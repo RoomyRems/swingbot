@@ -2,6 +2,9 @@ import numpy as np
 import pandas as pd
 import talib
 
+from models.signal import TradeSignal
+from risk.position import calc_stop_and_target, calc_position_size
+
 
 # ---------- 1) compute all indicators we need ----------
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
@@ -137,3 +140,55 @@ def generate_signals(df: pd.DataFrame) -> pd.DataFrame:
     df.loc[buy_mask, "Signal"] = 1
     df.loc[sell_mask, "Signal"] = -1
     return df
+
+
+def build_trade_signal(symbol: str, df: pd.DataFrame, cfg: dict) -> TradeSignal | None:
+    """
+    If 4/5 energies align, create a TradeSignal with ATR-based stop/target and position size.
+    Returns None if no valid trade.
+    """
+    min_score = cfg["trading"]["min_score"]
+    risk      = cfg["risk"]
+
+    energies = evaluate_five_energies(df)
+    if energies["score"] < min_score or energies["direction"] not in ("long", "short"):
+        return None
+
+    row = df.iloc[-1]
+    close = float(row["Close"])
+    atr   = float(row["ATR14"])
+
+    stop, target = calc_stop_and_target(
+        direction   = energies["direction"],
+        close       = close,
+        atr         = atr,
+        atr_mult    = float(risk["atr_multiple_stop"]),
+        reward_mult = float(risk["reward_multiple"]),
+    )
+    if stop is None or target is None:
+        return None
+
+    qty = calc_position_size(
+        account_equity = float(risk["account_equity"]),
+        risk_pct       = float(risk["risk_per_trade_pct"]),
+        entry          = close,
+        stop           = stop,
+    )
+    if qty <= 0:
+        return None
+
+    per_share_risk = abs(close - stop)
+    total_risk     = per_share_risk * qty
+
+    return TradeSignal(
+        symbol   = symbol,
+        direction= energies["direction"],
+        score    = int(energies["score"]),
+        entry    = close,
+        stop     = stop,
+        target   = target,
+        quantity = qty,
+        per_share_risk = per_share_risk,
+        total_risk = total_risk,
+        notes = f"Trend:{energies['trend']} Mom:{energies['momentum']} Cycle:{energies['cycle']} S/R:{energies['sr']} Vol:{energies['volume']}"
+    )

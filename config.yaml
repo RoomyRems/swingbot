@@ -1,0 +1,9 @@
+risk:
+  account_equity: 50000        # your account size (change as needed)
+  risk_per_trade_pct: 0.02     # 2% risk per trade
+  atr_multiple_stop: 1.5       # stop = 1.5 * ATR(14)
+  reward_multiple: 2.0         # target = entry + 2R
+  max_total_risk_pct: 0.10     # (future use) portfolio risk cap
+
+trading:
+  min_score: 4                 # need 4/5 energies aligned
