@@ -1,23 +1,16 @@
-import yfinance as yf
+# data/fetcher.py
+"""
+Unified OHLCV fetcher that delegates to Alpaca (daily bars).
+"""
+
+from __future__ import annotations
 import pandas as pd
+from broker.alpaca import get_daily_bars
 
-def fetch_ohlcv(symbol: str, interval: str = "1d", lookback_days: int = 100) -> pd.DataFrame:
+def fetch_ohlcv(symbol: str, lookback_days: int = 120) -> pd.DataFrame:
     """
-    Fetch historical OHLCV data using yfinance.
-
-    Args:
-        symbol (str): Ticker symbol (e.g. 'AAPL', 'MSFT').
-        interval (str): Data interval (e.g. '1d', '1h').
-        lookback_days (int): Number of past days to retrieve.
-
-    Returns:
-        pd.DataFrame: OHLCV dataframe with datetime index.
+    Fetch daily OHLCV via Alpaca (IEX feed).
+    Returns a DataFrame with columns: Open, High, Low, Close, Volume
+    and a Date index (UTC dropped).
     """
-    df = yf.download(
-        tickers=symbol,
-        period=f"{lookback_days}d",
-        interval=interval,
-        progress=False,
-        auto_adjust=False
-    )
-    return df
+    return get_daily_bars(symbol, lookback_days=lookback_days)

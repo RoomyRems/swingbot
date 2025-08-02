@@ -1,9 +1,11 @@
+# strategies/swing_strategy.py
 import numpy as np
 import pandas as pd
 import talib
 
 from models.signal import TradeSignal
-from risk.position import calc_stop_and_target, calc_position_size
+# ↓ use the centralized risk manager (Step 2)
+from risk.manager import compute_levels, size_position
 
 
 # ---------- 1) compute all indicators we need ----------
@@ -11,7 +13,7 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         raise ValueError("Empty DataFrame")
 
-    # ----- flatten yfinance MultiIndex: ('Adj Close','AAPL') → 'Adj Close'
+    # ----- flatten MultiIndex if present: ('Adj Close','AAPL') → 'Adj Close'
     if isinstance(df.columns, pd.MultiIndex):
         df = df.copy()
         df.columns = df.columns.get_level_values(0)
@@ -53,16 +55,16 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     avgvol50 = pd.Series(vol, index=df.index).rolling(50).mean().to_numpy()
 
     out = df.copy()
-    out["EMA20"]  = pd.Series(ema20, index=df.index)
-    out["EMA50"]  = pd.Series(ema50, index=df.index)
-    out["MACD"]   = pd.Series(macd,  index=df.index)
-    out["MACDs"]  = pd.Series(macds, index=df.index)
-    out["MACDh"]  = pd.Series(macdh, index=df.index)
-    out["RSI14"]  = pd.Series(rsi14, index=df.index)
-    out["SlowK"]  = pd.Series(slowk, index=df.index)
-    out["SlowD"]  = pd.Series(slowd, index=df.index)
-    out["ATR14"]  = pd.Series(atr14, index=df.index)
-    out["OBV"]    = pd.Series(obv,   index=df.index)
+    out["EMA20"]    = pd.Series(ema20, index=df.index)
+    out["EMA50"]    = pd.Series(ema50, index=df.index)
+    out["MACD"]     = pd.Series(macd,  index=df.index)
+    out["MACDs"]    = pd.Series(macds, index=df.index)
+    out["MACDh"]    = pd.Series(macdh, index=df.index)
+    out["RSI14"]    = pd.Series(rsi14, index=df.index)
+    out["SlowK"]    = pd.Series(slowk, index=df.index)
+    out["SlowD"]    = pd.Series(slowd, index=df.index)
+    out["ATR14"]    = pd.Series(atr14, index=df.index)
+    out["OBV"]      = pd.Series(obv,   index=df.index)
     out["AvgVol50"] = pd.Series(avgvol50, index=df.index)
     return out
 
@@ -93,15 +95,15 @@ def evaluate_five_energies(df: pd.DataFrame) -> dict:
 
     # 4) SUPPORT/RESISTANCE (near recent swing or EMA50 “value zone”)
     look = df.tail(20)
-    support   = look["Low"].min()
-    resistance= look["High"].max()
-    near_support    = (abs(row["Close"] - support)  / row["Close"] < 0.03) or (abs(row["Close"] - row["EMA50"]) / row["Close"] < 0.02)
-    near_resistance = (abs(row["Close"] - resistance)/ row["Close"] < 0.03) or (abs(row["Close"] - row["EMA50"]) / row["Close"] < 0.02)
+    support    = look["Low"].min()
+    resistance = look["High"].max()
+    near_support    = (abs(row["Close"] - support)   / row["Close"] < 0.03) or (abs(row["Close"] - row["EMA50"]) / row["Close"] < 0.02)
+    near_resistance = (abs(row["Close"] - resistance) / row["Close"] < 0.03) or (abs(row["Close"] - row["EMA50"]) / row["Close"] < 0.02)
     sr_ok = near_support if direction == "long" else near_resistance if direction == "short" else False
 
     # 5) VOLUME (above avg & OBV slope direction)
-    bull_vol = (row["Volume"] > 1.2 * row["AvgVol50"]) and (row["OBV"] > prev["OBV"])
-    bear_vol = (row["Volume"] > 1.2 * row["AvgVol50"]) and (row["OBV"] < prev["OBV"])
+    bull_vol = pd.notna(row["AvgVol50"]) and (row["Volume"] > 1.2 * row["AvgVol50"]) and (row["OBV"] > prev["OBV"])
+    bear_vol = pd.notna(row["AvgVol50"]) and (row["Volume"] > 1.2 * row["AvgVol50"]) and (row["OBV"] < prev["OBV"])
     volume_ok = bull_vol if direction == "long" else bear_vol if direction == "short" else False
 
     score = int(sum([trend_ok, momentum_ok, cycle_ok, sr_ok, volume_ok]))
@@ -148,32 +150,28 @@ def build_trade_signal(symbol: str, df: pd.DataFrame, cfg: dict) -> TradeSignal 
     Returns None if no valid trade.
     """
     min_score = cfg["trading"]["min_score"]
-    risk      = cfg["risk"]
 
     energies = evaluate_five_energies(df)
     if energies["score"] < min_score or energies["direction"] not in ("long", "short"):
         return None
 
-    row = df.iloc[-1]
+    row   = df.iloc[-1]
     close = float(row["Close"])
     atr   = float(row["ATR14"])
 
-    stop, target = calc_stop_and_target(
+    # 1) Compute levels with pennies rounding inside
+    stop, target = compute_levels(
         direction   = energies["direction"],
-        close       = close,
+        entry       = close,
         atr         = atr,
-        atr_mult    = float(risk["atr_multiple_stop"]),
-        reward_mult = float(risk["reward_multiple"]),
+        atr_mult    = float(cfg["risk"]["atr_multiple_stop"]),
+        reward_mult = float(cfg["risk"]["reward_multiple"]),
     )
     if stop is None or target is None:
         return None
 
-    qty = calc_position_size(
-        account_equity = float(risk["account_equity"]),
-        risk_pct       = float(risk["risk_per_trade_pct"]),
-        entry          = close,
-        stop           = stop,
-    )
+    # 2) Position size using full cfg (handles broker equity / BP caps)
+    qty = size_position(cfg=cfg, entry=close, stop=stop)
     if qty <= 0:
         return None
 
@@ -190,5 +188,8 @@ def build_trade_signal(symbol: str, df: pd.DataFrame, cfg: dict) -> TradeSignal 
         quantity = qty,
         per_share_risk = per_share_risk,
         total_risk = total_risk,
-        notes = f"Trend:{energies['trend']} Mom:{energies['momentum']} Cycle:{energies['cycle']} S/R:{energies['sr']} Vol:{energies['volume']}"
+        notes = (
+            f"Trend:{energies['trend']} Mom:{energies['momentum']} "
+            f"Cycle:{energies['cycle']} S/R:{energies['sr']} Vol:{energies['volume']}"
+        ),
     )

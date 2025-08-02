@@ -1,9 +1,14 @@
+dry_run: false   # set to false to actually submit orders
+
 risk:
-  account_equity: 50000        # your account size (change as needed)
+  account_equity: 50000        # used only if use_broker_equity: false
+  use_broker_equity: true      # pull live equity from Alpaca paper acct
   risk_per_trade_pct: 0.02     # 2% risk per trade
   atr_multiple_stop: 1.5       # stop = 1.5 * ATR(14)
   reward_multiple: 2.0         # target = entry + 2R
   max_total_risk_pct: 0.10     # (future use) portfolio risk cap
+  bp_utilization: 0.95         # spend at most 95% of available buying power
+  min_shares: 1
 
 trading:
   min_score: 4                 # need 4/5 energies aligned
