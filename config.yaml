@@ -1,4 +1,4 @@
-dry_run: false   # set to false to actually submit orders
+dry_run: false   # set true to preview/log only (no orders)
 
 risk:
   account_equity: 50000        # used only if use_broker_equity: false
@@ -10,5 +10,44 @@ risk:
   bp_utilization: 0.95         # spend at most 95% of available buying power
   min_shares: 1
 
+fundamentals:
+  enabled: false
+
+  # 1) Price range filter
+  min_price: 5
+  max_price: 1000
+
+  # 2) Liquidity (use 50-day average volume)
+  min_avg_vol: 1000000     # 1M shares/day
+
+  # 3) Earnings blackout (skip if earnings within +/- N calendar days)
+  earnings_blackout_days: 3
+
+  # 4) Sector allow/deny lists (requires a fundamentals provider; otherwise ignored)
+  sectors_allow: []        # e.g., ["Technology","Healthcare"]
+  sectors_deny:  []        # e.g., ["Energy"]
+
+  # 5) Tradability is handled earlier by Alpaca (filter_active_tradable)
+
+  # Optional: basic profitability (requires provider; ignored if data missing)
+  profitability:
+    enabled: false
+    require_positive_eps_ttm: true
+    min_revenue_yoy_growth_pct: 0
+
+  # Optional: short-term news sentiment / red-flag headlines (requires provider)
+  news:
+    enabled: false
+    lookback_days: 3
+    min_sentiment: -0.10        # require >= this; -1..1 scale
+    forbid_red_flags:
+      - bankruptcy
+      - fraud
+      - "going concern"
+
 trading:
   min_score: 4                 # need 4/5 energies aligned
+  confirm_before_place: true   # prompt before sending orders
+  time_in_force: "day"         # "day" or "gtc"
+  order_type: "market"         # "market" or "limit"
+  max_signals_per_run: 0       # 0=unlimited; otherwise cap per run
