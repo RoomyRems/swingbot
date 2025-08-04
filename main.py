@@ -119,28 +119,21 @@ if trade_rows:
 else:
     print("\nNo trade signals today.")
 
-# ---- [3/3] execution (only if CSV exists & non-empty) ----------------
+# ---- [3/3] execution (prompt only if this run produced signals) -----
 print("\n[3/3] Execution")
+has_signals = bool(trade_rows)
 
-csv_path = today_filename("trade_signals")
-if cfg.get("dry_run", False):
-    print("DRY RUN: Skipping order execution.")
+if not has_signals:
+    print("No trade signals to execute — skipping execution step.")
 else:
-    if csv_path.exists():
-        try:
-            df_exec = pd.read_csv(csv_path)
-        except Exception:
-            df_exec = pd.DataFrame()
-        if df_exec.shape[0] > 0:
-            if cfg.get("trading", {}).get("confirm_before_place", True):
-                resp = input("Place orders now? [y/N]: ").strip().lower()
-                if resp == "y":
-                    execute_today()
-                else:
-                    print("Canceled by user.")
+    if cfg.get("dry_run", False):
+        print("DRY RUN: Skipping order execution.")
+    else:
+        if cfg.get("trading", {}).get("confirm_before_place", True):
+            resp = input("Place orders now? [y/N]: ").strip().lower()
+            if resp != "y":
+                print("Canceled by user.")
             else:
                 execute_today()
         else:
-            print("No trade_signals CSV for today → nothing to execute.")
-    else:
-        print("No trade_signals CSV for today → nothing to execute.")
+            execute_today()

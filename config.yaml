@@ -10,15 +10,39 @@ risk:
   bp_utilization: 0.95         # spend at most 95% of available buying power
   min_shares: 1
 
+signals:
+  sr_pivots:
+    lookback: 60          # bars to search for recent pivots
+    left: 3               # pivot definition: bars to the left
+    right: 3              # pivot definition: bars to the right
+    near_pct: 0.02        # consider “near” if within 2% of close
+    near_atr_mult: 0.5    # or within 0.5 * ATR(14)
+    ema50_fallback_pct: 0.02  # if no/ not-near pivot, allow EMA50 proximity within 2%
+
+# --- momentum quality controls ---
+momentum:
+  rsi_filter: true          # keep RSI check (>=50 long, <=50 short)
+  rsi_threshold: 50
+  use_macd_expansion: true  # require MACD histogram expansion
+  expansion_lookback: 3     # look at last N bars of MACDh
+  expansion_min_steps: 2    # need at least this many “in the right direction” steps
+
+  # zero-line context for MACD line (not histogram):
+  #  - none     : ignore zero-line
+  #  - confirm  : require MACD>0 for longs ( <0 for shorts )
+  #  - cross    : require a zero-cross within the last K bars
+  zero_line_mode: "confirm"
+  zero_cross_lookback: 3
+
 fundamentals:
-  enabled: false
+  enabled: true
 
   # 1) Price range filter
   min_price: 5
   max_price: 1000
 
   # 2) Liquidity (use 50-day average volume)
-  min_avg_vol: 1000000     # 1M shares/day
+  min_avg_vol: 1000000     
 
   # 3) Earnings blackout (skip if earnings within +/- N calendar days)
   earnings_blackout_days: 3
@@ -37,7 +61,7 @@ fundamentals:
 
   # Optional: short-term news sentiment / red-flag headlines (requires provider)
   news:
-    enabled: false
+    enabled: true
     lookback_days: 3
     min_sentiment: -0.10        # require >= this; -1..1 scale
     forbid_red_flags:
@@ -48,6 +72,6 @@ fundamentals:
 trading:
   min_score: 4                 # need 4/5 energies aligned
   confirm_before_place: true   # prompt before sending orders
-  time_in_force: "day"         # "day" or "gtc"
+  time_in_force: "gtc"         # "day" or "gtc"
   order_type: "market"         # "market" or "limit"
   max_signals_per_run: 0       # 0=unlimited; otherwise cap per run
