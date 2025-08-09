@@ -73,7 +73,7 @@ for i, sym in enumerate(tqdm(tickers, desc="TA + signals"), start=1):
             continue
 
         df = add_indicators(df)
-        energies = evaluate_five_energies(df)
+        energies = evaluate_five_energies(df, cfg)
 
         all_evals.append({
             "date": date.today(),

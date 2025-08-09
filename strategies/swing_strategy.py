@@ -1,43 +1,69 @@
 # strategies/swing_strategy.py
-from __future__ import annotations
-
 import numpy as np
 import pandas as pd
 import talib
-from typing import Tuple, Optional
 
 from models.signal import TradeSignal
 from risk.manager import compute_levels, size_position
 
 
-# ----------------------------- Indicators ------------------------------
+# ---------- 0) lightweight logging helper ----------
+def _explain_enabled(cfg: dict | None) -> bool:
+    logcfg = (cfg or {}).get("logging", {}) or {}
+    v = logcfg.get("explain_rejects", True)  # default ON
+    if isinstance(v, str):
+        return v.strip().lower() in {"1", "true", "yes", "y"}
+    return bool(v)
+
+def _logline(msg: str) -> None:
+    try:
+        # stay nice with tqdm progress bars if present
+        from tqdm import tqdm
+        tqdm.write(msg)
+    except Exception:
+        print(msg)
+
+def _explain_log(symbol: str, reason: str, details: dict | None, cfg: dict | None) -> None:
+    if not _explain_enabled(cfg):
+        return
+    # keep it short: show up to ~6 key=val pairs
+    parts = []
+    if details:
+        for k, v in list(details.items())[:6]:
+            parts.append(f"{k}={v}")
+    suffix = f" — {', '.join(parts)}" if parts else ""
+    _logline(f"[{symbol}] reject: {reason}{suffix}")
+
+
+# ---------- 1) compute all indicators we need ----------
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         raise ValueError("Empty DataFrame")
 
-    # Flatten yfinance MultiIndex if present: ('Adj Close','AAPL') → 'Adj Close'
+    # Flatten MultiIndex if present
     if isinstance(df.columns, pd.MultiIndex):
         df = df.copy()
         df.columns = df.columns.get_level_values(0)
 
-    # Ensure we have 'Close'
+    # Ensure we have a 'Close' column (rename Adj Close if needed)
     if "Close" not in df.columns and "Adj Close" in df.columns:
         df = df.rename(columns={"Adj Close": "Close"})
 
-    for col in ("Close", "High", "Low", "Volume"):
+    # Ensure basic columns exist
+    for col in ("Open", "High", "Low", "Close", "Volume"):
         if col not in df.columns:
             raise ValueError(f"Missing column: {col}")
 
-    close = np.asarray(df["Close"], dtype="float64").ravel()
-    high  = np.asarray(df["High"],  dtype="float64").ravel()
-    low   = np.asarray(df["Low"],   dtype="float64").ravel()
+    close = np.asarray(df["Close"],  dtype="float64").ravel()
+    high  = np.asarray(df["High"],   dtype="float64").ravel()
+    low   = np.asarray(df["Low"],    dtype="float64").ravel()
     vol   = np.asarray(df["Volume"], dtype="float64").ravel()
 
     # Trend
     ema20 = talib.EMA(close, timeperiod=20)
     ema50 = talib.EMA(close, timeperiod=50)
 
-    # Momentum (MACD)
+    # Momentum
     macd, macds, macdh = talib.MACD(close, fastperiod=12, slowperiod=26, signalperiod=9)
     rsi14 = talib.RSI(close, timeperiod=14)
 
@@ -51,9 +77,23 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     # Volatility / stops
     atr14 = talib.ATR(high, low, close, timeperiod=14)
 
-    # Volume & confirmation
+    # Trend-strength (for regime filter)
+    adx14 = talib.ADX(high, low, close, timeperiod=14)
+
+    # Volume confirmations
     obv = talib.OBV(close, vol)
     avgvol50 = pd.Series(vol, index=df.index).rolling(50).mean().to_numpy()
+
+    # RVOL vs 20-day rolling median
+    vol_series = pd.Series(vol, index=df.index)
+    rvol20 = vol_series / vol_series.rolling(20).median()
+
+    # Chaikin A/D line
+    hl_range = (df["High"] - df["Low"]).replace(0, np.nan)
+    mfm = ((df["Close"] - df["Low"]) - (df["High"] - df["Close"])) / hl_range
+    mfm = mfm.fillna(0.0)
+    mfv = mfm * df["Volume"]
+    ad_line = mfv.cumsum()
 
     out = df.copy()
     out["EMA20"]    = pd.Series(ema20, index=df.index)
@@ -65,251 +105,227 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     out["SlowK"]    = pd.Series(slowk, index=df.index)
     out["SlowD"]    = pd.Series(slowd, index=df.index)
     out["ATR14"]    = pd.Series(atr14, index=df.index)
+    out["ADX14"]    = pd.Series(adx14, index=df.index)
     out["OBV"]      = pd.Series(obv,   index=df.index)
     out["AvgVol50"] = pd.Series(avgvol50, index=df.index)
+    out["RVOL20"]   = rvol20
+    out["ADLine"]   = ad_line
     return out
 
 
-# --------------------------- Pivot utilities ---------------------------
-def _find_pivots(high: pd.Series, low: pd.Series, left: int, right: int) -> Tuple[pd.Series, pd.Series]:
-    """
-    Return boolean Series for pivot highs and pivot lows using left/right window.
-    A pivot high at i means: High[i] is the max within [i-left, i+right].
-    A pivot low  at i means: Low[i]  is the min within [i-left, i+right].
-    """
-    # Rolling windows
-    rh = high.rolling(window=left + right + 1, center=True).max()
-    rl = low.rolling(window=left + right + 1, center=True).min()
+# ---------- small helpers: config defaults ----------
+def _cfg_path(cfg: dict | None, *keys, default=None):
+    d = cfg or {}
+    for k in keys:
+        d = d.get(k, {})
+    return d if d != {} else (default if default is not None else {})
 
-    # To ensure strict pivots, compare to shifted windows for edges
-    ph = (high == rh)
-    pl = (low == rl)
+def _get_float(d: dict, key: str, default: float) -> float:
+    try:
+        return float(d.get(key, default))
+    except Exception:
+        return default
 
-    # Avoid NaNs at edges
-    ph = ph.fillna(False)
-    pl = pl.fillna(False)
-    return ph, pl
+def _get_int(d: dict, key: str, default: int) -> int:
+    try:
+        return int(d.get(key, default))
+    except Exception:
+        return default
 
-
-def _nearest_pivot_dist(row_close: float,
-                        pivots: pd.Series,
-                        prices: pd.Series) -> Optional[float]:
-    """
-    Distance (in % of close) to the nearest pivot level from the recent window.
-    """
-    if pivots is None or pivots.empty:
-        return None
-    lvls = prices[pivots].dropna()
-    if lvls.empty:
-        return None
-    dists = (lvls - row_close).abs() / max(1e-6, row_close)
-    return float(dists.min()) if not dists.empty else None
+def _get_bool(d: dict, key: str, default: bool) -> bool:
+    v = d.get(key, default)
+    if isinstance(v, str):
+        return v.strip().lower() in {"1","true","yes","y"}
+    return bool(v)
 
 
-def _sr_ok_with_pivots(df: pd.DataFrame, direction: str, cfg: dict) -> Tuple[bool, dict]:
-    """
-    Decide S/R energy using swing pivots with EMA50 fallback.
-    Returns (ok, explain_dict).
-    """
-    scfg = (cfg.get("signals", {}) or {}).get("sr_pivots", {}) or {}
-    lookback = int(scfg.get("lookback", 60))
-    left = int(scfg.get("left", 3))
-    right = int(scfg.get("right", 3))
-    near_pct = float(scfg.get("near_pct", 0.02))
-    near_atr_mult = float(scfg.get("near_atr_mult", 0.5))
-    ema50_fallback_pct = float(scfg.get("ema50_fallback_pct", 0.02))
+# ---------- S/R pivots ----------
+def _find_pivots(high: pd.Series, low: pd.Series, left: int, right: int) -> tuple[list[int], list[int]]:
+    highs_idx, lows_idx = [], []
+    H = high.to_numpy()
+    L = low.to_numpy()
+    n = len(H)
+    for i in range(n):
+        l = max(0, i - left)
+        r = min(n, i + right + 1)
+        if r - l < 1:
+            continue
+        if np.isfinite(H[i]) and H[i] == np.nanmax(H[l:r]):
+            highs_idx.append(i)
+        if np.isfinite(L[i]) and L[i] == np.nanmin(L[l:r]):
+            lows_idx.append(i)
+    return highs_idx, lows_idx
 
-    sub = df.tail(lookback).copy()
-    row = sub.iloc[-1]
+def _nearest_pivot_levels(df: pd.DataFrame, lookback: int, left: int, right: int):
+    tail = df.tail(lookback)
+    highs_idx, lows_idx = _find_pivots(tail["High"], tail["Low"], left, right)
+    base = len(df) - len(tail)
+    highs_abs = [base + i for i in highs_idx]
+    lows_abs  = [base + i for i in lows_idx]
 
-    # Find pivots over the lookback
-    ph, pl = _find_pivots(sub["High"], sub["Low"], left, right)
-
-    # Nearest distances
-    dist_to_low  = _nearest_pivot_dist(float(row["Close"]), pl, sub["Low"])
-    dist_to_high = _nearest_pivot_dist(float(row["Close"]), ph, sub["High"])
-
-    # Dynamic ATR buffer
-    atr = float(row["ATR14"]) if pd.notna(row["ATR14"]) else 0.0
-    atr_buffer = (atr / max(1e-6, float(row["Close"]))) * near_atr_mult
-
-    ok_long = False
-    ok_short = False
-
-    # Longs: prefer proximity to pivot LOW (support)
-    if dist_to_low is not None:
-        if (dist_to_low <= near_pct) or (atr_buffer > 0 and dist_to_low <= atr_buffer):
-            ok_long = True
-
-    # Shorts: prefer proximity to pivot HIGH (resistance)
-    if dist_to_high is not None:
-        if (dist_to_high <= near_pct) or (atr_buffer > 0 and dist_to_high <= atr_buffer):
-            ok_short = True
-
-    # Fallback: EMA50 “value zone”
-    ema50_dist = abs(float(row["Close"]) - float(row["EMA50"])) / max(1e-6, float(row["Close"]))
-    if not ok_long and direction == "long":
-        ok_long = ema50_dist <= ema50_fallback_pct
-    if not ok_short and direction == "short":
-        ok_short = ema50_dist <= ema50_fallback_pct
-
-    explain = {
-        "dist_to_pivot_low_pct":  None if dist_to_low is None else f"{dist_to_low:.4f}",
-        "dist_to_pivot_high_pct": None if dist_to_high is None else f"{dist_to_high:.4f}",
-        "atr_buffer_pct": f"{atr_buffer:.4f}",
-        "ema50_dist_pct": f"{ema50_dist:.4f}",
-    }
-
-    return (ok_long if direction == "long" else ok_short), explain
+    support = float(df["Low"].iloc[lows_abs].max()) if lows_abs else None
+    resistance = float(df["High"].iloc[highs_abs].min()) if highs_abs else None
+    return support, resistance
 
 
-# ------------------------- Momentum utilities --------------------------
-def _macd_zero_context(macd_line: pd.Series, direction: str, mode: str, cross_lookback: int) -> bool:
-    """
-    Zero-line context for MACD line.
-      - 'none'    : always True
-      - 'confirm' : long requires MACD > 0, short requires MACD < 0
-      - 'cross'   : a zero-cross occurred within the last `cross_lookback` bars
-    """
-    if macd_line.isna().iloc[-1]:
+# ---------- momentum quality ----------
+def _macd_expansion_ok(df: pd.DataFrame, direction: str, mcfg: dict) -> bool:
+    if direction not in {"long", "short"}:
+        return False
+    lookback = _get_int(mcfg, "expansion_lookback", 3)
+    min_steps = _get_int(mcfg, "expansion_min_steps", 2)
+    if lookback < 2 or len(df) < lookback + 1:
+        return True  # permissive if not enough bars
+
+    macdh = df["MACDh"].to_numpy()
+    if not np.isfinite(macdh[-1]):
         return False
 
-    mode = (mode or "none").lower()
+    # direction-consistent sign
+    if direction == "long" and macdh[-1] <= 0:
+        return False
+    if direction == "short" and macdh[-1] >= 0:
+        return False
+
+    last = np.abs(macdh[-(lookback+1):])
+    diffs = np.diff(last)  # length = lookback
+    good = np.sum(diffs > 0)  # absolute expansion is symmetric
+    return good >= min_steps
+
+def _macd_zero_line_ok(df: pd.DataFrame, direction: str, mcfg: dict) -> bool:
+    mode = str(mcfg.get("zero_line_mode", "confirm")).lower()
     if mode == "none":
         return True
-
-    last = float(macd_line.iloc[-1])
-
+    macd = df["MACD"].to_numpy()
+    if not np.isfinite(macd[-1]):
+        return False
     if mode == "confirm":
-        return (last > 0) if direction == "long" else (last < 0)
-
+        return (macd[-1] > 0) if direction == "long" else (macd[-1] < 0)
     if mode == "cross":
-        # Require sign change inside the last K bars
-        k = max(1, int(cross_lookback))
-        seg = macd_line.tail(k + 1).dropna()
-        if seg.shape[0] < 2:
-            return False
-        signs = np.sign(seg.values)
-        return np.any(signs[:-1] * signs[1:] <= 0)  # any adjacent sign change
-
-    # Fallback
+        k = _get_int(mcfg, "zero_cross_lookback", 3)
+        if k < 1 or len(macd) < k + 1:
+            return True
+        window = macd[-(k+1):]
+        if direction == "long":
+            return (window[-1] > 0) and np.any(window[:-1] <= 0)
+        else:
+            return (window[-1] < 0) and np.any(window[:-1] >= 0)
     return True
 
 
-def _macd_expansion(macdh: pd.Series, direction: str, lookback: int, min_steps: int) -> bool:
-    """
-    Require histogram expansion: for longs, MACDh increasing (more positive);
-    for shorts, MACDh decreasing (more negative). Not strictly monotonic:
-    we need at least `min_steps` of the last `lookback-1` diffs in the desired direction.
-    Also enforces current MACDh sign ( >0 for long, <0 for short ).
-    """
-    k = max(2, int(lookback))
-    seg = macdh.tail(k).dropna()
-    if seg.shape[0] < k:
-        return False
+# ---------- volume context ----------
+def _volume_energy_ok(df: pd.DataFrame, direction: str, vcfg: dict) -> tuple[bool, dict]:
+    if direction not in {"long", "short"}:
+        return False, {"reason": "no-direction"}
 
-    diffs = seg.diff().dropna()  # length k-1
-    if direction == "long":
-        in_dir = int((diffs > 0).sum())
-        return (seg.iloc[-1] > 0) and (in_dir >= max(1, int(min_steps)))
+    rvol_thr = _get_float(vcfg, "rvol_threshold", 1.20)
+    ad_look  = _get_int(vcfg, "ad_trend_lookback", 3)
+    obv_conf = _get_bool(vcfg, "obv_confirm", True)
+
+    row  = df.iloc[-1]
+    rvol = float(row.get("RVOL20", np.nan))
+    det = {"rvol": f"{rvol:.2f}" if np.isfinite(rvol) else "nan", "rvol_thr": rvol_thr,
+           "ad_look": ad_look, "obv_conf": obv_conf}
+
+    if not np.isfinite(rvol):
+        return False, {"reason": "rvol-nan", **det}
+    rvol_ok = rvol >= rvol_thr
+
+    if ad_look < 1 or len(df) <= ad_look:
+        ad_ok = True
     else:
-        in_dir = int((diffs < 0).sum())
-        return (seg.iloc[-1] < 0) and (in_dir >= max(1, int(min_steps)))
+        ad_now = float(df["ADLine"].iloc[-1])
+        ad_prev= float(df["ADLine"].iloc[-ad_look-1])
+        ad_ok  = (ad_now > ad_prev) if direction == "long" else (ad_now < ad_prev)
+
+    if obv_conf:
+        obv_now  = float(df["OBV"].iloc[-1])
+        obv_prev = float(df["OBV"].iloc[-2])
+        obv_ok   = (obv_now > obv_prev) if direction == "long" else (obv_now < obv_prev)
+    else:
+        obv_ok = True
+
+    ok = rvol_ok and ad_ok and obv_ok
+    return ok, {**det, "ad_ok": ad_ok, "obv_ok": obv_ok}
 
 
-def _momentum_ok(df: pd.DataFrame, direction: str, cfg: dict) -> Tuple[bool, dict]:
-    """
-    Apply base momentum rules + optional expansion and zero-line context.
-    Returns (ok, explain_dict)
-    """
-    row = df.iloc[-1]
-    prev = df.iloc[-2]
-
-    mcfg = (cfg.get("signals", {}) or {}).get("momentum", {}) or {}
-
-    # Base momentum (as before)
-    bull_base = (row["MACDh"] > 0) and (row["MACD"] > row["MACDs"])
-    bear_base = (row["MACDh"] < 0) and (row["MACD"] < row["MACDs"])
-
-    rsi_filter = bool(mcfg.get("rsi_filter", True))
-    rsi_thr = float(mcfg.get("rsi_threshold", 50))
-
-    if rsi_filter:
-        bull_base = bull_base and (row["RSI14"] >= rsi_thr)
-        bear_base = bear_base and (row["RSI14"] <= (100 - rsi_thr))  # symmetric gate
-
-    base_ok = bull_base if direction == "long" else bear_base if direction == "short" else (bull_base or bear_base)
-
-    # Zero-line context for MACD line
-    zero_mode = str(mcfg.get("zero_line_mode", "none")).lower()
-    zero_lb = int(mcfg.get("zero_cross_lookback", 3))
-    zero_ok = _macd_zero_context(df["MACD"], direction, zero_mode, zero_lb)
-
-    # Histogram expansion
-    use_exp = bool(mcfg.get("use_macd_expansion", True))
-    exp_lb = int(mcfg.get("expansion_lookback", 3))
-    exp_steps = int(mcfg.get("expansion_min_steps", 2))
-    exp_ok = _macd_expansion(df["MACDh"], direction, exp_lb, exp_steps) if use_exp else True
-
-    final_ok = bool(base_ok and zero_ok and exp_ok)
-    explain = {
-        "base_ok": bool(base_ok),
-        "zero_ok": bool(zero_ok),
-        "exp_ok": bool(exp_ok),
-        "rsi_filter": bool(rsi_filter),
-        "zero_mode": zero_mode,
-        "expansion_lb": exp_lb,
-        "expansion_steps_req": exp_steps,
-    }
-    return final_ok, explain
-
-
-# ------------------------ Five Energies score --------------------------
+# ---------- 2) five energies on the last bar ----------
 def evaluate_five_energies(df: pd.DataFrame, cfg: dict | None = None) -> dict:
-    """
-    Evaluate the five energies on the last bar.
-    `cfg` is optional; when provided, momentum & S/R logic can use its signal settings.
-    """
     if len(df) < 60:
         raise ValueError("Need ~60 bars for stable signals")
-
-    cfg = cfg or {}
 
     row  = df.iloc[-1]
     prev = df.iloc[-2]
 
-    # 1) TREND (20/50 EMA + price relative to EMA50)
+    # 1) TREND
     bullish_trend = (row["EMA20"] > row["EMA50"]) and (row["Close"] > row["EMA50"])
     bearish_trend = (row["EMA20"] < row["EMA50"]) and (row["Close"] < row["EMA50"])
     direction = "long" if bullish_trend else "short" if bearish_trend else "none"
     trend_ok = bullish_trend or bearish_trend
 
-    # 2) MOMENTUM (with optional MACD expansion & zero-line context)
-    momentum_ok, mom_explain = _momentum_ok(df, direction, cfg)
+    # 2) MOMENTUM with quality gates
+    mcfg = _cfg_path(cfg, "momentum", default={})
+    rsi_filter     = _get_bool(mcfg, "rsi_filter", True)
+    rsi_threshold  = _get_float(mcfg, "rsi_threshold", 50.0)
+    use_expansion  = _get_bool(mcfg, "use_macd_expansion", True)
 
-    # 3) CYCLE (Stoch turning from extreme)
+    base_bull = (row["MACD"] > row["MACDs"])
+    base_bear = (row["MACD"] < row["MACDs"])
+    if rsi_filter:
+        base_bull = base_bull and (row["RSI14"] >= rsi_threshold)
+        base_bear = base_bear and (row["RSI14"] <= (100 - rsi_threshold))
+
+    zl_ok   = _macd_zero_line_ok(df, direction, mcfg) if direction in {"long","short"} else False
+    exp_ok  = _macd_expansion_ok(df, direction, mcfg) if (use_expansion and direction in {"long","short"}) else True
+
+    if direction == "long":
+        momentum_ok = bool(base_bull and zl_ok and exp_ok)
+    elif direction == "short":
+        momentum_ok = bool(base_bear and zl_ok and exp_ok)
+    else:
+        momentum_ok = False
+
+    # 3) CYCLE
     bull_cycle = (prev["SlowK"] < 20) and (row["SlowK"] > row["SlowD"])
     bear_cycle = (prev["SlowK"] > 80) and (row["SlowK"] < row["SlowD"])
-    cycle_ok = bull_cycle if direction == "long" else bear_cycle if direction == "short" else (bull_cycle or bear_cycle)
+    cycle_ok = bull_cycle if direction == "long" else bear_cycle if direction == "short" else False
 
-    # 4) SUPPORT/RESISTANCE (pivot-based + EMA50 fallback)
-    sr_ok, sr_explain = _sr_ok_with_pivots(df, direction, cfg)
+    # 4) SUPPORT/RESISTANCE — pivot-based + EMA50 fallback
+    scfg = _cfg_path(cfg, "signals", "sr_pivots", default={})
+    lookback = _get_int(scfg, "lookback", 60)
+    left     = _get_int(scfg, "left", 3)
+    right    = _get_int(scfg, "right", 3)
+    near_pct = _get_float(scfg, "near_pct", 0.02)
+    near_atr = _get_float(scfg, "near_atr_mult", 0.5)
+    ema_fall = _get_float(scfg, "ema50_fallback_pct", 0.02)
 
-    # 5) VOLUME (above avg & OBV slope direction)
-    bull_vol = pd.notna(row["AvgVol50"]) and (row["Volume"] > 1.2 * row["AvgVol50"]) and (row["OBV"] > prev["OBV"])
-    bear_vol = pd.notna(row["AvgVol50"]) and (row["Volume"] > 1.2 * row["AvgVol50"]) and (row["OBV"] < prev["OBV"])
-    volume_ok = bull_vol if direction == "long" else bear_vol if direction == "short" else False
+    support, resistance = _nearest_pivot_levels(df, lookback, left, right)
+
+    price = float(row["Close"])
+    tol_abs = float(row["ATR14"]) * near_atr if np.isfinite(row["ATR14"]) else np.inf
+    tol_pct = price * near_pct
+    tol = max(tol_abs, tol_pct)
+
+    sr_used = None
+    if direction == "long" and support is not None:
+        sr_ok = abs(price - support) <= tol and (support <= price)
+        sr_used = "pivot-support" if sr_ok else None
+    elif direction == "short" and resistance is not None:
+        sr_ok = abs(resistance - price) <= tol and (resistance >= price)
+        sr_used = "pivot-resistance" if sr_ok else None
+    else:
+        sr_ok = False
+
+    if not sr_ok:
+        sr_ok = (abs(price - float(row["EMA50"])) / price) <= ema_fall
+        if sr_ok:
+            sr_used = "ema50-fallback"
+
+    # 5) VOLUME — RVOL + Chaikin A/D + optional OBV confirm
+    vcfg = _cfg_path(cfg, "volume", default={})
+    volume_ok, vol_details = _volume_energy_ok(df, direction, vcfg)
 
     score = int(sum([trend_ok, momentum_ok, cycle_ok, sr_ok, volume_ok]))
-
-    explain = {
-        "bullish_trend": bullish_trend, "bearish_trend": bearish_trend,
-        "bull_cycle": bull_cycle, "bear_cycle": bear_cycle,
-        "bull_vol": bull_vol, "bear_vol": bear_vol,
-        # Momentum + SR details:
-        "momentum": mom_explain,
-        "sr": sr_explain,
-    }
 
     return {
         "direction": direction,
@@ -319,42 +335,202 @@ def evaluate_five_energies(df: pd.DataFrame, cfg: dict | None = None) -> dict:
         "sr": sr_ok,
         "volume": volume_ok,
         "score": score,
-        "explain": explain,
+        "explain": {
+            "trend": {"bull": bool(bullish_trend), "bear": bool(bearish_trend)},
+            "momentum": {
+                "base_bull": bool(base_bull), "base_bear": bool(base_bear),
+                "rsi_filter": rsi_filter, "rsi_threshold": rsi_threshold,
+                "zero_line_mode": mcfg.get("zero_line_mode", "confirm"),
+                "zl_ok": bool(zl_ok),
+                "use_expansion": use_expansion,
+                "exp_lookback": _get_int(mcfg, "expansion_lookback", 3),
+                "exp_min_steps": _get_int(mcfg, "expansion_min_steps", 2),
+                "exp_ok": bool(exp_ok),
+            },
+            "cycle": {"bull": bool(bull_cycle), "bear": bool(bear_cycle)},
+            "sr": {
+                "support": support, "resistance": resistance,
+                "tol": tol, "near_pct": near_pct, "near_atr_mult": near_atr,
+                "ema50_fallback_pct": ema_fall, "used": sr_used
+            },
+            "volume": vol_details,
+        }
     }
 
 
-# ---------------------------- Demo signals -----------------------------
-def generate_signals(df: pd.DataFrame) -> pd.DataFrame:
-    close = np.asarray(df["Close"], dtype="float64").ravel()
-    rsi   = talib.RSI(close, 14)
-    ema20 = talib.EMA(close, 20)
-    df = df.copy()
-    df["RSI"] = pd.Series(rsi, index=df.index)
-    df["EMA20"] = pd.Series(ema20, index=df.index)
-    buy_mask  = (rsi < 30) & (close > ema20)
-    sell_mask = (rsi > 70) & (close < ema20)
-    df["Signal"] = 0
-    df.loc[buy_mask, "Signal"] = 1
-    df.loc[sell_mask, "Signal"] = -1
+# ---------- 2.5) Higher-timeframe (weekly) confirmation helpers ----------
+def _ensure_dt_index(df: pd.DataFrame) -> pd.DataFrame:
+    if not isinstance(df.index, pd.DatetimeIndex):
+        if "Date" in df.columns:
+            df = df.set_index(pd.to_datetime(df["Date"]))
+            df = df.drop(columns=["Date"])
+        else:
+            raise ValueError("DataFrame must have a DatetimeIndex or a 'Date' column for MTF resampling.")
     return df
 
+def _resample_weekly_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Resample daily → weekly (Friday close). Keep partial weeks.
+    """
+    df = _ensure_dt_index(df)
+    wk = df[["Open", "High", "Low", "Close", "Volume"]].resample("W-FRI").agg({
+        "Open": "first",
+        "High": "max",
+        "Low": "min",
+        "Close": "last",
+        "Volume": "sum",
+    }).dropna(how="all")
+    return wk
 
-# ------------------------- Trade signal builder ------------------------
+def _weekly_trend_view(wk_ind: pd.DataFrame, mtf_cfg: dict) -> str:
+    if wk_ind.shape[0] < 10:
+        return "none"
+    mode = str(mtf_cfg.get("trend_filter", "ema")).lower()
+    r = wk_ind.iloc[-1]
+    if mode == "macd":
+        if pd.isna(r["MACD"]) or pd.isna(r["MACDs"]) or pd.isna(r["MACDh"]):
+            return "none"
+        if (r["MACD"] > r["MACDs"]) and (r["MACDh"] > 0):
+            return "up"
+        if (r["MACD"] < r["MACDs"]) and (r["MACDh"] < 0):
+            return "down"
+        return "none"
+    else:
+        if pd.isna(r["EMA20"]) or pd.isna(r["EMA50"]) or pd.isna(r["Close"]):
+            return "none"
+        if (r["EMA20"] > r["EMA50"]) and (r["Close"] > r["EMA50"]):
+            return "up"
+        if (r["EMA20"] < r["EMA50"]) and (r["Close"] < r["EMA50"]):
+            return "down"
+        return "none"
+
+def _mtf_alignment_ok(daily_direction: str, weekly_trend: str, mtf_cfg: dict) -> tuple[bool, str]:
+    if daily_direction not in {"long", "short"}:
+        return True, "daily-none"
+    if weekly_trend == "none":
+        return True, "weekly-none"
+    if daily_direction == "long" and weekly_trend == "up":
+        return True, "aligned-up"
+    if daily_direction == "short" and weekly_trend == "down":
+        return True, "aligned-down"
+    if bool(mtf_cfg.get("reject_on_mismatch", True)):
+        return False, f"mtf-mismatch({weekly_trend})"
+    else:
+        return True, f"mtf-mismatch-allowed({weekly_trend})"
+
+
+# ---------- market regime filters (with details for logging) ----------
+def _chop_index_latest(high: np.ndarray, low: np.ndarray, close: np.ndarray, window: int) -> float:
+    if window <= 1 or len(close) < window:
+        return np.nan
+    h = high[-window:]; l = low[-window:]; c = close[-window:]
+    tr = talib.TRANGE(h, l, c)
+    tr_sum = float(np.nansum(tr))
+    hi = float(np.nanmax(h))
+    lo = float(np.nanmin(l))
+    denom = hi - lo
+    if denom <= 0 or tr_sum <= 0:
+        return np.nan
+    return float(100.0 * (np.log10(tr_sum / denom) / np.log10(window)))
+
+def _regime_check(df: pd.DataFrame, cfg: dict) -> tuple[bool, dict]:
+    rcfg = (cfg or {}).get("regime", {}) or {}
+    if not rcfg.get("enabled", True):
+        return True, {"enabled": False}
+
+    adx_min      = float(rcfg.get("adx_min", 18))
+    atr_pct_min  = float(rcfg.get("atr_pct_min", 0.015))
+    use_chop     = bool(rcfg.get("use_chop", True))
+    chop_window  = int(rcfg.get("chop_window", 14))
+    chop_max     = float(rcfg.get("chop_max", 55))
+
+    last = df.iloc[-1]
+    det = {"adx_min": adx_min, "atr_pct_min": atr_pct_min, "use_chop": use_chop,
+           "chop_window": chop_window, "chop_max": chop_max}
+
+    adx_val = float(last.get("ADX14", np.nan))
+    adx_ok = True if np.isnan(adx_val) else (adx_val >= adx_min)
+    det["adx"] = f"{adx_val:.2f}" if np.isfinite(adx_val) else "nan"
+    det["adx_ok"] = adx_ok
+
+    atr_val = float(last.get("ATR14", np.nan))
+    close_val = float(last.get("Close", np.nan))
+    atr_ok = True
+    atr_pct = np.nan
+    if np.isfinite(atr_val) and np.isfinite(close_val) and close_val > 0:
+        atr_pct = atr_val / close_val
+        atr_ok = atr_pct >= atr_pct_min
+    det["atr_pct"] = f"{atr_pct:.3f}" if np.isfinite(atr_pct) else "nan"
+    det["atr_ok"] = atr_ok
+
+    chop_ok = True
+    if use_chop:
+        high = np.asarray(df["High"], dtype="float64").ravel()
+        low  = np.asarray(df["Low"],  dtype="float64").ravel()
+        close= np.asarray(df["Close"],dtype="float64").ravel()
+        chop = _chop_index_latest(high, low, close, chop_window)
+        det["chop"] = f"{chop:.1f}" if np.isfinite(chop) else "nan"
+        chop_ok = (not np.isfinite(chop)) or (chop <= chop_max)
+        det["chop_ok"] = chop_ok
+    else:
+        det["chop"] = "off"
+        det["chop_ok"] = True
+
+    ok = adx_ok and atr_ok and chop_ok
+    det["ok"] = ok
+    return ok, det
+
+
+# ---------- build trade ----------
 def build_trade_signal(symbol: str, df: pd.DataFrame, cfg: dict) -> TradeSignal | None:
     """
-    If min_score energies align, create a TradeSignal with ATR-based stop/target and position size.
+    If 4/5 energies align, create a TradeSignal with ATR-based stop/target and position size.
+    Adds higher-timeframe (weekly) confirmation if enabled in config.
+    Also logs concise rejection reasons when a trade is skipped.
     """
-    min_score = int(cfg.get("trading", {}).get("min_score", 4))
+    min_score = cfg["trading"]["min_score"]
 
-    energies = evaluate_five_energies(df, cfg=cfg)
-    if energies["score"] < min_score or energies["direction"] not in ("long", "short"):
+    # 0) Market regime filter: bail early if conditions are poor
+    regime_ok, regime_det = _regime_check(df, cfg)
+    if not regime_ok:
+        _explain_log(symbol, "regime", regime_det, cfg)
         return None
 
+    # 1) Energies
+    energies = evaluate_five_energies(df, cfg)
+    if energies["direction"] not in ("long", "short"):
+        _explain_log(symbol, "no-trend", {"ema20>ema50 & price>ema50 (long) OR opposite (short)": False}, cfg)
+        return None
+
+    if energies["score"] < min_score:
+        # show which energies failed
+        fails = {k: bool(energies[k]) for k in ("trend","momentum","cycle","sr","volume")}
+        _explain_log(symbol, f"score<{min_score}", fails, cfg)
+        return None
+
+    # 2) Higher timeframe confirmation (weekly)
+    mtf_cfg = (cfg.get("trading", {}).get("mtf") or {})
+    if bool(mtf_cfg.get("enabled", False)):
+        try:
+            wk = _resample_weekly_ohlcv(df)
+            wk_ind = add_indicators(wk)
+            w_trend = _weekly_trend_view(wk_ind, mtf_cfg)
+            mtf_ok, mtf_reason = _mtf_alignment_ok(energies["direction"], w_trend, mtf_cfg)
+            if not mtf_ok:
+                _explain_log(symbol, "mtf", {"reason": mtf_reason, "weekly": w_trend}, cfg)
+                return None
+        except Exception as e:
+            # Don't block, but log the issue
+            _explain_log(symbol, "mtf-error", {"err": str(e)}, cfg)
+            mtf_reason = "mtf-skip-error"
+    else:
+        mtf_reason = "mtf-disabled"
+
+    # 3) Risk levels and sizing
     row   = df.iloc[-1]
     close = float(row["Close"])
     atr   = float(row["ATR14"])
 
-    # 1) Compute exits
     stop, target = compute_levels(
         direction   = energies["direction"],
         entry       = close,
@@ -363,11 +539,12 @@ def build_trade_signal(symbol: str, df: pd.DataFrame, cfg: dict) -> TradeSignal 
         reward_mult = float(cfg["risk"]["reward_multiple"]),
     )
     if stop is None or target is None:
+        _explain_log(symbol, "levels-none", {"atr": atr}, cfg)
         return None
 
-    # 2) Position size with centralized manager
     qty = size_position(cfg=cfg, entry=close, stop=stop)
     if qty <= 0:
+        _explain_log(symbol, "qty<=0", {"entry": close, "stop": stop}, cfg)
         return None
 
     per_share_risk = abs(close - stop)
@@ -385,6 +562,23 @@ def build_trade_signal(symbol: str, df: pd.DataFrame, cfg: dict) -> TradeSignal 
         total_risk = total_risk,
         notes = (
             f"Trend:{energies['trend']} Mom:{energies['momentum']} "
-            f"Cycle:{energies['cycle']} S/R:{energies['sr']} Vol:{energies['volume']}"
+            f"Cycle:{energies['cycle']} S/R:{energies['sr']} Vol:{energies['volume']} | "
+            f"MTF:{mtf_reason}"
         ),
     )
+
+
+# ---------- (optional) simple demo signals ----------
+def generate_signals(df: pd.DataFrame) -> pd.DataFrame:
+    close = np.asarray(df["Close"], dtype="float64").ravel()
+    rsi   = talib.RSI(close, 14)
+    ema20 = talib.EMA(close, 20)
+    df = df.copy()
+    df["RSI"] = pd.Series(rsi, index=df.index)
+    df["EMA20"] = pd.Series(ema20, index=df.index)
+    buy_mask  = (rsi < 30) & (close > ema20)
+    sell_mask = (rsi > 70) & (close < ema20)
+    df["Signal"] = 0
+    df.loc[buy_mask, "Signal"] = 1
+    df.loc[sell_mask, "Signal"] = -1
+    return df

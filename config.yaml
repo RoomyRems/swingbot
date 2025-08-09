@@ -34,8 +34,25 @@ momentum:
   zero_line_mode: "confirm"
   zero_cross_lookback: 3
 
-fundamentals:
+volume:
+  rvol_window: 20        # days for median volume
+  rvol_threshold: 1.20   # require RVOL >= this
+  ad_trend_lookback: 3   # AD slope lookback in bars
+  obv_confirm: true      # also require OBV moving in the same direction
+
+regime:
   enabled: true
+  adx_min: 18           # require ADX(14) >= this (trend strength floor)
+  atr_pct_min: 0.015    # require ATR14/Close >= this (volatility floor; 1.5%)
+  use_chop: true        # use Choppiness Index filter
+  chop_window: 14       # CHOP lookback
+  chop_max: 55          # skip if CHOP > this (too rangey)
+
+logging:
+  explain_rejects: false
+
+fundamentals:
+  enabled: false
 
   # 1) Price range filter
   min_price: 5
@@ -75,3 +92,30 @@ trading:
   time_in_force: "gtc"         # "day" or "gtc"
   order_type: "market"         # "market" or "limit"
   max_signals_per_run: 0       # 0=unlimited; otherwise cap per run
+
+  # ---- Higher timeframe (MTF) confirmation ----
+  mtf:
+    enabled: true
+    timeframe: "W"             # resample daily → weekly
+    trend_filter: "ema"        # "ema" or "macd"
+    ema_fast: 20
+    ema_slow: 50
+    macd_fast: 12
+    macd_slow: 26
+    macd_signal: 9
+    require_alignment: true    # long needs HTF uptrend; short needs HTF downtrend
+    reject_on_mismatch: true   # if false, you could penalize score instead (we'll hard-reject for now)
+
+
+### ---------- For backtesting ---------- ###
+backtest:
+  start_days_ago: 300     # first pass using lookback
+  initial_equity: 50000
+  commission_per_share: 0.00
+  slippage_bps: 2         # 0.02% on entries & exits
+  allow_short: true
+  max_positions: 5
+  max_new_trades_per_week: 3
+  entry_price: "next_open"   # or "close"
+  touch_priority: "stop_first"  # if both hit same day: stop_first|target_first
+
