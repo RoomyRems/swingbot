@@ -267,7 +267,7 @@ def run_backtest(
 
                 # Regime filter first (same as live)
                 try:
-                    if not _regime_pass(hist, cfg):
+                    if not _regime_check(hist, cfg):
                         continue
                 except Exception:
                     # if anything weird → don't block
