@@ -3,16 +3,16 @@ risk.manager
 ------------
 Position sizing and level calculation helpers for equities.
 - compute_levels: build stop/target using ATR multiples
-- size_position : shares based on % risk of equity, with optional BP cap
+- size_position : shares based on % risk of equity, with optional caps
 """
 
 from math import floor
 from typing import Tuple
 
-# Optional: we’ll read equity / buying power from Alpaca if configured
+# Optional: read equity / buying power from Alpaca if configured
 try:
     from broker.alpaca import api  # only used when use_broker_equity is True
-except Exception:  # keep module import-safe in non-broker contexts
+except Exception:
     api = None
 
 
@@ -39,23 +39,33 @@ def compute_levels(
     if entry <= 0 or atr <= 0 or atr_mult <= 0 or reward_mult <= 0:
         return None, None
 
-    d = direction.lower()
+    d = (direction or "").lower()
     if d in {"long", "buy", "bull"}:
         stop = entry - atr_mult * atr
         if stop <= 0:
             return None, None
-        r    = entry - stop  # R
-        tgt  = entry + reward_mult * r
+        r   = entry - stop
+        tgt = entry + reward_mult * r
     elif d in {"short", "sell", "bear"}:
         stop = entry + atr_mult * atr
-        r    = stop - entry  # R
-        tgt  = entry - reward_mult * r
+        r   = stop - entry
+        tgt = entry - reward_mult * r
         if tgt <= 0:
             return None, None
     else:
         return None, None
 
-    return _round_cent(stop), _round_cent(tgt)
+    stop = _round_cent(stop)
+    tgt  = _round_cent(tgt)
+
+    # Guard against rounding collapsing R to zero
+    if abs(entry - stop) < 0.01:
+        if d in {"long", "buy", "bull"}:
+            stop = _round_cent(entry - 0.01)
+        else:
+            stop = _round_cent(entry + 0.01)
+
+    return stop, tgt
 
 
 def _get_equity(cfg: dict) -> float:
@@ -72,7 +82,14 @@ def _get_equity(cfg: dict) -> float:
     return float(risk.get("account_equity", 0.0))
 
 
-def _get_buying_power() -> float | None:
+def _get_buying_power(cfg: dict) -> float | None:
+    """
+    Only consult broker buying power when use_broker_equity is True.
+    This prevents live BP from constraining backtests.
+    """
+    risk = cfg.get("risk", {})
+    if not bool(risk.get("use_broker_equity", False)):
+        return None
     if api is None:
         return None
     try:
@@ -84,7 +101,10 @@ def _get_buying_power() -> float | None:
 def size_position(cfg: dict, entry: float, stop: float) -> int:
     """
     Shares = floor( (risk_per_trade_pct * equity) / per_share_risk ).
-    Also caps by buying power * bp_utilization (if broker is available).
+    Caps by:
+      - optional max_notional_pct of equity (if 0<pct<1)
+      - optional max_shares (if >0)
+      - broker buying power * bp_utilization (only if use_broker_equity=True)
     Returns 0 if not feasible.
     """
     if entry is None or stop is None or entry <= 0:
@@ -107,12 +127,23 @@ def size_position(cfg: dict, entry: float, stop: float) -> int:
     if qty < min_shares:
         return 0
 
-    # Optional BP cap
+    # Optional: cap by % of equity as notional
+    max_notional_pct = float(risk.get("max_notional_pct", 1.0))
+    if 0.0 < max_notional_pct < 1.0:
+        max_qty_by_notional = floor((equity * max_notional_pct) / entry)
+        qty = min(qty, max_qty_by_notional)
+
+    # Optional: absolute share cap
+    max_shares = int(risk.get("max_shares", 0))
+    if max_shares > 0:
+        qty = min(qty, max_shares)
+
+    # Optional: broker buying power cap (live only)
     bp_util = float(risk.get("bp_utilization", 1.0))
-    bp_now = _get_buying_power()
-    if bp_now is not None and 0 < bp_util <= 1.0:
+    bp_now = _get_buying_power(cfg)
+    if (bp_now is not None) and (0 < bp_util <= 1.0) and entry > 0:
         notional_cap = bp_now * bp_util
-        max_by_bp = floor(notional_cap / entry) if entry > 0 else 0
+        max_by_bp = floor(notional_cap / entry)
         qty = min(qty, max_by_bp)
 
     return max(int(qty), 0)

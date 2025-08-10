@@ -156,15 +156,29 @@ def _find_pivots(high: pd.Series, low: pd.Series, left: int, right: int) -> tupl
             lows_idx.append(i)
     return highs_idx, lows_idx
 
-def _nearest_pivot_levels(df: pd.DataFrame, lookback: int, left: int, right: int):
+def _nearest_pivot_levels(df: pd.DataFrame, lookback: int, left: int, right: int, price: float | None = None):
     tail = df.tail(lookback)
     highs_idx, lows_idx = _find_pivots(tail["High"], tail["Low"], left, right)
     base = len(df) - len(tail)
+
     highs_abs = [base + i for i in highs_idx]
     lows_abs  = [base + i for i in lows_idx]
 
-    support = float(df["Low"].iloc[lows_abs].max()) if lows_abs else None
-    resistance = float(df["High"].iloc[highs_abs].min()) if highs_abs else None
+    if price is None:
+        price = float(df["Close"].iloc[-1])
+
+    # candidates near current price with direction
+    low_levels  = [float(df["Low"].iloc[i])  for i in lows_abs]
+    high_levels = [float(df["High"].iloc[i]) for i in highs_abs]
+
+    # support: nearest pivot low BELOW or EQUAL to price
+    sup_below = [lvl for lvl in low_levels  if lvl <= price]
+    support = max(sup_below) if sup_below else None
+
+    # resistance: nearest pivot high ABOVE or EQUAL to price
+    res_above = [lvl for lvl in high_levels if lvl >= price]
+    resistance = min(res_above) if res_above else None
+
     return support, resistance
 
 
@@ -174,22 +188,22 @@ def _macd_expansion_ok(df: pd.DataFrame, direction: str, mcfg: dict) -> bool:
         return False
     lookback = _get_int(mcfg, "expansion_lookback", 3)
     min_steps = _get_int(mcfg, "expansion_min_steps", 2)
-    if lookback < 2 or len(df) < lookback + 1:
-        return True  # permissive if not enough bars
+    if lookback < 1 or len(df) < lookback + 1:
+        return True  # permissive when insufficient data
 
     macdh = df["MACDh"].to_numpy()
     if not np.isfinite(macdh[-1]):
         return False
 
-    # direction-consistent sign
-    if direction == "long" and macdh[-1] <= 0:
-        return False
-    if direction == "short" and macdh[-1] >= 0:
-        return False
+    # sign-aware improvement over last `lookback` diffs
+    diffs = np.diff(macdh[-(lookback+1):])  # len = lookback
+    if direction == "long":
+        # allow “improving toward/above zero” (doesn’t force >0 here;
+        # zero-line policy is handled in _macd_zero_line_ok)
+        good = np.sum(diffs > 0)
+    else:
+        good = np.sum(diffs < 0)
 
-    last = np.abs(macdh[-(lookback+1):])
-    diffs = np.diff(last)  # length = lookback
-    good = np.sum(diffs > 0)  # absolute expansion is symmetric
     return good >= min_steps
 
 def _macd_zero_line_ok(df: pd.DataFrame, direction: str, mcfg: dict) -> bool:
@@ -291,32 +305,42 @@ def evaluate_five_energies(df: pd.DataFrame, cfg: dict | None = None) -> dict:
     cycle_ok = bull_cycle if direction == "long" else bear_cycle if direction == "short" else False
 
     # 4) SUPPORT/RESISTANCE — pivot-based + EMA50 fallback
+    # --- S/R config ---
     scfg = _cfg_path(cfg, "signals", "sr_pivots", default={})
     lookback = _get_int(scfg, "lookback", 60)
     left     = _get_int(scfg, "left", 3)
     right    = _get_int(scfg, "right", 3)
     near_pct = _get_float(scfg, "near_pct", 0.02)
     near_atr = _get_float(scfg, "near_atr_mult", 0.5)
-    ema_fall = _get_float(scfg, "ema50_fallback_pct", 0.02)
 
-    support, resistance = _nearest_pivot_levels(df, lookback, left, right)
+    # IMPORTANT: allow disabling EMA50 fallback when None/null
+    ema_fall_raw = scfg.get("ema50_fallback_pct", 0.02)
+    ema_fall = None
+    try:
+        if ema_fall_raw is not None:
+            ema_fall = float(ema_fall_raw)
+    except Exception:
+        ema_fall = None  # if malformed, treat as disabled
 
     price = float(row["Close"])
+    support, resistance = _nearest_pivot_levels(df, lookback, left, right, price=price)
+
     tol_abs = float(row["ATR14"]) * near_atr if np.isfinite(row["ATR14"]) else np.inf
     tol_pct = price * near_pct
     tol = max(tol_abs, tol_pct)
 
     sr_used = None
-    if direction == "long" and support is not None:
-        sr_ok = abs(price - support) <= tol and (support <= price)
+    if direction == "long" and (support is not None):
+        sr_ok = (support <= price) and (abs(price - support) <= tol)
         sr_used = "pivot-support" if sr_ok else None
-    elif direction == "short" and resistance is not None:
-        sr_ok = abs(resistance - price) <= tol and (resistance >= price)
+    elif direction == "short" and (resistance is not None):
+        sr_ok = (resistance >= price) and (abs(resistance - price) <= tol)
         sr_used = "pivot-resistance" if sr_ok else None
     else:
         sr_ok = False
 
-    if not sr_ok:
+    # only if pivot check failed AND fallback is enabled
+    if (not sr_ok) and (ema_fall is not None):
         sr_ok = (abs(price - float(row["EMA50"])) / price) <= ema_fall
         if sr_ok:
             sr_used = "ema50-fallback"
