@@ -6,129 +6,7 @@ risk:
   risk_per_trade_pct: 0.02     # 2% risk per trade
   atr_multiple_stop: 1.5       # stop = 1.5 * ATR(14)
   reward_multiple: 2.0         # target = entry + 2R
-  max_total_risk_pct: 0.10     # (live guard; backtester has its own cap below)
-  bp_utilization: 0.95         # spend at most 95% of available buying power
-  min_shares: 1
-
-signals:
-  sr_pivots:
-    lookback: 60          # bars to search for recent pivots
-    left: 3               # pivot definition: bars to the left
-    right: 3              # pivot definition: bars to the right
-    near_pct: 0.015       # stricter proximity (was 0.02)
-    near_atr_mult: 0.5    # or within 0.5 * ATR(14)
-    ema50_fallback_pct: null  # disable EMA50 fallback for now
-
-# --- momentum quality controls ---
-momentum:
-  rsi_filter: true          # keep RSI check (>=50 long, <=50 short)
-  rsi_threshold: 50
-  use_macd_expansion: true  # require MACD histogram expansion
-  expansion_lookback: 3     # look at last N bars of MACDh
-  expansion_min_steps: 2    # 
-
-  # zero-line context for MACD line (not histogram):
-  #  - none     : ignore zero-line
-  #  - confirm  : require MACD>0 for longs ( <0 for shorts )
-  #  - cross    : require a zero-cross within the last K bars
-  zero_line_mode: "confirm"   # stricter (was "confirm")
-  zero_cross_lookback: 3
-
-volume:
-  rvol_window: 20        # days for median volume
-  rvol_threshold: 1.20   # stricter (was 1.20)
-  ad_trend_lookback: 3   # AD slope lookback in bars
-  obv_confirm: true      # also require OBV moving in the same direction
-
-regime:
-  enabled: true
-  adx_min: 18           # require ADX(14) >= this (trend strength floor)
-  atr_pct_min: 0.015    # require ATR14/Close >= this (volatility floor; 1.5%)
-  use_chop: true        # use Choppiness Index filter
-  chop_window: 14       # CHOP lookback
-  chop_max: 55          # skip if CHOP > this (too rangey)
-
-logging:
-  explain_rejects: true  # keep detailed reasons visible
-
-fundamentals:
-  enabled: false
-
-  # 1) Price range filter
-  min_price: 5
-  max_price: 1000
-
-  # 2) Liquidity (use 50-day average volume)
-  min_avg_vol: 1000000     
-
-  # 3) Earnings blackout (skip if earnings within +/- N calendar days)
-  earnings_blackout_days: 3
-
-  # 4) Sector allow/deny lists (requires a fundamentals provider; otherwise ignored)
-  sectors_allow: []        # e.g., ["Technology","Healthcare"]
-  sectors_deny:  []        # e.g., ["Energy"]
-
-  # 5) Tradability is handled earlier by Alpaca (filter_active_tradable)
-
-  # Optional: basic profitability (requires provider; ignored if data missing)
-  profitability:
-    enabled: false
-    require_positive_eps_ttm: true
-    min_revenue_yoy_growth_pct: 0
-
-  # Optional: short-term news sentiment / red-flag headlines (requires provider)
-  news:
-    enabled: true
-    lookback_days: 3
-    min_sentiment: -0.10        # require >= this; -1..1 scale
-    forbid_red_flags:
-      - bankruptcy
-      - fraud
-      - "going concern"
-
-trading:
-  min_score: 4                 # 4 out of 5 alignment
-  confirm_before_place: true   # prompt before sending orders
-  time_in_force: "gtc"         # "day" or "gtc"
-  order_type: "market"         # "market" or "limit"
-  max_signals_per_run: 0       # 0=unlimited; otherwise cap per run
-
-  # ---- Higher timeframe (MTF) confirmation ----
-  mtf:
-    enabled: true
-    timeframe: "W"             # resample daily → weekly
-    trend_filter: "ema"        # "ema" or "macd"
-    ema_fast: 20
-    ema_slow: 50
-    macd_fast: 12
-    macd_slow: 26
-    macd_signal: 9
-    require_alignment: true
-    reject_on_mismatch: true
-
-### ---------- For backtesting ---------- ###
-backtest:
-  start_days_ago: 600
-  initial_equity: 50000
-  commission_per_share: 0.00
-  slippage_bps: 2.0              # 0.02% on entries & exits
-  allow_short: true
-  max_open_positions: 6          # portfolio cap (engine uses this key)
-  max_total_risk_pct: 0.08       # cap total risk across all open trades
-  max_new_trades_per_week: 3
-  touch_priority: "stop_first"   # if both hit same day: stop_first|target_first
-
-  # Backtest entry model (independent of live order_type)
-  entry_model:
-    type: "limit_retrace"        # "market" or "limit_retrace"dry_run: false   # set true to preview/log only (no orders)
-
-risk:
-  account_equity: 50000        # used only if use_broker_equity: false
-  use_broker_equity: true      # pull live equity from Alpaca paper acct
-  risk_per_trade_pct: 0.02     # 2% risk per trade
-  atr_multiple_stop: 1.5       # stop = 1.5 * ATR(14)
-  reward_multiple: 2.0         # target = entry + 2R
-  max_total_risk_pct: 0.10     # (live guard; backtester has its own cap below)
+  max_total_risk_pct: 0.10     # cap total risk across open stops
   bp_utilization: 0.95         # spend at most 95% of available buying power
   min_shares: 1
 
@@ -137,41 +15,39 @@ signals:
     lookback: 60
     left: 3
     right: 3
-    near_pct: 0.015            # stricter proximity (was 0.02)
-    near_atr_mult: 0.5         # or within 0.5 * ATR(14)
-    ema50_fallback_pct: null   # disable EMA50 fallback for now
+    near_pct: 0.025            # was 0.015 — loosen proximity
+    near_atr_mult: 0.75        # was 0.5  — allow wider ATR tolerance
+    ema50_fallback_pct: 0.025  # re-enable EMA50 fallback
+    yesterday_touch_ok: true   # NEW: accept prior-bar proximity as valid
 
 # --- momentum quality controls ---
 momentum:
-  rsi_filter: true             # keep RSI check (>=50 long, <=50 short)
+  rsi_filter: true
   rsi_threshold: 50
-  use_macd_expansion: true     # require MACD histogram expansion
+  use_macd_expansion: false    # was true — expansion becomes optional/bonus
   expansion_lookback: 3
-  expansion_min_steps: 3       # stricter (was 2)
+  expansion_min_steps: 1
+  zero_line_mode: "confirm"    # was "cross" — confirm MACD sign only
+  zero_cross_lookback: 3
 
-  # zero-line context for MACD line (not histogram):
-  #  - none     : ignore zero-line
-  #  - confirm  : require MACD>0 for longs ( <0 for shorts )
-  #  - cross    : require a zero-cross within the last K bars
-  zero_line_mode: "cross"      # stricter: require recent cross
-  zero_cross_lookback: 5       # lookback for the zero-cross condition
-
+# --- volume confirmation (any-of) ---
 volume:
   rvol_window: 20
-  rvol_threshold: 1.30         # stricter (was 1.20)
+  rvol_threshold: 1.15         # was 1.20/1.30 — slightly easier participation
   ad_trend_lookback: 3
-  obv_confirm: true            # require OBV to agree
+  obv_confirm: true            # counts as one check if true
+  min_checks_true: 1           # NEW: require at least N of {RVOL, A/D, OBV}
 
 regime:
   enabled: true
-  adx_min: 18                  # trend strength floor
-  atr_pct_min: 0.015           # volatility floor; 1.5%
+  adx_min: 16                  # was 18 — a bit more permissive
+  atr_pct_min: 0.010           # was 0.015 — allow lower-vol environments
   use_chop: true
   chop_window: 14
-  chop_max: 55                 # skip if too rangey
+  chop_max: 60                 # was 55 — allow a touch more range
 
 logging:
-  explain_rejects: true        # keep detailed reasons visible
+  explain_rejects: true
 
 fundamentals:
   enabled: false
@@ -195,48 +71,49 @@ fundamentals:
       - "going concern"
 
 trading:
-  min_score: 4                 # need 5/5 energies aligned
+  # NOTE: MTF can count as a 6th "bonus" energy; keep min_score at 4 so you're not forced to pass volume+MTF simultaneously.
+  min_score: 4
   confirm_before_place: true
   time_in_force: "gtc"
-  order_type: "market"         # live setting; backtest has its own entry model
+  order_type: "market"
   max_signals_per_run: 0
 
   # ---- Higher timeframe (MTF) confirmation ----
   mtf:
     enabled: true
-    timeframe: "W"             # resample daily → weekly
-    trend_filter: "ema"        # "ema" or "macd"
+    timeframe: "W"
+    trend_filter: "macd"       # MACD-based weekly momentum tends to work better
     ema_fast: 20
     ema_slow: 50
     macd_fast: 12
     macd_slow: 26
     macd_signal: 9
     require_alignment: true
-    reject_on_mismatch: true
+    reject_on_mismatch: false  # don't veto — it's a bonus energy instead
+    counts_as_energy: true     # NEW: add +1 to score when aligned
 
 ### ---------- For backtesting ---------- ###
 backtest:
   start_days_ago: 600
   initial_equity: 50000
   commission_per_share: 0.00
-  slippage_bps: 2.0              # 0.02% on entries & exits
+  slippage_bps: 2.0
   allow_short: true
-  max_open_positions: 6          # portfolio cap (engine uses this key)
-  max_total_risk_pct: 0.08       # cap total risk across all open trades
+  max_open_positions: 6
+  max_total_risk_pct: 0.08
   max_new_trades_per_week: 3
-  touch_priority: "stop_first"   # if both hit same day: stop_first|target_first
+  touch_priority: "stop_first"
+  bp_multiple: 1.0               # cap notional per trade to 1.0× equity (set 2.0 for margin)
+  halt_on_equity_at_or_below: 0  # block new trades if equity <= this
+  force_close_on_end: true       # liquidate all open positions on final day
 
-  # Breakeven controls (used by engine.py)
-  breakeven_at_R: 1.0            # move stop to entry after +1R; 0.0 disables
-  breakeven_intrabar: favor_be    # or "favor_stop" for conservative ordering
+  # Breakeven controls (engine.py uses these)
+  breakeven_at_R: 1.0
+  breakeven_intrabar: "favor_be"   # or "favor_stop"
 
   # Backtest entry model (independent of live order_type)
   entry_model:
-    type: "limit_retrace"        # "market" or "limit_retrace"
+    type: "limit_retrace"          # "market" or "limit_retrace"
     retrace_to: "EMA20"
-    atr_fraction: 0.25           # ±0.25 * ATR from EMA20 in trade direction
-    horizon_days: 3              # give it up to 3 bars to fill
-
-    retrace_to: "EMA20"          # base reference
-    atr_fraction: 0.25           # ±0.25 * ATR from EMA20 in trade direction
-    horizon_days: 3              # give it up to 3 bars to fill
+    atr_fraction: 0.25
+    horizon_days: 3

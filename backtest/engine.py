@@ -55,6 +55,11 @@ def _annualized_sharpe(daily_pct: pd.Series) -> float:
 def _week_key(ts: pd.Timestamp) -> pd.Period:
     return pd.to_datetime(ts).to_period("W-FRI")
 
+def _qty_bp_cap(entry_px: float, equity: float, bp_multiple: float) -> int:
+    if entry_px <= 0 or equity <= 0 or bp_multiple <= 0:
+        return 0
+    return int(math.floor((equity * bp_multiple) / entry_px))
+
 @dataclass
 class PendingLimit:
     symbol: str
@@ -125,9 +130,13 @@ def run_backtest(
     cfg = load_config(cfg_path)
 
     bt_cfg = cfg.get("backtest", {}) or {}
+    # caps
     max_open = int(bt_cfg.get("max_open_positions", bt_cfg.get("max_positions", 6)))
     max_risk_pct = float(bt_cfg.get("max_total_risk_pct", cfg.get("risk", {}).get("max_total_risk_pct", 0.08)))
     max_new_week = int(bt_cfg.get("max_new_trades_per_week", 0))  # 0 = unlimited
+    bp_multiple = float(bt_cfg.get("bp_multiple", 1.0))  # simple notional cap
+    equity_halt_floor = float(bt_cfg.get("halt_on_equity_at_or_below", 0.0))
+    force_close_on_end = bool(bt_cfg.get("force_close_on_end", True))
 
     # entry model
     if "entry_model" in bt_cfg:
@@ -148,9 +157,9 @@ def run_backtest(
     slip_bps = float(bt_cfg.get("slippage_bps", 0.0))
     commission_ps = float(bt_cfg.get("commission_per_share", 0.0))
 
-    # Breakeven config
-    be_R = float(bt_cfg.get("breakeven_at_R", 0.0))  # 0 disables
-    be_intrabar = str(bt_cfg.get("breakeven_intrabar", "favor_be")).lower()  # or "favor_stop"
+    # BREAKEVEN
+    be_R = float(bt_cfg.get("breakeven_at_R", 0.0))
+    be_intrabar = str(bt_cfg.get("breakeven_intrabar", "favor_be")).lower()
 
     start_date = pd.to_datetime(start_date)
     end_date = pd.to_datetime(end_date)
@@ -170,8 +179,10 @@ def run_backtest(
 
     calendar = [d for d in _trading_calendar(data) if (start_date <= d <= end_date)]
     calendar = sorted(calendar)
+    if not calendar:
+        raise RuntimeError("No trading days in range.")
 
-    # Precompute daily candidates by date + evaluations
+    # Precompute daily candidates by date
     candidates_by_day: Dict[pd.Timestamp, List[dict]] = {d: [] for d in calendar}
     evaluations: List[dict] = []
     for sym, df in tqdm(data.items(), desc="Scan signals", leave=False):
@@ -183,7 +194,10 @@ def run_backtest(
             sl = df.iloc[: i + 1]
             row = sl.iloc[-1]
 
-            regime_ok, _det = _regime_check(sl, cfg)
+            # Regime
+            regime_ok, _ = _regime_check(sl, cfg)
+
+            # Energies/components
             eng = evaluate_five_energies(sl, cfg) or {}
             direction = eng.get("direction")
             score = int(eng.get("score", 0))
@@ -193,33 +207,40 @@ def run_backtest(
             sr_ok    = bool(eng.get("sr", False))
             vol_ok   = bool(eng.get("volume", False))
 
+            # MTF bonus
             if direction in ("long", "short"):
                 mtf_ok, _mtf_reason = _mtf_ok_for_slice(sl, cfg, direction)
             else:
                 mtf_ok, _mtf_reason = False, "no-dir"
+            mtf_cfg = (cfg.get("trading", {}).get("mtf") or {})
+            mtf_counts = bool(mtf_cfg.get("counts_as_energy", True))
+            score_eff = score + (1 if (mtf_counts and mtf_ok) else 0)
 
+            # Acceptance logic (no hard veto on MTF)
             min_score = int(cfg["trading"]["min_score"])
             allowed_dir = (direction != "short") or allow_short
-            accept = regime_ok and (direction in ("long", "short")) and (score >= min_score) and mtf_ok and allowed_dir
+            accept = regime_ok and (direction in ("long", "short")) and (score_eff >= min_score) and allowed_dir
 
+            # First failing reason
             if not regime_ok:
                 reason = "regime"
             elif direction not in ("long", "short"):
                 reason = "no_dir"
-            elif score < min_score:
+            elif score_eff < min_score:
                 reason = "below_score"
-            elif not mtf_ok:
-                reason = "mtf_mismatch"
             elif not allowed_dir:
                 reason = "short_blocked"
             else:
                 reason = "pass"
 
+            # Evaluation row
             evaluations.append({
                 "date": d,
                 "symbol": sym,
                 "direction": direction or "",
                 "score": score,
+                "score_eff": int(score_eff),
+                "mtf_bonus": int(1 if (mtf_counts and mtf_ok) else 0),
                 "trend": trend_ok,
                 "momentum": mom_ok,
                 "cycle": cycle_ok,
@@ -232,7 +253,6 @@ def run_backtest(
                 "ema20": float(row.get("EMA20", np.nan)),
                 "atr14": float(row.get("ATR14", np.nan)),
                 "adx14": float(row.get("ADX14", np.nan)) if "ADX14" in row.index else np.nan,
-                "chop14": float(row.get("CHOP14", np.nan)) if "CHOP14" in row.index else np.nan,
             })
 
             if accept:
@@ -240,11 +260,11 @@ def run_backtest(
                     "symbol": sym,
                     "date": d,
                     "direction": direction,
-                    "score": score,
+                    "score": int(score),
+                    "score_eff": int(score_eff),
                     "close": float(row["Close"]),
                     "ema20": float(row.get("EMA20", np.nan)),
                     "atr": float(row.get("ATR14", np.nan)),
-                    "stop_target_inputs": (float(row.get("Close", np.nan)), float(row.get("ATR14", np.nan))),
                 })
 
     # --- DIAGNOSTIC ---
@@ -264,10 +284,12 @@ def run_backtest(
     week_new_count: defaultdict[pd.Period, int] = defaultdict(int)
 
     def _current_total_risk() -> float:
-        if equity <= 0 or not open_positions:
+        if not open_positions:
             return 0.0
+        # Use a tiny floor in denominator to avoid divide-by-zero; treat <=0 equity as maxed risk.
+        eq = max(equity, 1e-9)
         risk_amt = sum(p.per_share_risk * p.qty for p in open_positions.values())
-        return risk_amt / equity
+        return float(risk_amt / eq)
 
     # ---------- backtest loop ----------
     for day in tqdm(calendar, desc="Backtest", leave=True):
@@ -281,7 +303,7 @@ def run_backtest(
             l = float(df.at[day, "Low"])
             c = float(df.at[day, "Close"])
 
-            # Breakeven arming
+            # BREAKEVEN
             orig_stop = pos.stop
             if be_R > 0 and not pos.be_armed:
                 if pos.side == "long":
@@ -319,7 +341,6 @@ def run_backtest(
                 slip = (slip_bps / 10000.0) * fill_px
                 fill_px_eff = fill_px - slip if pos.side == "long" else fill_px + slip
                 commission = commission_ps * pos.qty
-
                 if pos.side == "long":
                     cash += pos.qty * fill_px_eff
                 else:
@@ -337,14 +358,17 @@ def run_backtest(
                     "qty": pos.qty,
                     "pnl": pnl,
                     "r_multiple": pnl / (pos.per_share_risk * pos.qty) if pos.per_share_risk > 0 else np.nan,
-                    "commission": commission_ps * pos.qty * 2.0,  # entry+exit
+                    "commission": commission_ps * pos.qty * 2.0,
                     "slippage_cost": slip * pos.qty,
                     "reason": exit_reason,
                 })
                 del open_positions[sym]
 
-        # 2) try to place/fill pending limit orders (respect weekly cap)
+        # 2) try to place/fill pending limit orders
         for pend in list(pending_limits):
+            if equity <= equity_halt_floor:
+                pending_limits.clear()
+                break
             df = data.get(pend.symbol)
             if df is None or day < pend.signal_date or day > pend.expires or day not in df.index:
                 if day > pend.expires:
@@ -359,50 +383,31 @@ def run_backtest(
                     pending_limits.remove(pend)
                 continue
 
-            # caps
             if len(open_positions) >= max_open or (_current_total_risk() >= max_risk_pct):
                 continue
             wk = _week_key(day)
             if max_new_week > 0 and week_new_count[wk] >= max_new_week:
                 continue
 
-            # per-day cfg: force no broker equity/BP in backtest
+            # per-day cfg: override equity (no broker BP)
             cfg_day = copy.deepcopy(cfg)
             cfg_day["risk"]["use_broker_equity"] = False
             cfg_day["risk"]["account_equity"] = float(equity)
-            cfg_day["risk"]["bp_utilization"] = 0.0  # disable BP cap in backtest
 
             # effective entry with slippage
             slip = (slip_bps / 10000.0) * pend.limit_px
             entry_px = pend.limit_px + slip if pend.direction == "long" else pend.limit_px - slip
 
-            # recompute stop/target off actual fill price & today's ATR
-            atr_today = float(df.at[day, "ATR14"]) if "ATR14" in df.columns else np.nan
-            if not np.isfinite(atr_today):
-                # fallback: keep planned stop/target
-                stop, target = float(pend.stop), float(pend.target)
-            else:
-                st = rm_compute_levels(
-                    direction=pend.direction,
-                    entry=entry_px,
-                    atr=atr_today,
-                    atr_mult=float(cfg["risk"]["atr_multiple_stop"]),
-                    reward_mult=float(cfg["risk"]["reward_multiple"]),
-                )
-                if not st or st[0] is None or st[1] is None:
-                    # if compute fails, keep planned
-                    stop, target = float(pend.stop), float(pend.target)
-                else:
-                    stop, target = float(st[0]), float(st[1])
-
-            # size from risk helper (using recomputed stop)
-            qty = rm_size_position(cfg_day, entry=entry_px, stop=stop)
+            # size from live helper, then apply BP cap
+            qty = rm_size_position(cfg_day, entry=entry_px, stop=pend.stop)
+            qty_bp = _qty_bp_cap(entry_px, equity, bp_multiple)
+            qty = min(qty, qty_bp)
             if qty <= 0:
                 continue
 
             # portfolio risk cap check
-            psr = abs(entry_px - stop)
-            new_total_risk = (_current_total_risk() * equity + psr * qty) / equity
+            psr = abs(entry_px - pend.stop)
+            new_total_risk = (_current_total_risk() * max(equity, 1e-9) + psr * qty) / max(equity, 1e-9)
             if new_total_risk > max_risk_pct:
                 continue
 
@@ -419,8 +424,8 @@ def run_backtest(
                 entry_date=day,
                 entry_price=entry_px,
                 qty=qty,
-                stop=stop,
-                target=target,
+                stop=pend.stop,
+                target=pend.target,
                 per_share_risk=psr,
                 score=pend.score,
                 be_armed=False,
@@ -431,19 +436,19 @@ def run_backtest(
         # 3) new signals for this day (respect caps; market enters at next open)
         day_candidates = sorted(
             candidates_by_day.get(day, []),
-            key=lambda s: (-s["score"], s["close"])
+            key=lambda s: (-s.get("score_eff", s["score"]), s["close"])
         )
 
         for sig in day_candidates:
+            if equity <= equity_halt_floor:
+                break
             if sig["symbol"] in open_positions:
                 continue
             if len(open_positions) >= max_open or (_current_total_risk() >= max_risk_pct):
                 break
-
             df = data[sig["symbol"]]
 
             if entry_type == "market":
-                # enter NEXT trading day open
                 idx = df.index.get_indexer([sig["date"]])[0]
                 if idx == -1 or idx + 1 >= len(df.index):
                     continue
@@ -453,37 +458,32 @@ def run_backtest(
                     continue
 
                 o = float(df.at[nd, "Open"])
+
                 slip = (slip_bps / 10000.0) * o
                 entry_px = o + slip if sig["direction"] == "long" else o - slip
 
-                # compute levels off entry day ATR (fallback to signal ATR)
-                atr_today = float(df.at[nd, "ATR14"]) if "ATR14" in df.columns else sig["atr"]
-                if not np.isfinite(atr_today):
-                    atr_today = sig["atr"]
-
-                st = rm_compute_levels(
+                stop, target = rm_compute_levels(
                     direction=sig["direction"],
                     entry=entry_px,
-                    atr=atr_today,
+                    atr=sig["atr"],
                     atr_mult=float(cfg["risk"]["atr_multiple_stop"]),
                     reward_mult=float(cfg["risk"]["reward_multiple"]),
                 )
-                if not st or st[0] is None or st[1] is None:
+                if stop is None or target is None:
                     continue
-                stop, target = float(st[0]), float(st[1])
 
-                # per-day cfg: force no broker equity/BP in backtest
                 cfg_day = copy.deepcopy(cfg)
                 cfg_day["risk"]["use_broker_equity"] = False
                 cfg_day["risk"]["account_equity"] = float(equity)
-                cfg_day["risk"]["bp_utilization"] = 0.0
 
                 qty = rm_size_position(cfg_day, entry=entry_px, stop=stop)
+                qty_bp = _qty_bp_cap(entry_px, equity, bp_multiple)
+                qty = min(qty, qty_bp)
                 if qty <= 0:
                     continue
 
                 psr = abs(entry_px - stop)
-                new_total_risk = (_current_total_risk() * equity + psr * qty) / equity
+                new_total_risk = (_current_total_risk() * max(equity, 1e-9) + psr * qty) / max(equity, 1e-9)
                 if new_total_risk > max_risk_pct:
                     continue
 
@@ -503,28 +503,23 @@ def run_backtest(
                     stop=stop,
                     target=target,
                     per_share_risk=psr,
-                    score=sig["score"],
+                    score=int(sig.get("score_eff", sig["score"])),
                     be_armed=False,
                 )
                 week_new_count[wk_nd] += 1
 
             elif entry_type == "limit_retrace":
                 ema = sig["ema20"] if retrace_ref == "EMA20" else sig["close"]
-                if sig["direction"] == "long":
-                    limit_px = ema - atr_frac * sig["atr"]
-                else:
-                    limit_px = ema + atr_frac * sig["atr"]
-
-                st = rm_compute_levels(
+                limit_px = (ema - atr_frac * sig["atr"]) if sig["direction"] == "long" else (ema + atr_frac * sig["atr"])
+                stop, target = rm_compute_levels(
                     direction=sig["direction"],
                     entry=float(limit_px),
                     atr=sig["atr"],
                     atr_mult=float(cfg["risk"]["atr_multiple_stop"]),
                     reward_mult=float(cfg["risk"]["reward_multiple"]),
                 )
-                if not st or st[0] is None or st[1] is None:
+                if stop is None or target is None:
                     continue
-                stop, target = float(st[0]), float(st[1])
 
                 pending_limits.append(PendingLimit(
                     symbol=sig["symbol"],
@@ -534,7 +529,7 @@ def run_backtest(
                     limit_px=float(limit_px),
                     stop=float(stop),
                     target=float(target),
-                    score=sig["score"],
+                    score=int(sig.get("score_eff", sig["score"])),
                 ))
 
         # 4) mark-to-market equity for the day (close)
@@ -547,9 +542,43 @@ def run_backtest(
             mv += pos.market_value(c)
         equity_today = cash + mv
         equity_curve.append((day, equity_today))
-
-        # adapt equity for next day sizing & caps
         equity = float(equity_today)
+
+        # 5) Force-close all open positions on last day (so PnL reconciles)
+        if force_close_on_end and (day == calendar[-1]) and open_positions:
+            for sym, pos in list(open_positions.items()):
+                df = data[sym]
+                if day not in df.index:
+                    continue
+                c = float(df.at[day, "Close"])
+                slip = (slip_bps / 10000.0) * c
+                fill_px_eff = c - slip if pos.side == "long" else c + slip
+                commission = commission_ps * pos.qty
+                if pos.side == "long":
+                    cash += pos.qty * fill_px_eff
+                else:
+                    cash -= pos.qty * fill_px_eff
+                cash -= commission
+                pnl = (fill_px_eff - pos.entry_price) * pos.qty if pos.side == "long" else (pos.entry_price - fill_px_eff) * pos.qty
+                trades.append({
+                    "symbol": sym,
+                    "side": pos.side,
+                    "entry_date": pos.entry_date,
+                    "entry_price": pos.entry_price,
+                    "exit_date": day,
+                    "exit_price": fill_px_eff,
+                    "qty": pos.qty,
+                    "pnl": pnl,
+                    "r_multiple": pnl / (pos.per_share_risk * pos.qty) if pos.per_share_risk > 0 else np.nan,
+                    "commission": commission_ps * pos.qty * 2.0,
+                    "slippage_cost": slip * pos.qty,
+                    "reason": "force_end",
+                })
+                del open_positions[sym]
+            # mark equity after forced liquidation
+            equity_today = cash
+            equity_curve[-1] = (day, equity_today)
+            equity = float(equity_today)
 
     # ---------- wrap up ----------
     eq_df = pd.DataFrame(equity_curve, columns=["date", "equity"]).set_index("date")
@@ -589,10 +618,6 @@ def run_backtest(
         log_dataframe(trades_df, trades_path)
     log_dataframe(eq_df.reset_index(), equity_path)
 
-    files_list = [trades_path.name, equity_path.name]
-    if not eval_df.empty:
-        files_list.insert(0, eval_path.name)
-
     summary = {
         "start_equity": start_eq,
         "end_equity": end_eq,
@@ -607,10 +632,9 @@ def run_backtest(
         "avg_loss": float(avg_loss),
         "profit_factor": float(profit_factor),
         "avg_R": float(avg_R),
-        "files": files_list,
+        "files": [str(trades_path.name), str(equity_path.name)],
     }
 
-    # pretty print
     print("\n— Backtest Summary —")
     for k in ("start_equity","end_equity","total_return","CAGR","max_drawdown","daily_sharpe","days","trades","win_rate","avg_win","avg_loss","profit_factor","avg_R"):
         v = summary[k]
@@ -622,7 +646,6 @@ def run_backtest(
         else:
             print(f"{k:<15}: {v:.4f}" if isinstance(v, float) and not np.isnan(v) else f"{k:<15}: {v}")
 
-    trades_df = trades_df if isinstance(trades_df, pd.DataFrame) else pd.DataFrame()
     if not trades_df.empty:
         t5 = trades_df.sort_values("r_multiple", ascending=False).head(5)
         b5 = trades_df.sort_values("r_multiple", ascending=True).head(5)
