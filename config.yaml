@@ -15,36 +15,37 @@ signals:
     lookback: 60
     left: 3
     right: 3
-    near_pct: 0.025            # was 0.015 — loosen proximity
-    near_atr_mult: 0.75        # was 0.5  — allow wider ATR tolerance
-    ema50_fallback_pct: 0.025  # re-enable EMA50 fallback
-    yesterday_touch_ok: true   # NEW: accept prior-bar proximity as valid
+    near_pct: 0.025            # was 0.015
+    near_atr_mult: 0.75        # was 0.5
+    ema50_fallback_pct: 0.025  # re-enabled fallback
+    # yesterday_touch_ok defaults to true in code; add here if you want to control it
+    # yesterday_touch_ok: true
 
 # --- momentum quality controls ---
 momentum:
   rsi_filter: true
   rsi_threshold: 50
-  use_macd_expansion: false    # was true — expansion becomes optional/bonus
+  use_macd_expansion: false    # off by default; if you re-enable set expansion_min_steps: 1
   expansion_lookback: 3
   expansion_min_steps: 1
-  zero_line_mode: "confirm"    # was "cross" — confirm MACD sign only
+  zero_line_mode: "confirm"
   zero_cross_lookback: 3
 
 # --- volume confirmation (any-of) ---
 volume:
   rvol_window: 20
-  rvol_threshold: 1.15         # was 1.20/1.30 — slightly easier participation
+  rvol_threshold: 1.20
   ad_trend_lookback: 3
-  obv_confirm: true            # counts as one check if true
-  min_checks_true: 1           # NEW: require at least N of {RVOL, A/D, OBV}
+  obv_mode: "tick"             # or "slope"
+  min_components: 1            # pass if >=1 of {RVOL, AD, OBV} agrees
 
 regime:
   enabled: true
-  adx_min: 16                  # was 18 — a bit more permissive
-  atr_pct_min: 0.010           # was 0.015 — allow lower-vol environments
+  adx_min: 16
+  atr_pct_min: 0.010
   use_chop: true
   chop_window: 14
-  chop_max: 60                 # was 55 — allow a touch more range
+  chop_max: 60
 
 logging:
   explain_rejects: true
@@ -71,7 +72,7 @@ fundamentals:
       - "going concern"
 
 trading:
-  # NOTE: MTF can count as a 6th "bonus" energy; keep min_score at 4 so you're not forced to pass volume+MTF simultaneously.
+  # MTF can count as a 6th "bonus" energy; keep min_score=4
   min_score: 4
   confirm_before_place: true
   time_in_force: "gtc"
@@ -82,15 +83,14 @@ trading:
   mtf:
     enabled: true
     timeframe: "W"
-    trend_filter: "macd"       # MACD-based weekly momentum tends to work better
+    trend_filter: "ema"        # or "macd"
     ema_fast: 20
     ema_slow: 50
     macd_fast: 12
     macd_slow: 26
     macd_signal: 9
-    require_alignment: true
-    reject_on_mismatch: false  # don't veto — it's a bonus energy instead
-    counts_as_energy: true     # NEW: add +1 to score when aligned
+    counts_as_energy: true     # bonus point if aligned
+    reject_on_mismatch: false  # never a hard veto unless set true
 
 ### ---------- For backtesting ---------- ###
 backtest:
@@ -103,9 +103,10 @@ backtest:
   max_total_risk_pct: 0.08
   max_new_trades_per_week: 3
   touch_priority: "stop_first"
-  bp_multiple: 1.0               # cap notional per trade to 1.0× equity (set 2.0 for margin)
-  halt_on_equity_at_or_below: 0  # block new trades if equity <= this
-  force_close_on_end: true       # liquidate all open positions on final day
+  # The next three are ignored unless engine.py implements them:
+  bp_multiple: 1.0
+  halt_on_equity_at_or_below: 0
+  force_close_on_end: true
 
   # Breakeven controls (engine.py uses these)
   breakeven_at_R: 1.0
@@ -113,7 +114,7 @@ backtest:
 
   # Backtest entry model (independent of live order_type)
   entry_model:
-    type: "limit_retrace"          # "market" or "limit_retrace"
+    type: "market"          # "market" or "limit_retrace"
     retrace_to: "EMA20"
     atr_fraction: 0.25
     horizon_days: 3

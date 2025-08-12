@@ -5,7 +5,7 @@ from typing import Optional
 class TradeSignal:
     symbol: str
     direction: str             # "long" or "short"
-    score: int                 # 0..5
+    score: int                 # 0..6 (MTF may add +1)
     entry: float
     stop: float
     target: float

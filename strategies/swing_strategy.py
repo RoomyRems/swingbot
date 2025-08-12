@@ -216,64 +216,56 @@ def _macd_zero_line_ok(df: pd.DataFrame, direction: str, mcfg: dict) -> bool:
 
 # ---------- volume context (ANY-OF) ----------
 def _volume_energy_ok(df: pd.DataFrame, direction: str, vcfg: dict) -> tuple[bool, dict]:
+    """
+    Pass if AT LEAST `min_components` of {RVOL, AD slope, OBV tick/slope} agree with direction.
+    Config:
+      rvol_threshold (float)
+      ad_trend_lookback (int)
+      obv_mode: "tick" (last>prev) or "slope" (lookback)
+      min_components: int (default 1)
+    """
     if direction not in {"long", "short"}:
         return False, {"reason": "no-direction"}
 
-    rvol_thr = _get_float(vcfg, "rvol_threshold", 1.15)
+    rvol_thr = _get_float(vcfg, "rvol_threshold", 1.20)
     ad_look  = _get_int(vcfg, "ad_trend_lookback", 3)
-    use_obv  = _get_bool(vcfg, "obv_confirm", True)
-    need_n   = _get_int(vcfg, "min_checks_true", 1)
+    obv_mode = str(vcfg.get("obv_mode", "tick")).lower()   # "tick" or "slope"
+    min_components = _get_int(vcfg, "min_components", 1)
 
-    row  = df.iloc[-1]
+    row = df.iloc[-1]
     rvol = float(row.get("RVOL20", np.nan))
+    rvol_ok = bool(np.isfinite(rvol) and (rvol >= rvol_thr))
 
-    checks_considered = 0
-    checks_true = 0
-
-    # 1) RVOL
-    rvol_considered = np.isfinite(rvol) and (rvol_thr > 0)
-    rvol_ok = rvol_considered and (rvol >= rvol_thr)
-    checks_considered += int(rvol_considered)
-    checks_true += int(rvol_ok)
-
-    # 2) A/D slope over ad_look bars
-    if ad_look >= 1 and len(df) > ad_look:
+    # A/D slope over exactly `ad_look` bars (compare -1 vs -ad_look)
+    if ad_look < 1 or len(df) <= ad_look:
+        ad_ok = True
+        ad_now = ad_prev = np.nan
+    else:
         ad_now  = float(df["ADLine"].iloc[-1])
-        ad_prev = float(df["ADLine"].iloc[-ad_look])  # N bars ago (not N+1)
+        ad_prev = float(df["ADLine"].iloc[-ad_look])
         ad_ok   = (ad_now > ad_prev) if direction == "long" else (ad_now < ad_prev)
-        ad_considered = np.isfinite(ad_now) and np.isfinite(ad_prev)
-    else:
-        ad_ok = True  # neutral when insufficient history
-        ad_considered = False
-    checks_considered += int(ad_considered)
-    checks_true += int(ad_considered and ad_ok)
 
-    # 3) OBV tick direction (optional)
-    if use_obv and len(df) >= 2:
+    # OBV confirmation: tick or slope mode
+    if obv_mode == "slope" and ad_look >= 1 and len(df) > ad_look:
         obv_now  = float(df["OBV"].iloc[-1])
-        obv_prev = float(df["OBV"].iloc[-2])
+        obv_prev = float(df["OBV"].iloc[-ad_look])
         obv_ok   = (obv_now > obv_prev) if direction == "long" else (obv_now < obv_prev)
-        obv_considered = np.isfinite(obv_now) and np.isfinite(obv_prev)
     else:
-        obv_ok = True  # neutral if not used
-        obv_considered = False
-    checks_considered += int(obv_considered)
-    checks_true += int(obv_considered and obv_ok)
+        obv_now  = float(df["OBV"].iloc[-1])
+        obv_prev = float(df["OBV"].iloc[-2]) if len(df) >= 2 else obv_now
+        obv_ok   = (obv_now > obv_prev) if direction == "long" else (obv_now < obv_prev)
 
-    ok = (checks_true >= need_n)
+    passed = int(rvol_ok) + int(ad_ok) + int(obv_ok)
+    ok = passed >= max(1, min_components)
 
-    det = {
+    details = {
         "rvol": f"{rvol:.2f}" if np.isfinite(rvol) else "nan",
-        "rvol_thr": rvol_thr,
-        "rvol_ok": bool(rvol_ok),
-        "ad_ok": bool(ad_ok),
-        "obv_ok": bool(obv_ok),
-        "considered": checks_considered,
-        "checks_true": checks_true,
-        "min_checks_true": need_n,
+        "rvol_ok": rvol_ok, "rvol_thr": rvol_thr,
+        "ad_look": ad_look, "ad_ok": ad_ok,
+        "obv_mode": obv_mode, "obv_ok": obv_ok,
+        "passed": passed, "min_components": min_components,
     }
-    return ok, det
-
+    return ok, details
 
 # ---------- 2) five energies on the last bar ----------
 def evaluate_five_energies(df: pd.DataFrame, cfg: dict | None = None) -> dict:
@@ -534,8 +526,6 @@ def build_trade_signal(symbol: str, df: pd.DataFrame, cfg: dict) -> TradeSignal 
     If 4/5 energies align (plus optional MTF bonus), create a TradeSignal with ATR-based stop/target and position size.
     Weekly alignment can add +1 to score when enabled; no hard reject when reject_on_mismatch=false.
     """
-    base_min_score = int(cfg["trading"]["min_score"])
-
     # 0) Market regime filter
     regime_ok, regime_det = _regime_check(df, cfg)
     if not regime_ok:
@@ -548,29 +538,37 @@ def build_trade_signal(symbol: str, df: pd.DataFrame, cfg: dict) -> TradeSignal 
         _explain_log(symbol, "no-trend", {"ema20>ema50 & price>ema50 (long) OR opposite (short)": False}, cfg)
         return None
 
-    # 2) Higher timeframe (weekly) — as BONUS energy if aligned
+    # ---- MTF as BONUS energy ----
     mtf_cfg = (cfg.get("trading", {}).get("mtf") or {})
+    mtf_counts = bool(mtf_cfg.get("counts_as_energy", True))        # whether weekly adds +1
+    mtf_reject = bool(mtf_cfg.get("reject_on_mismatch", False))     # hard veto or not
+
+    mtf_ok = True
     mtf_reason = "mtf-disabled"
-    mtf_bonus = 0
     if bool(mtf_cfg.get("enabled", False)):
         try:
             wk = _resample_weekly_ohlcv(df)
             wk_ind = add_indicators(wk)
             w_trend = _weekly_trend_view(wk_ind, mtf_cfg)
             mtf_ok, mtf_reason = _mtf_alignment_ok(energies["direction"], w_trend, mtf_cfg)
-            # Only add to score if aligned AND counts_as_energy is true
-            if mtf_ok and bool(mtf_cfg.get("counts_as_energy", True)):
-                mtf_bonus = 1
-            # If mismatch but reject_on_mismatch=false, we still continue (no veto)
         except Exception as e:
-            mtf_reason = f"mtf-error:{e}"
+            mtf_ok, mtf_reason = True, f"mtf-skip-error:{e}"
 
-    # Effective score
-    effective_score = int(energies["score"]) + int(mtf_bonus)
-    if effective_score < base_min_score:
-        fails = {k: bool(energies[k]) for k in ("trend","momentum","cycle","sr","volume")}
-        fails["mtf_bonus"] = mtf_bonus
-        _explain_log(symbol, f"score<{base_min_score}", fails, cfg)
+    mtf_bonus = 1 if (mtf_counts and mtf_ok) else 0
+    eff_score = int(energies["score"]) + mtf_bonus
+
+    # Minimum score gate (use config)
+    min_score = int(cfg.get("trading", {}).get("min_score", 4))
+
+    if (mtf_reject and not mtf_ok):
+        _explain_log(symbol, "mtf", {"reason": mtf_reason}, cfg)
+        return None
+
+    if eff_score < min_score:
+        # show which energies passed; you can invert if you want "fails"
+        passes = {k: bool(energies[k]) for k in ("trend","momentum","cycle","sr","volume")}
+        passes["mtf_bonus"] = bool(mtf_bonus)
+        _explain_log(symbol, f"eff_score<{min_score}", passes, cfg)
         return None
 
     # 3) Risk levels and sizing (at close)
@@ -600,7 +598,7 @@ def build_trade_signal(symbol: str, df: pd.DataFrame, cfg: dict) -> TradeSignal 
     return TradeSignal(
         symbol   = symbol,
         direction= energies["direction"],
-        score    = effective_score,  # include MTF bonus if any
+        score    = int(eff_score),  # include MTF bonus if any
         entry    = close,
         stop     = stop,
         target   = target,
@@ -610,7 +608,7 @@ def build_trade_signal(symbol: str, df: pd.DataFrame, cfg: dict) -> TradeSignal 
         notes = (
             f"Trend:{energies['trend']} Mom:{energies['momentum']} "
             f"Cycle:{energies['cycle']} S/R:{energies['sr']} Vol:{energies['volume']} | "
-            f"MTF:{mtf_reason} (+{mtf_bonus})"
+            f"MTF:{mtf_reason}, eff_score:{eff_score} (+{mtf_bonus})"
         ),
     )
 

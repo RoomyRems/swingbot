@@ -1,104 +1,79 @@
 # scripts/summarize_evals.py
 from __future__ import annotations
-
-import sys, glob
+import sys
 from pathlib import Path
 import pandas as pd
+from utils.config import load_config
 
-# --- ensure project root on sys.path (like run_backtest.py) ---
-ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
-
-from utils.config import load_config  # now import works
-
-
-def _latest_eval_path() -> Path | None:
-    # prefer logs/, fall back to CWD
-    candidates = sorted(
-        [*Path("logs").glob("backtest_evaluations_*.csv"),
-         *Path(".").glob("backtest_evaluations_*.csv")]
-    )
-    return candidates[-1] if candidates else None
-
-
-def main():
-    cfg = load_config("config.yaml")
-    min_score = int(cfg["trading"]["min_score"])
-
-    p = _latest_eval_path()
-    if not p:
-        print("No backtest_evaluations_*.csv found in logs/ or current dir.")
+def main(path: str | None = None):
+    # pick today's by default
+    if path is None:
+        from utils.logger import today_filename
+        p = today_filename("backtest_evaluations")
+    else:
+        p = Path(path)
+    if not p.exists():
+        print(f">> \n\nFile not found: {p}")
         sys.exit(1)
 
-    df = pd.read_csv(p)
-    if df.empty:
-        print(f"{p.name} is empty.")
-        sys.exit(0)
+    df = pd.read_csv(p, parse_dates=["date"])
+    cfg = load_config("config.yaml")
+    min_score = int(cfg.get("trading", {}).get("min_score", 4))
 
-    # coerce bool-ish columns
-    for col in ("regime_ok","trend","momentum","cycle","sr","volume","mtf_ok"):
-        if col in df.columns:
-            df[col] = df[col].astype(str).str.lower().isin(["1","true","t","yes","y"])
+    # Prefer effective score if present (includes MTF bonus)
+    score_col = "score_eff" if "score_eff" in df.columns else "score"
+    max_score = int(df[score_col].max()) if not df.empty else 0
 
-    total = len(df)
-    uniq_syms = df["symbol"].nunique() if "symbol" in df.columns else 0
-    date_min = df["date"].min() if "date" in df.columns else "?"
-    date_max = df["date"].max() if "date" in df.columns else "?"
+    syms = df["symbol"].nunique()
+    d0, d1 = df["date"].min(), df["date"].max()
+    print(">>\n")
+    print(f"File: {p.name}")
+    print(f"Rows: {len(df):,}  Symbols: {syms}  Dates: {d0} → {d1}\n")
 
-    print(f"\nFile: {p.name}")
-    print(f"Rows: {total:,}  Symbols: {uniq_syms:,}  Dates: {date_min} → {date_max}")
+    # Pass rates
+    regime_ok = df["regime_ok"].mean() if "regime_ok" in df.columns else float("nan")
+    has_dir   = (df["direction"].isin(["long","short"])).mean()
+    score_ok  = (df[score_col] >= min_score).mean()
+    mtf_ok    = df["mtf_ok"].mean() if "mtf_ok" in df.columns else float("nan")
 
-    # Overall pass rates
-    def rate(s): return float(s.mean()) if len(s) else 0.0
-
-    has_dir = df.get("direction", pd.Series(index=df.index, dtype=object)).isin(["long","short"])
-
-    print("\nPass rates (overall):")
-    print(f"  {'regime_ok':15s}: {rate(df.get('regime_ok', pd.Series(False, index=df.index))):.1%}")
-    print(f"  {'has_direction':15s}: {rate(has_dir):.1%}")
-    print(f"  {'score>=min':15s}: {rate(df.get('score', pd.Series(0)).ge(min_score)):.1%}")
+    print("Pass rates (overall):")
+    print(f"  regime_ok      : {regime_ok:0.1%}")
+    print(f"  has_direction  : {has_dir:0.1%}")
+    print(f"  score>={min_score:<5}: {score_ok:0.1%}")
     if "mtf_ok" in df.columns:
-        print(f"  {'mtf_ok':15s}: {rate(df['mtf_ok']):.1%}")
+        print(f"  mtf_ok         : {mtf_ok:0.1%}")
+    print()
 
-    # Energy components
-    print("\nEnergy components true-rate:")
-    for k in ["trend","momentum","cycle","sr","volume"]:
-        if k in df.columns:
-            print(f"  {k:15s}: {rate(df[k]):.1%}")
+    # Energy component “true rates”
+    def rate(col): return df[col].mean() if col in df.columns else float("nan")
+    print("Energy components true-rate:")
+    for col in ["trend","momentum","cycle","sr","volume"]:
+        print(f"  {col:<13}: {rate(col):0.1%}")
+    print()
 
-    # Score distribution
-    if "score" in df.columns:
-        print("\nScore distribution:")
-        sc = df["score"].value_counts().sort_index()
-        tot = sc.sum() or 1
-        for s, c in sc.items():
-            print(f"  score {int(s):>1}: {c:7d}  ({c/tot:.1%})")
+    # Score distribution (effective if available)
+    print("Score distribution (using " + score_col + "):")
+    # Expect 0..6 when score_eff exists
+    top = max(max_score, 6 if score_col=="score_eff" else 5)
+    for s in range(0, top+1):
+        cnt = int((df[score_col] == s).sum())
+        pct = cnt / len(df) if len(df) else 0.0
+        print(f"  score {s}: {cnt:7d}  ({pct:0.1%})")
+    print()
 
-    # Sequential survivors
-    g0 = df
-    g1 = g0[g0.get("regime_ok", False)]
-    g2 = g1[g1.get("direction", "").isin(["long","short"])]
-    g3 = g2[g2.get("score", 0) >= min_score]
-    g4 = g3[g3.get("mtf_ok", True)]  # if mtf not present, treat as pass
+    # Sequential survivors (use effective score in the gate)
+    seq1 = df[df.get("regime_ok", True) == True]
+    seq2 = seq1[seq1["direction"].isin(["long","short"])]
+    seq3 = seq2[seq2[score_col] >= min_score]
+    seq4 = seq3[(seq3.get("mtf_ok", True) == True)]  # only meaningful if you later set reject_on_mismatch True
 
-    print("\nSequential survivors:")
-    print(f"  after regime_ok      : {len(g1):7d}  ({len(g1)/total:.1%})")
-    print(f"  after direction      : {len(g2):7d}  ({len(g2)/total:.1%})")
-    print(f"  after score>= {min_score}: {len(g3):7d}  ({len(g3)/total:.1%})")
-    if "mtf_ok" in df.columns:
-        print(f"  after MTF            : {len(g4):7d}  ({len(g4)/total:.1%})")
-
-    # Quick bottleneck hint
-    if len(g1)==0:
-        print("\nBottleneck: regime. Try easing adx_min/atr_pct_min/chop_max.")
-    elif len(g2)==0:
-        print("\nBottleneck: direction (trend model).")
-    elif len(g3)==0:
-        print("\nBottleneck: score. See which energy has lowest true-rate.")
-    elif "mtf_ok" in df.columns and len(g4)==0:
-        print("\nBottleneck: MTF alignment. Consider reject_on_mismatch: false for a test.")
-
+    def line(name, x):
+        print(f"  after {name:<14}: {len(x):7d}  ({(len(x)/len(df) if len(df) else 0):0.1%})")
+    print("Sequential survivors:")
+    line("regime_ok", seq1)
+    line("direction", seq2)
+    line(f"score>={min_score}", seq3)
+    line("MTF", seq4)
 
 if __name__ == "__main__":
-    main()
+    main(sys.argv[1] if len(sys.argv) > 1 else None)
