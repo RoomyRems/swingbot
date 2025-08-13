@@ -1,7 +1,6 @@
 # backtest/engine.py
 from __future__ import annotations
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Dict, List, Tuple
 from collections import defaultdict
 import math
@@ -67,8 +66,15 @@ class PendingLimit:
     signal_date: pd.Timestamp
     expires: pd.Timestamp
     limit_px: float
-    stop: float
-    target: float
+    atr: float       # <-- keep ATR so we can compute levels at fill
+    score: int
+
+@dataclass
+class PendingMarket:
+    symbol: str
+    direction: str    # "long"/"short"
+    fill_date: pd.Timestamp
+    atr: float
     score: int
 
 @dataclass
@@ -216,22 +222,30 @@ def run_backtest(
             mtf_counts = bool(mtf_cfg.get("counts_as_energy", True))
             score_eff = score + (1 if (mtf_counts and mtf_ok) else 0)
 
-            # Acceptance logic (no hard veto on MTF)
             min_score = int(cfg["trading"]["min_score"])
             allowed_dir = (direction != "short") or allow_short
+            mtf_cfg = (cfg.get("trading", {}).get("mtf") or {})
+            mtf_veto = bool(mtf_cfg.get("reject_on_mismatch", False))
             accept = regime_ok and (direction in ("long", "short")) and (score_eff >= min_score) and allowed_dir
+            if accept and mtf_veto and (not mtf_ok):
+                accept = False
+                reason = "mtf_mismatch"
 
             # First failing reason
             if not regime_ok:
                 reason = "regime"
-            elif direction not in ("long", "short"):
+            elif direction not in ("long","short"):
                 reason = "no_dir"
+            elif mtf_veto and not mtf_ok:
+                reason = "mtf_mismatch"
             elif score_eff < min_score:
                 reason = "below_score"
             elif not allowed_dir:
                 reason = "short_blocked"
             else:
                 reason = "pass"
+
+            accept = (reason == "pass")
 
             # Evaluation row
             evaluations.append({
@@ -279,6 +293,7 @@ def run_backtest(
     cash = equity
     open_positions: Dict[str, Position] = {}
     pending_limits: List[PendingLimit] = []
+    pending_markets: List[PendingMarket] = []
     equity_curve: List[Tuple[pd.Timestamp, float]] = []
     trades: List[dict] = []
     week_new_count: defaultdict[pd.Period, int] = defaultdict(int)
@@ -363,6 +378,132 @@ def run_backtest(
                     "reason": exit_reason,
                 })
                 del open_positions[sym]
+        # 1a) fill any scheduled MARKET entries for today at the open
+        for pend in list(pending_markets):
+            if pend.fill_date != day:
+                continue
+
+            df = data.get(pend.symbol)
+            if df is None or day not in df.index:
+                pending_markets.remove(pend)
+                continue
+
+            # caps before sizing
+            if len(open_positions) >= max_open or (_current_total_risk() >= max_risk_pct):
+                pending_markets.remove(pend)
+                continue
+            wk = _week_key(day)
+            if max_new_week > 0 and week_new_count[wk] >= max_new_week:
+                pending_markets.remove(pend)
+                continue
+
+            o = float(df.at[day, "Open"])
+            slip = (slip_bps / 10000.0) * o
+            entry_px = o + slip if pend.direction == "long" else o - slip
+
+            # compute levels at actual entry
+            stop, target = rm_compute_levels(
+                direction=pend.direction,
+                entry=entry_px,
+                atr=pend.atr,
+                atr_mult=float(cfg["risk"]["atr_multiple_stop"]),
+                reward_mult=float(cfg["risk"]["reward_multiple"]),
+            )
+            if stop is None or target is None:
+                pending_markets.remove(pend)
+                continue
+
+            # per-day cfg and sizing
+            cfg_day = copy.deepcopy(cfg)
+            cfg_day["risk"]["use_broker_equity"] = False
+            cfg_day["risk"]["account_equity"] = float(equity)
+
+            qty = rm_size_position(cfg_day, entry=entry_px, stop=stop)
+            qty_bp = _qty_bp_cap(entry_px, equity, bp_multiple)
+            qty = min(qty, qty_bp)
+            if qty <= 0:
+                pending_markets.remove(pend)
+                continue
+
+            # portfolio risk cap
+            psr = abs(entry_px - stop)
+            new_total_risk = (_current_total_risk() * max(equity, 1e-9) + psr * qty) / max(equity, 1e-9)
+            if new_total_risk > max_risk_pct:
+                pending_markets.remove(pend)
+                continue
+
+            commission = commission_ps * qty
+            if pend.direction == "long":
+                cash -= qty * entry_px
+            else:
+                cash += qty * entry_px
+            cash -= commission
+
+            open_positions[pend.symbol] = Position(
+                symbol=pend.symbol,
+                side=pend.direction,
+                entry_date=day,
+                entry_price=entry_px,
+                qty=qty,
+                stop=stop,
+                target=target,
+                per_share_risk=psr,
+                score=pend.score,
+                be_armed=False,
+            )
+
+            # Immediately check same-day exit for newly opened market positions
+            h = float(df.at[day, "High"])
+            l = float(df.at[day, "Low"])
+
+            pos = open_positions[pend.symbol]
+            exit_reason = None
+            fill_px = None
+
+            if pos.side == "long":
+                if l <= pos.stop:
+                    fill_px = _gap_exit_price("long", o, pos.stop)
+                    exit_reason = "stop_same_day"
+                elif h >= pos.target:
+                    fill_px = pos.target if o <= pos.target else o
+                    exit_reason = "target_same_day"
+            else:
+                if h >= pos.stop:
+                    fill_px = _gap_exit_price("short", o, pos.stop)
+                    exit_reason = "stop_same_day"
+                elif l <= pos.target:
+                    fill_px = pos.target if o >= pos.target else o
+                    exit_reason = "target_same_day"
+
+            if exit_reason:
+                slip_exit = (slip_bps / 10000.0) * fill_px
+                fill_px_eff = fill_px - slip_exit if pos.side == "long" else fill_px + slip_exit
+                commission = commission_ps * pos.qty
+                if pos.side == "long":
+                    cash += pos.qty * fill_px_eff
+                else:
+                    cash -= pos.qty * fill_px_eff
+                cash -= commission
+
+                pnl = (fill_px_eff - pos.entry_price) * pos.qty if pos.side == "long" else (pos.entry_price - fill_px_eff) * pos.qty
+                trades.append({
+                    "symbol": pend.symbol, "side": pos.side,
+                    "entry_date": pos.entry_date, "entry_price": pos.entry_price,
+                    "exit_date": day, "exit_price": fill_px_eff, "qty": pos.qty,
+                    "pnl": pnl,
+                    "r_multiple": pnl / (pos.per_share_risk * pos.qty) if pos.per_share_risk > 0 else np.nan,
+                    "commission": commission_ps * pos.qty * 2.0,
+                    "slippage_cost": slip_exit * pos.qty,
+                    "reason": exit_reason,
+                })
+                del open_positions[pend.symbol]
+
+
+
+            week_new_count[wk] += 1
+            pending_markets.remove(pend)
+
+
 
         # 2) try to place/fill pending limit orders
         for pend in list(pending_limits):
@@ -395,18 +536,29 @@ def run_backtest(
             cfg_day["risk"]["account_equity"] = float(equity)
 
             # effective entry with slippage
-            slip = (slip_bps / 10000.0) * pend.limit_px
-            entry_px = pend.limit_px + slip if pend.direction == "long" else pend.limit_px - slip
+            raw_entry = min(o, pend.limit_px) if pend.direction == "long" else max(o, pend.limit_px)
+            slip = (slip_bps / 10000.0) * raw_entry
+            entry_px = raw_entry + slip if pend.direction == "long" else raw_entry - slip
+
+            stop, target = rm_compute_levels(
+                direction=pend.direction,
+                entry=entry_px,
+                atr=pend.atr,                                  # <-- use stored ATR
+                atr_mult=float(cfg["risk"]["atr_multiple_stop"]),
+                reward_mult=float(cfg["risk"]["reward_multiple"]),
+            )
+            if stop is None or target is None:
+                continue
 
             # size from live helper, then apply BP cap
-            qty = rm_size_position(cfg_day, entry=entry_px, stop=pend.stop)
+            qty = rm_size_position(cfg_day, entry=entry_px, stop=stop)
             qty_bp = _qty_bp_cap(entry_px, equity, bp_multiple)
             qty = min(qty, qty_bp)
             if qty <= 0:
                 continue
 
             # portfolio risk cap check
-            psr = abs(entry_px - pend.stop)
+            psr = abs(entry_px - stop)
             new_total_risk = (_current_total_risk() * max(equity, 1e-9) + psr * qty) / max(equity, 1e-9)
             if new_total_risk > max_risk_pct:
                 continue
@@ -424,14 +576,58 @@ def run_backtest(
                 entry_date=day,
                 entry_price=entry_px,
                 qty=qty,
-                stop=pend.stop,
-                target=pend.target,
+                stop=stop,
+                target=target,
                 per_share_risk=psr,
                 score=pend.score,
                 be_armed=False,
             )
             week_new_count[wk] += 1
             pending_limits.remove(pend)
+
+            # Immediately check same-day exit for newly filled limit orders
+            pos = open_positions[pend.symbol]
+            exit_reason = None
+            fill_px = None
+
+            if pos.side == "long":
+                if l <= pos.stop:
+                    fill_px = _gap_exit_price("long", o, pos.stop)
+                    exit_reason = "stop_same_day"
+                elif h >= pos.target:
+                    fill_px = pos.target if o <= pos.target else o
+                    exit_reason = "target_same_day"
+            else:
+                if h >= pos.stop:
+                    fill_px = _gap_exit_price("short", o, pos.stop)
+                    exit_reason = "stop_same_day"
+                elif l <= pos.target:
+                    fill_px = pos.target if o >= pos.target else o
+                    exit_reason = "target_same_day"
+
+            if exit_reason:
+                slip_exit = (slip_bps / 10000.0) * fill_px
+                fill_px_eff = fill_px - slip_exit if pos.side == "long" else fill_px + slip_exit
+                commission = commission_ps * pos.qty
+                if pos.side == "long":
+                    cash += pos.qty * fill_px_eff
+                else:
+                    cash -= pos.qty * fill_px_eff
+                cash -= commission
+
+                pnl = (fill_px_eff - pos.entry_price) * pos.qty if pos.side == "long" else (pos.entry_price - fill_px_eff) * pos.qty
+                trades.append({
+                    "symbol": pend.symbol, "side": pos.side,
+                    "entry_date": pos.entry_date, "entry_price": pos.entry_price,
+                    "exit_date": day, "exit_price": fill_px_eff, "qty": pos.qty,
+                    "pnl": pnl,
+                    "r_multiple": pnl / (pos.per_share_risk * pos.qty) if pos.per_share_risk > 0 else np.nan,
+                    "commission": commission_ps * pos.qty * 2.0,
+                    "slippage_cost": slip_exit * pos.qty,
+                    "reason": exit_reason,
+                })
+                del open_positions[pend.symbol]
+
 
         # 3) new signals for this day (respect caps; market enters at next open)
         day_candidates = sorted(
@@ -457,56 +653,14 @@ def run_backtest(
                 if max_new_week > 0 and week_new_count[wk_nd] >= max_new_week:
                     continue
 
-                o = float(df.at[nd, "Open"])
-
-                slip = (slip_bps / 10000.0) * o
-                entry_px = o + slip if sig["direction"] == "long" else o - slip
-
-                stop, target = rm_compute_levels(
-                    direction=sig["direction"],
-                    entry=entry_px,
-                    atr=sig["atr"],
-                    atr_mult=float(cfg["risk"]["atr_multiple_stop"]),
-                    reward_mult=float(cfg["risk"]["reward_multiple"]),
-                )
-                if stop is None or target is None:
-                    continue
-
-                cfg_day = copy.deepcopy(cfg)
-                cfg_day["risk"]["use_broker_equity"] = False
-                cfg_day["risk"]["account_equity"] = float(equity)
-
-                qty = rm_size_position(cfg_day, entry=entry_px, stop=stop)
-                qty_bp = _qty_bp_cap(entry_px, equity, bp_multiple)
-                qty = min(qty, qty_bp)
-                if qty <= 0:
-                    continue
-
-                psr = abs(entry_px - stop)
-                new_total_risk = (_current_total_risk() * max(equity, 1e-9) + psr * qty) / max(equity, 1e-9)
-                if new_total_risk > max_risk_pct:
-                    continue
-
-                commission = commission_ps * qty
-                if sig["direction"] == "long":
-                    cash -= qty * entry_px
-                else:
-                    cash += qty * entry_px
-                cash -= commission
-
-                open_positions[sig["symbol"]] = Position(
+                pending_markets.append(PendingMarket(
                     symbol=sig["symbol"],
-                    side=sig["direction"],
-                    entry_date=nd,
-                    entry_price=entry_px,
-                    qty=qty,
-                    stop=stop,
-                    target=target,
-                    per_share_risk=psr,
+                    direction=sig["direction"],
+                    fill_date=nd,
+                    atr=float(sig["atr"]),
                     score=int(sig.get("score_eff", sig["score"])),
-                    be_armed=False,
-                )
-                week_new_count[wk_nd] += 1
+                ))
+
 
             elif entry_type == "limit_retrace":
                 ema = sig["ema20"] if retrace_ref == "EMA20" else sig["close"]
@@ -527,8 +681,7 @@ def run_backtest(
                     signal_date=sig["date"],
                     expires=sig["date"] + pd.tseries.offsets.BDay(horizon),
                     limit_px=float(limit_px),
-                    stop=float(stop),
-                    target=float(target),
+                    atr=float(sig["atr"]),        # <-- NEW
                     score=int(sig.get("score_eff", sig["score"])),
                 ))
 

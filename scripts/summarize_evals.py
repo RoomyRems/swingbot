@@ -2,6 +2,12 @@
 from __future__ import annotations
 import sys
 from pathlib import Path
+
+# --- make repo root importable when run as a script ---
+PROJECT_ROOT = Path(__file__).resolve().parents[1]  # parent of "scripts"
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 import pandas as pd
 from utils.config import load_config
 
@@ -39,7 +45,7 @@ def main(path: str | None = None):
     print("Pass rates (overall):")
     print(f"  regime_ok      : {regime_ok:0.1%}")
     print(f"  has_direction  : {has_dir:0.1%}")
-    print(f"  score>={min_score:<5}: {score_ok:0.1%}")
+    print(f"  score>={min_score}: {score_ok:0.1%}")
     if "mtf_ok" in df.columns:
         print(f"  mtf_ok         : {mtf_ok:0.1%}")
     print()

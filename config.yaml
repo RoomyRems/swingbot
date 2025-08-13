@@ -15,17 +15,16 @@ signals:
     lookback: 60
     left: 3
     right: 3
-    near_pct: 0.025            # was 0.015
-    near_atr_mult: 0.75        # was 0.5
-    ema50_fallback_pct: 0.025  # re-enabled fallback
-    # yesterday_touch_ok defaults to true in code; add here if you want to control it
-    # yesterday_touch_ok: true
+    near_pct: 0.02
+    near_atr_mult: 0.50
+    ema50_fallback_pct: null     # pivot-only for now
+    # yesterday_touch_ok: true    # enabled by default in code
 
 # --- momentum quality controls ---
 momentum:
   rsi_filter: true
   rsi_threshold: 50
-  use_macd_expansion: false    # off by default; if you re-enable set expansion_min_steps: 1
+  use_macd_expansion: false      # if you re-enable, keep expansion_min_steps: 1
   expansion_lookback: 3
   expansion_min_steps: 1
   zero_line_mode: "confirm"
@@ -36,8 +35,8 @@ volume:
   rvol_window: 20
   rvol_threshold: 1.20
   ad_trend_lookback: 3
-  obv_mode: "tick"             # or "slope"
-  min_components: 1            # pass if >=1 of {RVOL, AD, OBV} agrees
+  obv_mode: "tick"               # or "slope"
+  min_components: 2              # require 2 of {RVOL, AD, OBV}
 
 regime:
   enabled: true
@@ -72,25 +71,25 @@ fundamentals:
       - "going concern"
 
 trading:
-  # MTF can count as a 6th "bonus" energy; keep min_score=4
+  # MTF counts as a 6th "bonus" energy but also vetoes mismatches
   min_score: 4
   confirm_before_place: true
   time_in_force: "gtc"
-  order_type: "market"
+  order_type: "market"           # live only; backtest has its own entry model
   max_signals_per_run: 0
 
   # ---- Higher timeframe (MTF) confirmation ----
   mtf:
     enabled: true
     timeframe: "W"
-    trend_filter: "ema"        # or "macd"
+    trend_filter: "ema"          # or "macd"
     ema_fast: 20
     ema_slow: 50
     macd_fast: 12
     macd_slow: 26
     macd_signal: 9
-    counts_as_energy: true     # bonus point if aligned
-    reject_on_mismatch: false  # never a hard veto unless set true
+    counts_as_energy: true       # bonus point if aligned
+    reject_on_mismatch: true     # veto trades against weekly
 
 ### ---------- For backtesting ---------- ###
 backtest:
@@ -98,23 +97,22 @@ backtest:
   initial_equity: 50000
   commission_per_share: 0.00
   slippage_bps: 2.0
-  allow_short: true
+  allow_short: false             # optional: start long-only; re-enable later
   max_open_positions: 6
   max_total_risk_pct: 0.08
   max_new_trades_per_week: 3
   touch_priority: "stop_first"
-  # The next three are ignored unless engine.py implements them:
   bp_multiple: 1.0
   halt_on_equity_at_or_below: 0
   force_close_on_end: true
 
   # Breakeven controls (engine.py uses these)
-  breakeven_at_R: 1.0
+  breakeven_at_R: 0.8
   breakeven_intrabar: "favor_be"   # or "favor_stop"
 
   # Backtest entry model (independent of live order_type)
   entry_model:
-    type: "market"          # "market" or "limit_retrace"
+    type: "market"        # "limit_retrace" or "market"
     retrace_to: "EMA20"
-    atr_fraction: 0.25
+    atr_fraction: 0.20
     horizon_days: 3
