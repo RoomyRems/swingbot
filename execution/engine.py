@@ -30,6 +30,18 @@ _COLUMN_ALIASES = {
 }
 
 def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Return a copy of *df* with normalized column names.
+
+    The incoming CSVs may use various casings or spaces in the header
+    (e.g. ``Qty`` or ``Take Profit``).  The previous implementation only
+    handled exact lowercase matches, which meant these common variants were
+    left untouched and later validation failed.  We now standardize headers by
+    stripping whitespace, lowercasing, and replacing spaces with underscores
+    before applying the alias map.
+    """
+    df = df.copy()
+    df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
+
     col_map = {}
     for k, v in _COLUMN_ALIASES.items():
         if k in df.columns and v not in df.columns:
