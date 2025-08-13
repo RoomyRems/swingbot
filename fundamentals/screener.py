@@ -45,7 +45,11 @@ def _canon_for_mx(sym: str) -> str:
     return sym.upper().strip()
 
 def _get_json(url: str, params: Optional[dict] = None, timeout: int = 15, retries: int = 2) -> Optional[dict | list]:
-    """GET with small retry/backoff for 429/5xx."""
+    """
+    GET with small retry/backoff for 429/5xx.
+
+    Retries on request exceptions and returns ``None`` for any non-OK response.
+    """
     backoff = 0.6
     for i in range(retries + 1):
         try:
