@@ -125,7 +125,10 @@ def execute_today(csv_path: Path | None = None, sleep_between: float = 0.20) -> 
         print("\n— Execution summary —")
         print(f"Signals in file: {orig_rows}")
         print(f"After de-dup:   {dedup_rows} (dropped {dropped_dupes})")
-        print(f"After open flt: 0 (dropped {dedup_rows})")
+        # Preserve counts from the open-orders/positions filter so the
+        # summary reflects what actually happened before the sanity checks
+        # removed all remaining rows.
+        print(f"After open flt: {filtered_rows} (dropped {dropped_open})")
         print(f"Placed: 0 | Skipped BP: 0 | Failed: 0")
         return
 
