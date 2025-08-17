@@ -135,20 +135,30 @@ def _get_bool(d: dict, key: str, default: bool) -> bool:
 
 
 # ---------- S/R pivots ----------
-def _find_pivots(high: pd.Series, low: pd.Series, left: int, right: int) -> tuple[list[int], list[int]]:
+def _find_pivots(high: pd.Series, low: pd.Series, left: int, right: int, tol: float = 1e-6) -> tuple[list[int], list[int]]:
+    """Return indices of local pivot highs/lows using a tolerance and plateau compression.
+    Only first bar of a plateau high (or low) is kept to reduce multi-bar duplication.
+    """
     highs_idx, lows_idx = [], []
     H = high.to_numpy()
     L = low.to_numpy()
     n = len(H)
+    last_high_plateau = last_low_plateau = -2
     for i in range(n):
         l = max(0, i - left)
         r = min(n, i + right + 1)
-        if r - l < 1:
+        if r - l < 2:  # need at least 2 bars context
             continue
-        if np.isfinite(H[i]) and H[i] == np.nanmax(H[l:r]):
-            highs_idx.append(i)
-        if np.isfinite(L[i]) and L[i] == np.nanmin(L[l:r]):
-            lows_idx.append(i)
+        winH = H[l:r]; winL = L[l:r]
+        mx = np.nanmax(winH); mn = np.nanmin(winL)
+        if np.isfinite(H[i]) and np.isfinite(mx) and (H[i] >= mx - tol):
+            if i - 1 != last_high_plateau:  # compress plateau
+                highs_idx.append(i)
+            last_high_plateau = i
+        if np.isfinite(L[i]) and np.isfinite(mn) and (L[i] <= mn + tol):
+            if i - 1 != last_low_plateau:
+                lows_idx.append(i)
+            last_low_plateau = i
     return highs_idx, lows_idx
 
 def _nearest_pivot_levels(df: pd.DataFrame, lookback: int, left: int, right: int, price: float | None = None):
@@ -182,8 +192,12 @@ def _macd_expansion_ok(df: pd.DataFrame, direction: str, mcfg: dict) -> bool:
         return False
     lookback = _get_int(mcfg, "expansion_lookback", 3)
     min_steps = _get_int(mcfg, "expansion_min_steps", 1)
-    if lookback < 1 or len(df) < lookback + 1:
-        return True  # permissive when insufficient data
+    if lookback < 1:
+        return True
+    if len(df) < lookback + 1:
+        # stricter behavior now optional
+        permissive = _get_bool(mcfg, "expansion_permissive_on_short_history", False)
+        return True if permissive else False
 
     macdh = df["MACDh"].to_numpy()
     if not np.isfinite(macdh[-1]):
@@ -230,40 +244,63 @@ def _volume_energy_ok(df: pd.DataFrame, direction: str, vcfg: dict) -> tuple[boo
     rvol_thr = _get_float(vcfg, "rvol_threshold", 1.20)
     ad_look  = _get_int(vcfg, "ad_trend_lookback", 3)
     obv_mode = str(vcfg.get("obv_mode", "tick")).lower()   # "tick" or "slope"
-    min_components = _get_int(vcfg, "min_components", 1)
+    # default stricter now (>=2 components) unless user overrides
+    min_components = _get_int(vcfg, "min_components", 2)
 
     row = df.iloc[-1]
     rvol = float(row.get("RVOL20", np.nan))
     rvol_ok = bool(np.isfinite(rvol) and (rvol >= rvol_thr))
 
     # A/D slope over exactly `ad_look` bars (compare -1 vs -ad_look)
-    if ad_look < 1 or len(df) <= ad_look:
-        ad_ok = True
+    if ad_look < 1:
+        ad_ok = False
         ad_now = ad_prev = np.nan
+        ad_available = False
+    elif len(df) <= ad_look:
+        ad_ok = False
+        ad_now = ad_prev = np.nan
+        ad_available = False
     else:
         ad_now  = float(df["ADLine"].iloc[-1])
         ad_prev = float(df["ADLine"].iloc[-ad_look])
         ad_ok   = (ad_now > ad_prev) if direction == "long" else (ad_now < ad_prev)
+        ad_available = True
 
     # OBV confirmation: tick or slope mode
     if obv_mode == "slope" and ad_look >= 1 and len(df) > ad_look:
         obv_now  = float(df["OBV"].iloc[-1])
         obv_prev = float(df["OBV"].iloc[-ad_look])
         obv_ok   = (obv_now > obv_prev) if direction == "long" else (obv_now < obv_prev)
+        obv_available = True
     else:
-        obv_now  = float(df["OBV"].iloc[-1])
-        obv_prev = float(df["OBV"].iloc[-2]) if len(df) >= 2 else obv_now
-        obv_ok   = (obv_now > obv_prev) if direction == "long" else (obv_now < obv_prev)
+        if len(df) >= 2:
+            obv_now  = float(df["OBV"].iloc[-1])
+            obv_prev = float(df["OBV"].iloc[-2])
+            obv_ok   = (obv_now > obv_prev) if direction == "long" else (obv_now < obv_prev)
+            obv_available = True
+        else:
+            obv_now = obv_prev = np.nan
+            obv_ok = False
+            obv_available = False
 
-    passed = int(rvol_ok) + int(ad_ok) + int(obv_ok)
+    # Only count components that are available
+    components = []
+    if np.isfinite(rvol):
+        components.append(rvol_ok)
+    if ad_available:
+        components.append(ad_ok)
+    if obv_available:
+        components.append(obv_ok)
+    passed = int(sum(1 for c in components if c))
+    avail = max(1, len(components))
     ok = passed >= max(1, min_components)
 
     details = {
         "rvol": f"{rvol:.2f}" if np.isfinite(rvol) else "nan",
         "rvol_ok": rvol_ok, "rvol_thr": rvol_thr,
         "ad_look": ad_look, "ad_ok": ad_ok,
-        "obv_mode": obv_mode, "obv_ok": obv_ok,
-        "passed": passed, "min_components": min_components,
+    "obv_mode": obv_mode, "obv_ok": obv_ok,
+    "passed": passed, "available_components": avail, "min_components": min_components,
     }
     return ok, details
 
@@ -286,6 +323,7 @@ def evaluate_five_energies(df: pd.DataFrame, cfg: dict | None = None) -> dict:
     rsi_filter     = _get_bool(mcfg, "rsi_filter", True)
     rsi_threshold  = _get_float(mcfg, "rsi_threshold", 50.0)
     use_expansion  = _get_bool(mcfg, "use_macd_expansion", False)
+    macd_abs_min   = _get_float(mcfg, "macd_abs_min", 0.0)  # require |MACD - signal| >= threshold or |MACD| >= threshold if signal NA
 
     base_bull = (row["MACD"] > row["MACDs"])
     base_bear = (row["MACD"] < row["MACDs"])
@@ -303,12 +341,39 @@ def evaluate_five_energies(df: pd.DataFrame, cfg: dict | None = None) -> dict:
     else:
         momentum_ok = False
 
-    # 3) CYCLE
-    bull_cycle = (prev["SlowK"] < 20) and (row["SlowK"] > row["SlowD"])
-    bear_cycle = (prev["SlowK"] > 80) and (row["SlowK"] < row["SlowD"])
+    if momentum_ok and macd_abs_min > 0:
+        macd_val = float(row["MACD"])
+        macds_val = float(row["MACDs"]) if np.isfinite(row["MACDs"]) else macd_val
+        dist = abs(macd_val - macds_val)
+        if dist < macd_abs_min and abs(macd_val) < macd_abs_min:
+            momentum_ok = False
+
+    # 3) CYCLE with optional hysteresis / debounce
+    cycfg = _cfg_path(cfg, "cycle", default={})
+    rise_bars = _get_int(cycfg, "rise_bars", 0)  # number of prior bars %K must be strictly rising (0 = disabled)
+    require_d_slope = _get_bool(cycfg, "require_d_slope", False)
+    # base triggers
+    bull_cycle_raw = (prev["SlowK"] < 20) and (row["SlowK"] > row["SlowD"])
+    bear_cycle_raw = (prev["SlowK"] > 80) and (row["SlowK"] < row["SlowD"])
+    def _k_rising(n: int) -> bool:
+        if n <= 1:
+            return True
+        if len(df) < n:
+            return False
+        k_vals = df["SlowK"].iloc[-n:].to_numpy()
+        return np.all(np.diff(k_vals) > 0)
+    def _k_falling(n: int) -> bool:
+        if n <= 1:
+            return True
+        if len(df) < n:
+            return False
+        k_vals = df["SlowK"].iloc[-n:].to_numpy()
+        return np.all(np.diff(k_vals) < 0)
+    bull_cycle = bull_cycle_raw and _k_rising(rise_bars) and (not require_d_slope or row["SlowD"] > prev["SlowD"])
+    bear_cycle = bear_cycle_raw and _k_falling(rise_bars) and (not require_d_slope or row["SlowD"] < prev["SlowD"])
     cycle_ok = bull_cycle if direction == "long" else bear_cycle if direction == "short" else False
 
-    # 4) SUPPORT/RESISTANCE — pivot-based + EMA50 fallback + yesterday touch
+    # 4) SUPPORT/RESISTANCE — pivot structure; EMA fallback optional separate flag (not alone unless enabled)
     scfg = _cfg_path(cfg, "signals", "sr_pivots", default={})
     lookback = _get_int(scfg, "lookback", 60)
     left     = _get_int(scfg, "left", 3)
@@ -318,6 +383,7 @@ def evaluate_five_energies(df: pd.DataFrame, cfg: dict | None = None) -> dict:
     yday_ok  = _get_bool(scfg, "yesterday_touch_ok", True)
 
     ema_fall_raw = scfg.get("ema50_fallback_pct", 0.025)
+    allow_fallback_as_sr = _get_bool(scfg, "allow_fallback_as_core", False)  # new: fallback alone can't satisfy S/R unless True
     ema_fall = None
     try:
         if ema_fall_raw is not None:
@@ -330,7 +396,9 @@ def evaluate_five_energies(df: pd.DataFrame, cfg: dict | None = None) -> dict:
 
     tol_abs = float(row["ATR14"]) * near_atr if np.isfinite(row["ATR14"]) else np.inf
     tol_pct = price * near_pct
-    tol = max(tol_abs, tol_pct)
+    # tolerance mode configurable: "max" (original) or "min"
+    tol_mode = str(scfg.get("tolerance_mode", "max")).lower()
+    tol = max(tol_abs, tol_pct) if tol_mode == "max" else min(tol_abs, tol_pct)
 
     sr_used = None
     sr_ok = False
@@ -357,16 +425,59 @@ def evaluate_five_energies(df: pd.DataFrame, cfg: dict | None = None) -> dict:
                 sr_ok = True
                 sr_used = "pivot-resistance-yday"
 
+    sr_fallback_used = False
     if (not sr_ok) and (ema_fall is not None):
-        sr_ok = (abs(price - float(row["EMA50"])) / price) <= ema_fall
-        if sr_ok:
-            sr_used = "ema50-fallback"
+        sr_fallback_hit = (abs(price - float(row["EMA50"])) / price) <= ema_fall
+        if sr_fallback_hit:
+            sr_fallback_used = True
+            if allow_fallback_as_sr:
+                sr_ok = True
+                sr_used = "ema50-fallback"
 
-    # 5) VOLUME — any-of RVOL / A-D / OBV
+    # 5) FRACTAL / VOLATILITY ENERGY (new core component) using ADX + (optional) choppiness
+    fcfg = _cfg_path(cfg, "fractal", default={})
+    f_enabled = _get_bool(fcfg, "enabled", True)
+    f_use_chop = _get_bool(fcfg, "use_chop", True)
+    f_adx_min = _get_float(fcfg, "adx_min", 18.0)
+    f_chop_max = _get_float(fcfg, "chop_max", 58.0)
+    # reuse existing values if present
+    adx_val = float(row.get("ADX14", np.nan))
+    # compute choppiness via regime helper if not already explained
+    # we'll lazily compute with last 14 window by calling _chop_index_latest
+    if f_use_chop:
+        high_np = df["High"].to_numpy(dtype="float64")
+        low_np = df["Low"].to_numpy(dtype="float64")
+        close_np = df["Close"].to_numpy(dtype="float64")
+        chop_val = _chop_index_latest(high_np, low_np, close_np, int(fcfg.get("chop_window", 14)))
+    else:
+        chop_val = np.nan
+    adx_ok_f = (not np.isfinite(adx_val)) or (adx_val >= f_adx_min)
+    chop_ok_f = (not f_use_chop) or (not np.isfinite(chop_val)) or (chop_val <= f_chop_max)
+    fractal_ok = (not f_enabled) or (adx_ok_f and chop_ok_f)
+
+    # VOLUME now treated as confirmation (not core energy)
     vcfg = _cfg_path(cfg, "volume", default={})
     volume_ok, vol_details = _volume_energy_ok(df, direction, vcfg)
+    vol_details["counts_in_score"] = False
 
-    score = int(sum([trend_ok, momentum_ok, cycle_ok, sr_ok, volume_ok]))
+    # Energy weighting (core five only) - default weight=1 each unless provided
+    weights_cfg = (cfg.get("trading", {}) or {}).get("energy_weights", {}) or {}
+    def w(name: str) -> float:
+        try:
+            return float(weights_cfg.get(name, 1.0))
+        except Exception:
+            return 1.0
+    core_pass = {
+        "trend": trend_ok,
+        "momentum": momentum_ok,
+        "cycle": cycle_ok,
+        "sr": sr_ok,
+        "fractal": fractal_ok,
+    }
+    score_count = int(sum(core_pass.values()))
+    score_weighted = float(sum(w(k) for k, v in core_pass.items() if v))
+    # maintain backward-compatible 'score' as count
+    score = score_count
 
     return {
         "direction": direction,
@@ -374,8 +485,11 @@ def evaluate_five_energies(df: pd.DataFrame, cfg: dict | None = None) -> dict:
         "momentum": momentum_ok,
         "cycle": cycle_ok,
         "sr": sr_ok,
-        "volume": volume_ok,
-        "score": score,
+        "fractal": fractal_ok,
+        "volume": volume_ok,  # confirmation only
+        "score": score,  # count of core passes
+        "score_weighted": score_weighted,
+        "core_pass_count": score_count,
         "explain": {
             "trend": {"bull": bool(bullish_trend), "bear": bool(bearish_trend)},
             "momentum": {
@@ -387,15 +501,28 @@ def evaluate_five_energies(df: pd.DataFrame, cfg: dict | None = None) -> dict:
                 "exp_lookback": _get_int(mcfg, "expansion_lookback", 3),
                 "exp_min_steps": _get_int(mcfg, "expansion_min_steps", 1),
                 "exp_ok": bool(exp_ok),
+                "macd_abs_min": macd_abs_min,
             },
-            "cycle": {"bull": bool(bull_cycle), "bear": bool(bear_cycle)},
+            "cycle": {"bull": bool(bull_cycle), "bear": bool(bear_cycle), "rise_bars": rise_bars, "require_d_slope": require_d_slope},
             "sr": {
                 "support": support, "resistance": resistance,
                 "tol": tol, "near_pct": near_pct, "near_atr_mult": near_atr,
                 "ema50_fallback_pct": ema_fall, "used": sr_used,
+                "fallback_used": sr_fallback_used,
+                "allow_fallback_as_core": allow_fallback_as_sr,
                 "yesterday_touch_ok": yday_ok
             },
+            "fractal": {
+                "adx": adx_val if np.isfinite(adx_val) else None,
+                "adx_min": f_adx_min,
+                "chop": chop_val if np.isfinite(chop_val) else None,
+                "chop_max": f_chop_max,
+                "use_chop": f_use_chop,
+                "enabled": f_enabled,
+                "ok": fractal_ok,
+            },
             "volume": vol_details,
+            "weights": {k: w(k) for k in core_pass.keys()},
         }
     }
 
@@ -487,8 +614,15 @@ def _regime_check(df: pd.DataFrame, cfg: dict) -> tuple[bool, dict]:
     det = {"adx_min": adx_min, "atr_pct_min": atr_pct_min, "use_chop": use_chop,
            "chop_window": chop_window, "chop_max": chop_max}
 
+    # Optionally skip ADX in regime if fractal energy already handles it
+    skip_adx_if_fractal = bool(rcfg.get("skip_adx_if_fractal", True))
+    fractal_enabled = bool((cfg.get("fractal", {}) or {}).get("enabled", True))
     adx_val = float(last.get("ADX14", np.nan))
-    adx_ok = True if np.isnan(adx_val) else (adx_val >= adx_min)
+    if skip_adx_if_fractal and fractal_enabled:
+        adx_ok = True
+        det["adx_skipped"] = True
+    else:
+        adx_ok = True if np.isnan(adx_val) else (adx_val >= adx_min)
     det["adx"] = f"{adx_val:.2f}" if np.isfinite(adx_val) else "nan"
     det["adx_ok"] = adx_ok
 
@@ -501,6 +635,8 @@ def _regime_check(df: pd.DataFrame, cfg: dict) -> tuple[bool, dict]:
         atr_ok = atr_pct >= atr_pct_min
     det["atr_pct"] = f"{atr_pct:.3f}" if np.isfinite(atr_pct) else "nan"
     det["atr_ok"] = atr_ok
+    if not np.isfinite(atr_val) or not np.isfinite(close_val):
+        det["atr_note"] = "atr_or_close_nan"
 
     chop_ok = True
     if use_chop:
@@ -555,21 +691,35 @@ def build_trade_signal(symbol: str, df: pd.DataFrame, cfg: dict) -> TradeSignal 
             mtf_ok, mtf_reason = True, f"mtf-skip-error:{e}"
 
     mtf_bonus = 1 if (mtf_counts and mtf_ok) else 0
+    core_min = int(cfg.get("trading", {}).get("min_core_energies", cfg.get("trading", {}).get("min_score", 4)))
     eff_score = int(energies["score"]) + mtf_bonus
-
-    # Minimum score gate (use config)
-    min_score = int(cfg.get("trading", {}).get("min_score", 4))
+    # enforce core_min BEFORE bonus (strict Burns 4 of 5 rule)
+    if int(energies["score"]) < core_min:
+        passes = {k: bool(energies.get(k)) for k in ("trend","momentum","cycle","sr","fractal")}
+        passes["core_pass_count"] = int(energies["score"])
+        _explain_log(symbol, f"core<{core_min}", passes, cfg)
+        return None
+    # Minimum score gate (possibly same as core_min or higher including bonus)
+    min_score = int(cfg.get("trading", {}).get("min_score", core_min))
 
     if (mtf_reject and not mtf_ok):
         _explain_log(symbol, "mtf", {"reason": mtf_reason}, cfg)
         return None
 
     if eff_score < min_score:
-        # show which energies passed; you can invert if you want "fails"
-        passes = {k: bool(energies[k]) for k in ("trend","momentum","cycle","sr","volume")}
+        passes = {k: bool(energies.get(k)) for k in ("trend","momentum","cycle","sr","fractal")}
         passes["mtf_bonus"] = bool(mtf_bonus)
+        passes["volume_confirm"] = bool(energies.get("volume"))
         _explain_log(symbol, f"eff_score<{min_score}", passes, cfg)
         return None
+
+    # 2.5) Optional pattern trigger layer (price action) AFTER energies pass
+    pcfg = (cfg.get("trading", {}) or {}).get("patterns", {}) or {}
+    if bool(pcfg.get("enabled", False)):
+        ok_pat, pdet = _pattern_trigger(df, energies["direction"], pcfg)
+        if not ok_pat:
+            _explain_log(symbol, "pattern", pdet, cfg)
+            return None
 
     # 3) Risk levels and sizing (at close)
     row   = df.iloc[-1]
@@ -606,11 +756,61 @@ def build_trade_signal(symbol: str, df: pd.DataFrame, cfg: dict) -> TradeSignal 
         per_share_risk = per_share_risk,
         total_risk = total_risk,
         notes = (
-            f"Trend:{energies['trend']} Mom:{energies['momentum']} "
-            f"Cycle:{energies['cycle']} S/R:{energies['sr']} Vol:{energies['volume']} | "
-            f"MTF:{mtf_reason}, eff_score:{eff_score} (+{mtf_bonus})"
+            f"Trend:{energies['trend']} Mom:{energies['momentum']} Cycle:{energies['cycle']} "
+            f"S/R:{energies['sr']} Frac:{energies['fractal']} VolC:{energies['volume']} | "
+            f"core:{energies['score']} w:{energies['score_weighted']:.2f} MTF:{mtf_reason} (+{mtf_bonus})"
         ),
     )
+
+
+# ---------- Pattern triggers (post-energy) ----------
+def _pattern_trigger(df: pd.DataFrame, direction: str, pcfg: dict) -> tuple[bool, dict]:
+    """Return (ok, details). Supports simple patterns:
+    modes: engulf, inside_break, nr4_break
+    All optional; pass if ANY selected pattern satisfied.
+    """
+    if direction not in {"long","short"}:
+        return False, {"reason": "no-direction"}
+    modes = pcfg.get("modes", ["engulf"]) or []
+    if not modes:
+        return True, {"reason": "no-modes"}
+    if len(df) < 3:
+        return False, {"reason": "insufficient-bars"}
+    row = df.iloc[-1]; prev = df.iloc[-2]
+    o, h, l, c = float(row.Open), float(row.High), float(row.Low), float(row.Close)
+    po, ph, pl, pc = float(prev.Open), float(prev.High), float(prev.Low), float(prev.Close)
+    passed = []
+    # Engulfing (real body engulf)
+    if "engulf" in modes:
+        prev_body_high = max(po, pc)
+        prev_body_low  = min(po, pc)
+        curr_body_high = max(o, c)
+        curr_body_low  = min(o, c)
+        bull = (direction == "long" and c > o and pc < po and curr_body_high >= prev_body_high and curr_body_low <= prev_body_low)
+        bear = (direction == "short" and c < o and pc > po and curr_body_high >= prev_body_high and curr_body_low <= prev_body_low)
+        if bull or bear:
+            passed.append("engulf")
+    # Inside bar breakout (current range breaks prior high/low after an inside bar prev compared to its prior)
+    if "inside_break" in modes and len(df) >= 3:
+        prev2 = df.iloc[-3]
+        inside_prev = (ph <= float(prev2.High) and pl >= float(prev2.Low))
+        if inside_prev:
+            if direction == "long" and h > ph:
+                passed.append("inside_break")
+            if direction == "short" and l < pl:
+                passed.append("inside_break")
+    # NR4 breakout (narrowest range of last 4, then breakout in direction)
+    if "nr4_break" in modes and len(df) >= 4:
+        last4 = df.iloc[-4:]
+        ranges = (last4.High - last4.Low).to_numpy()
+        if np.argmin(ranges) == 2:  # the bar BEFORE current is narrowest
+            if direction == "long" and h > ph:
+                passed.append("nr4_break")
+            if direction == "short" and l < pl:
+                passed.append("nr4_break")
+    if passed:
+        return True, {"patterns": passed}
+    return False, {"reason": "no-pattern", "tested": modes}
 
 
 # ---------- (optional) simple demo signals ----------

@@ -79,12 +79,14 @@ for i, sym in enumerate(tqdm(tickers, desc="TA + signals"), start=1):
             "date": date.today(),
             "symbol": sym,
             "score": energies["score"],
+            "score_weighted": energies.get("score_weighted"),
             "direction": energies["direction"],
             "trend": energies["trend"],
             "momentum": energies["momentum"],
             "cycle": energies["cycle"],
             "sr": energies["sr"],
-            "volume": energies["volume"],
+            "fractal": energies.get("fractal"),
+            "volume_confirm": energies.get("volume"),
         })
 
         signal = build_trade_signal(sym, df, cfg)
@@ -100,7 +102,7 @@ for i, sym in enumerate(tqdm(tickers, desc="TA + signals"), start=1):
 # ---- diagnostics: show top candidates by score -----------------------
 if all_evals:
     ev = pd.DataFrame(all_evals).sort_values("score", ascending=False)
-    cols = ["symbol", "score", "direction", "trend", "momentum", "cycle", "sr", "volume"]
+    cols = ["symbol", "score", "direction", "trend", "momentum", "cycle", "sr", "fractal", "volume_confirm"]
     print("\nTop candidates by score:")
     print(ev[cols].head(10).to_string(index=False))
 

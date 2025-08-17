@@ -17,8 +17,14 @@ signals:
     right: 3
     near_pct: 0.02
     near_atr_mult: 0.50
-    ema50_fallback_pct: null     # pivot-only for now
+    ema50_fallback_pct: 0.025    # fallback tolerance (percent of price); set null to disable check
+    allow_fallback_as_core: false # if true, EMA50 proximity alone can satisfy S/R energy
     # yesterday_touch_ok: true    # enabled by default in code
+
+# --- cycle (stochastic) hysteresis ---
+cycle:
+  rise_bars: 0            # require %K strictly rising (or falling) N bars before trigger (0=off)
+  require_d_slope: false  # demand SlowD rising for long trigger / falling for short
 
 # --- momentum quality controls ---
 momentum:
@@ -37,6 +43,13 @@ volume:
   ad_trend_lookback: 3
   obv_mode: "tick"               # or "slope"
   min_components: 2              # require 2 of {RVOL, AD, OBV}
+
+# --- fractal/volatility (5th core energy) ---
+fractal:
+  adx_min: 18            # ADX threshold for trend strength (passes if missing)
+  use_chop: true         # include choppiness constraint
+  chop_window: 14
+  chop_max: 58
 
 regime:
   enabled: true
@@ -72,11 +85,25 @@ fundamentals:
 
 trading:
   # MTF counts as a 6th "bonus" energy but also vetoes mismatches
-  min_score: 4
+  min_score: 4             # effective score threshold (core + MTF bonus)
+  min_core_energies: 4     # STRICT: must have at least this many of 5 core before bonus
   confirm_before_place: true
   time_in_force: "gtc"
   order_type: "market"           # live only; backtest has its own entry model
   max_signals_per_run: 0
+
+  # Optional weighting of core energies (trend, momentum, cycle, sr, fractal)
+  energy_weights:
+    trend: 1.0
+    momentum: 1.0
+    cycle: 1.0
+    sr: 1.0
+    fractal: 1.0
+
+  # Post-energy pattern trigger (must pass if enabled)
+  patterns:
+    enabled: false
+    modes: ["engulf", "inside_break", "nr4_break"]
 
   # ---- Higher timeframe (MTF) confirmation ----
   mtf:

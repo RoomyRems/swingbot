@@ -211,7 +211,8 @@ def run_backtest(
             mom_ok   = bool(eng.get("momentum", False))
             cycle_ok = bool(eng.get("cycle", False))
             sr_ok    = bool(eng.get("sr", False))
-            vol_ok   = bool(eng.get("volume", False))
+            fractal_ok = bool(eng.get("fractal", False))
+            vol_ok   = bool(eng.get("volume", False))  # confirmation only
 
             # MTF bonus
             if direction in ("long", "short"):
@@ -220,13 +221,15 @@ def run_backtest(
                 mtf_ok, _mtf_reason = False, "no-dir"
             mtf_cfg = (cfg.get("trading", {}).get("mtf") or {})
             mtf_counts = bool(mtf_cfg.get("counts_as_energy", True))
+            core_min = int(cfg.get("trading", {}).get("min_core_energies", cfg.get("trading", {}).get("min_score", 4)))
+            # enforce core gate before bonus
             score_eff = score + (1 if (mtf_counts and mtf_ok) else 0)
 
-            min_score = int(cfg["trading"]["min_score"])
+            min_score = int(cfg["trading"]["min_score"])  # effective threshold (post bonus)
             allowed_dir = (direction != "short") or allow_short
             mtf_cfg = (cfg.get("trading", {}).get("mtf") or {})
             mtf_veto = bool(mtf_cfg.get("reject_on_mismatch", False))
-            accept = regime_ok and (direction in ("long", "short")) and (score_eff >= min_score) and allowed_dir
+            accept = regime_ok and (direction in ("long", "short")) and (score >= core_min) and (score_eff >= min_score) and allowed_dir
             if accept and mtf_veto and (not mtf_ok):
                 accept = False
                 reason = "mtf_mismatch"
@@ -238,6 +241,8 @@ def run_backtest(
                 reason = "no_dir"
             elif mtf_veto and not mtf_ok:
                 reason = "mtf_mismatch"
+            elif score < core_min:
+                reason = "below_core_min"
             elif score_eff < min_score:
                 reason = "below_score"
             elif not allowed_dir:
@@ -259,14 +264,15 @@ def run_backtest(
                 "momentum": mom_ok,
                 "cycle": cycle_ok,
                 "sr": sr_ok,
-                "volume": vol_ok,
+                "fractal": fractal_ok,
+                "volume_confirm": vol_ok,
                 "regime_ok": bool(regime_ok),
                 "mtf_ok": bool(mtf_ok),
                 "reject_reason": reason,
                 "close": float(row.get("Close", np.nan)),
                 "ema20": float(row.get("EMA20", np.nan)),
-                "atr14": float(row.get("ATR14", np.nan)),
-                "adx14": float(row.get("ADX14", np.nan)) if "ADX14" in row.index else np.nan,
+                    "atr14": float(row.get("ATR14", np.nan)),
+                    "adx14": float(row.get("ADX14", np.nan)) if "ADX14" in row.index else np.nan,
             })
 
             if accept:
