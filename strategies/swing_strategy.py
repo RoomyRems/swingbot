@@ -721,10 +721,45 @@ def build_trade_signal(symbol: str, df: pd.DataFrame, cfg: dict) -> TradeSignal 
             _explain_log(symbol, "pattern", pdet, cfg)
             return None
 
+    # 2.6) Pullback & extension gating (avoid extended entries, require proximity to EMA20)
+    f2cfg = (cfg.get("trading", {}) or {}).get("filters", {}) or {}
+    max_extension_pct = float(f2cfg.get("max_extension_pct", 0.0))  # e.g. 0.06 means <=6% above/below EMA20 for longs/shorts
+    pullback_tolerance_pct = float(f2cfg.get("pullback_tolerance_pct", 0.0))  # require price within X% of EMA20
+    if max_extension_pct > 0 or pullback_tolerance_pct > 0:
+        if len(df) >= 1:
+            row_last = df.iloc[-1]
+            ema20 = float(row_last.get("EMA20", np.nan))
+            close_px = float(row_last.get("Close", np.nan))
+            if np.isfinite(ema20) and np.isfinite(close_px) and ema20 > 0:
+                ext_pct = (close_px - ema20) / ema20
+                # Extension rejection: price too far in direction already
+                if max_extension_pct > 0:
+                    if energies["direction"] == "long" and ext_pct > max_extension_pct:
+                        _explain_log(symbol, "over_extended", {"ext_pct": f"{ext_pct:.3f}", "max": max_extension_pct}, cfg)
+                        return None
+                    if energies["direction"] == "short" and (-ext_pct) > max_extension_pct:  # price far below EMA20
+                        _explain_log(symbol, "over_extended", {"ext_pct": f"{ext_pct:.3f}", "max": max_extension_pct}, cfg)
+                        return None
+                # Pullback proximity: demand we are not too far from EMA20
+                if pullback_tolerance_pct > 0:
+                    if abs(ext_pct) > pullback_tolerance_pct:
+                        _explain_log(symbol, "not_pulled_back", {"ext_pct": f"{ext_pct:.3f}", "tol": pullback_tolerance_pct}, cfg)
+                        return None
+
+    # 2.9) Additional volatility/liquidity filters (ATR % floor)
+    fcfg = (cfg.get("trading", {}) or {}).get("filters", {}) or {}
+    min_atr_pct = float(fcfg.get("min_atr_pct", 0.0))
+
     # 3) Risk levels and sizing (at close)
     row   = df.iloc[-1]
     close = float(row["Close"])
     atr   = float(row["ATR14"])
+
+    if min_atr_pct > 0 and np.isfinite(atr) and close > 0:
+        atr_pct_val = atr / close
+        if atr_pct_val < min_atr_pct:
+            _explain_log(symbol, "atr_pct_floor", {"atr_pct": f"{atr_pct_val:.3f}", "min": min_atr_pct}, cfg)
+            return None
 
     stop, target = compute_levels(
         direction   = energies["direction"],

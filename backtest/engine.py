@@ -54,10 +54,41 @@ def _annualized_sharpe(daily_pct: pd.Series) -> float:
 def _week_key(ts: pd.Timestamp) -> pd.Period:
     return pd.to_datetime(ts).to_period("W-FRI")
 
-def _qty_bp_cap(entry_px: float, equity: float, bp_multiple: float) -> int:
-    if entry_px <= 0 or equity <= 0 or bp_multiple <= 0:
+def _qty_bp_cap(entry_px: float, cash: float, bp_multiple: float) -> int:
+    if entry_px <= 0 or cash <= 0 or bp_multiple <= 0:
         return 0
-    return int(math.floor((equity * bp_multiple) / entry_px))
+    return int(math.floor((cash * bp_multiple) / entry_px))
+
+def _detect_split(prev_close: float, today_open: float) -> int:
+    """Return forward split factor (>=2) if a likely corporate split occurred, else 1.
+    Heuristic: large downward gap where ratio prev_close / today_open is near an integer >= 2
+    and absolute gap exceeds 60%. Handles cases like 50:1 (CMG 2024) producing huge artificial losses otherwise.
+    """
+    if not (np.isfinite(prev_close) and np.isfinite(today_open)) or prev_close <= 0 or today_open <= 0:
+        return 1
+    ratio = prev_close / today_open
+    if ratio < 1.8:  # require substantial factor
+        return 1
+    cand = int(round(ratio))
+    if cand < 2:
+        return 1
+    # relative diff threshold 2%
+    if abs(ratio - cand) / ratio <= 0.02:
+        # also ensure big absolute gap to filter ordinary moves
+        gap_pct = abs(today_open - prev_close) / prev_close
+        if gap_pct > 0.60:
+            return cand
+    return 1
+
+def _apply_split_adjustment(pos, factor: int):
+    """Adjust an open Position in-place for a forward split factor (>=2)."""
+    if factor <= 1:
+        return
+    pos.entry_price /= factor
+    pos.stop /= factor
+    pos.target /= factor
+    pos.per_share_risk = abs(pos.entry_price - pos.stop)
+    pos.qty *= factor
 
 @dataclass
 class PendingLimit:
@@ -285,6 +316,7 @@ def run_backtest(
                     "close": float(row["Close"]),
                     "ema20": float(row.get("EMA20", np.nan)),
                     "atr": float(row.get("ATR14", np.nan)),
+                    "adx": float(row.get("ADX14", np.nan)),
                 })
 
     # --- DIAGNOSTIC ---
@@ -296,7 +328,7 @@ def run_backtest(
     # ---------- portfolio state ----------
     start_equity_cfg = float(bt_cfg.get("initial_equity", cfg.get("risk", {}).get("account_equity", 50000)))
     equity = float(start_equity_cfg)
-    cash = equity
+    cash = equity  # free cash; equity = cash + MV(open positions)
     open_positions: Dict[str, Position] = {}
     pending_limits: List[PendingLimit] = []
     pending_markets: List[PendingMarket] = []
@@ -313,431 +345,245 @@ def run_backtest(
         return float(risk_amt / eq)
 
     # ---------- backtest loop ----------
+    min_stop_pct_cfg = float(cfg.get("risk", {}).get("min_stop_pct", 0.0))
+
+    def _enforce_floor(direction: str, entry_px: float, stop: float, target: float) -> tuple[float, float]:
+        if min_stop_pct_cfg <= 0 or entry_px <= 0:
+            return stop, target
+        dist = abs(entry_px - stop)
+        floor_dist = entry_px * min_stop_pct_cfg
+        if dist >= floor_dist:
+            return stop, target
+        rm = float(cfg["risk"]["reward_multiple"])
+        if direction == "long":
+            stop = entry_px - floor_dist
+            target = entry_px + rm * floor_dist
+        else:
+            stop = entry_px + floor_dist
+            target = entry_px - rm * floor_dist
+        if target <= 0:
+            return stop, target  # will be rejected later
+        return round(stop, 2), round(target, 2)
+
     for day in tqdm(calendar, desc="Backtest", leave=True):
         # 1) exits first
         for sym, pos in list(open_positions.items()):
             df = data.get(sym)
             if df is None or day not in df.index:
                 continue
-            o = float(df.at[day, "Open"])
-            h = float(df.at[day, "High"])
-            l = float(df.at[day, "Low"])
-            c = float(df.at[day, "Close"])
+            o = float(df.at[day, "Open"]); h = float(df.at[day, "High"]); l = float(df.at[day, "Low"]); c = float(df.at[day, "Close"])
+
+            # --- Corporate action (forward split) detection & adjustment BEFORE evaluating exits ---
+            try:
+                idx = df.index.get_loc(day)
+                if idx > 0:
+                    prev_close = float(df.iloc[idx-1]["Close"])
+                    split_factor = _detect_split(prev_close, o)
+                    if split_factor > 1:
+                        _apply_split_adjustment(pos, split_factor)
+                        # Recompute per-share risk used for R multiple later automatically via pos.per_share_risk
+            except Exception:
+                pass
 
             # BREAKEVEN
-            orig_stop = pos.stop
             if be_R > 0 and not pos.be_armed:
                 if pos.side == "long":
-                    be_level = pos.entry_price + be_R * pos.per_share_risk
-                    if h >= be_level:
-                        if not (be_intrabar == "favor_stop" and l <= orig_stop):
-                            pos.stop = max(pos.stop, pos.entry_price)
-                            pos.be_armed = True
+                    if h >= pos.entry_price + be_R * pos.per_share_risk:
+                        if not (be_intrabar == "favor_stop" and l <= pos.stop):
+                            pos.stop = max(pos.stop, pos.entry_price); pos.be_armed = True
                 else:
-                    be_level = pos.entry_price - be_R * pos.per_share_risk
-                    if l <= be_level:
-                        if not (be_intrabar == "favor_stop" and h >= orig_stop):
-                            pos.stop = min(pos.stop, pos.entry_price)
-                            pos.be_armed = True
+                    if l <= pos.entry_price - be_R * pos.per_share_risk:
+                        if not (be_intrabar == "favor_stop" and h >= pos.stop):
+                            pos.stop = min(pos.stop, pos.entry_price); pos.be_armed = True
 
-            exit_reason = None
-            fill_px = None
-
+            exit_reason = None; fill_px = None
             if pos.side == "long":
                 if l <= pos.stop:
-                    fill_px = _gap_exit_price("long", o, pos.stop)
-                    exit_reason = "stop"
+                    fill_px = _gap_exit_price("long", o, pos.stop); exit_reason = "stop"
                 elif h >= pos.target:
-                    fill_px = pos.target if o <= pos.target else o
-                    exit_reason = "target"
+                    fill_px = pos.target if o <= pos.target else o; exit_reason = "target"
             else:
                 if h >= pos.stop:
-                    fill_px = _gap_exit_price("short", o, pos.stop)
-                    exit_reason = "stop"
+                    fill_px = _gap_exit_price("short", o, pos.stop); exit_reason = "stop"
                 elif l <= pos.target:
-                    fill_px = pos.target if o >= pos.target else o
-                    exit_reason = "target"
-
+                    fill_px = pos.target if o >= pos.target else o; exit_reason = "target"
             if exit_reason:
                 slip = (slip_bps / 10000.0) * fill_px
-                fill_px_eff = fill_px - slip if pos.side == "long" else fill_px + slip
+                fill_eff = fill_px - slip if pos.side == "long" else fill_px + slip
                 commission = commission_ps * pos.qty
-                if pos.side == "long":
-                    cash += pos.qty * fill_px_eff
-                else:
-                    cash -= pos.qty * fill_px_eff
+                cash += (pos.qty * fill_eff) if pos.side == "long" else (-pos.qty * fill_eff)
                 cash -= commission
-
-                pnl = (fill_px_eff - pos.entry_price) * pos.qty if pos.side == "long" else (pos.entry_price - fill_px_eff) * pos.qty
+                pnl = (fill_eff - pos.entry_price) * pos.qty if pos.side == "long" else (pos.entry_price - fill_eff) * pos.qty
                 trades.append({
-                    "symbol": sym,
-                    "side": pos.side,
-                    "entry_date": pos.entry_date,
-                    "entry_price": pos.entry_price,
-                    "exit_date": day,
-                    "exit_price": fill_px_eff,
-                    "qty": pos.qty,
-                    "pnl": pnl,
+                    "symbol": sym, "side": pos.side, "entry_date": pos.entry_date, "entry_price": pos.entry_price,
+                    "exit_date": day, "exit_price": fill_eff, "qty": pos.qty, "pnl": pnl,
                     "r_multiple": pnl / (pos.per_share_risk * pos.qty) if pos.per_share_risk > 0 else np.nan,
-                    "commission": commission_ps * pos.qty * 2.0,
-                    "slippage_cost": slip * pos.qty,
-                    "reason": exit_reason,
+                    "commission": commission_ps * pos.qty * 2.0, "slippage_cost": slip * pos.qty, "reason": exit_reason,
                 })
                 del open_positions[sym]
-        # 1a) fill any scheduled MARKET entries for today at the open
+
+        # 1a) pending market fills
         for pend in list(pending_markets):
             if pend.fill_date != day:
                 continue
-
             df = data.get(pend.symbol)
             if df is None or day not in df.index:
-                pending_markets.remove(pend)
-                continue
-
-            # caps before sizing
+                pending_markets.remove(pend); continue
             if len(open_positions) >= max_open or (_current_total_risk() >= max_risk_pct):
-                pending_markets.remove(pend)
-                continue
+                pending_markets.remove(pend); continue
             wk = _week_key(day)
             if max_new_week > 0 and week_new_count[wk] >= max_new_week:
-                pending_markets.remove(pend)
-                continue
-
+                pending_markets.remove(pend); continue
             o = float(df.at[day, "Open"])
             slip = (slip_bps / 10000.0) * o
             entry_px = o + slip if pend.direction == "long" else o - slip
-
-            # compute levels at actual entry
-            stop, target = rm_compute_levels(
-                direction=pend.direction,
-                entry=entry_px,
-                atr=pend.atr,
-                atr_mult=float(cfg["risk"]["atr_multiple_stop"]),
-                reward_mult=float(cfg["risk"]["reward_multiple"]),
-            )
+            stop, target = rm_compute_levels(pend.direction, entry_px, pend.atr, float(cfg["risk"]["atr_multiple_stop"]), float(cfg["risk"]["reward_multiple"]))
             if stop is None or target is None:
-                pending_markets.remove(pend)
-                continue
-
-            # per-day cfg and sizing
-            cfg_day = copy.deepcopy(cfg)
-            cfg_day["risk"]["use_broker_equity"] = False
-            cfg_day["risk"]["account_equity"] = float(equity)
-
-            qty = rm_size_position(cfg_day, entry=entry_px, stop=stop)
-            qty_bp = _qty_bp_cap(entry_px, equity, bp_multiple)
-            qty = min(qty, qty_bp)
+                pending_markets.remove(pend); continue
+            stop, target = _enforce_floor(pend.direction, entry_px, stop, target)
+            if target <= 0:
+                pending_markets.remove(pend); continue
+            cfg_day = copy.deepcopy(cfg); cfg_day["risk"]["use_broker_equity"] = False; cfg_day["risk"]["account_equity"] = float(equity)
+            qty = rm_size_position(cfg_day, entry_px, stop); qty = min(qty, _qty_bp_cap(entry_px, cash, bp_multiple))
             if qty <= 0:
-                pending_markets.remove(pend)
-                continue
-
-            # portfolio risk cap
+                pending_markets.remove(pend); continue
             psr = abs(entry_px - stop)
-            new_total_risk = (_current_total_risk() * max(equity, 1e-9) + psr * qty) / max(equity, 1e-9)
-            if new_total_risk > max_risk_pct:
-                pending_markets.remove(pend)
-                continue
-
+            new_total = (_current_total_risk() * max(equity, 1e-9) + psr * qty) / max(equity, 1e-9)
+            if new_total > max_risk_pct:
+                pending_markets.remove(pend); continue
             commission = commission_ps * qty
-            if pend.direction == "long":
-                cash -= qty * entry_px
-            else:
-                cash += qty * entry_px
+            cash += (-qty * entry_px) if pend.direction == "long" else (qty * entry_px)
             cash -= commission
-
-            open_positions[pend.symbol] = Position(
-                symbol=pend.symbol,
-                side=pend.direction,
-                entry_date=day,
-                entry_price=entry_px,
-                qty=qty,
-                stop=stop,
-                target=target,
-                per_share_risk=psr,
-                score=pend.score,
-                be_armed=False,
-            )
-
-            # Immediately check same-day exit for newly opened market positions
-            h = float(df.at[day, "High"])
-            l = float(df.at[day, "Low"])
-
-            pos = open_positions[pend.symbol]
-            exit_reason = None
-            fill_px = None
-
+            open_positions[pend.symbol] = Position(pend.symbol, pend.direction, day, entry_px, qty, stop, target, psr, pend.score, False)
+            # same day exit check
+            h = float(df.at[day, "High"]); l = float(df.at[day, "Low"]); pos = open_positions[pend.symbol]
+            exit_reason=None; fill_px=None
             if pos.side == "long":
-                if l <= pos.stop:
-                    fill_px = _gap_exit_price("long", o, pos.stop)
-                    exit_reason = "stop_same_day"
-                elif h >= pos.target:
-                    fill_px = pos.target if o <= pos.target else o
-                    exit_reason = "target_same_day"
+                if l <= pos.stop: fill_px=_gap_exit_price("long", o, pos.stop); exit_reason="stop_same_day"
+                elif h >= pos.target: fill_px = pos.target if o <= pos.target else o; exit_reason="target_same_day"
             else:
-                if h >= pos.stop:
-                    fill_px = _gap_exit_price("short", o, pos.stop)
-                    exit_reason = "stop_same_day"
-                elif l <= pos.target:
-                    fill_px = pos.target if o >= pos.target else o
-                    exit_reason = "target_same_day"
-
+                if h >= pos.stop: fill_px=_gap_exit_price("short", o, pos.stop); exit_reason="stop_same_day"
+                elif l <= pos.target: fill_px = pos.target if o >= pos.target else o; exit_reason="target_same_day"
             if exit_reason:
-                slip_exit = (slip_bps / 10000.0) * fill_px
-                fill_px_eff = fill_px - slip_exit if pos.side == "long" else fill_px + slip_exit
-                commission = commission_ps * pos.qty
-                if pos.side == "long":
-                    cash += pos.qty * fill_px_eff
-                else:
-                    cash -= pos.qty * fill_px_eff
-                cash -= commission
-
-                pnl = (fill_px_eff - pos.entry_price) * pos.qty if pos.side == "long" else (pos.entry_price - fill_px_eff) * pos.qty
-                trades.append({
-                    "symbol": pend.symbol, "side": pos.side,
-                    "entry_date": pos.entry_date, "entry_price": pos.entry_price,
-                    "exit_date": day, "exit_price": fill_px_eff, "qty": pos.qty,
-                    "pnl": pnl,
-                    "r_multiple": pnl / (pos.per_share_risk * pos.qty) if pos.per_share_risk > 0 else np.nan,
-                    "commission": commission_ps * pos.qty * 2.0,
-                    "slippage_cost": slip_exit * pos.qty,
-                    "reason": exit_reason,
-                })
+                slip2=(slip_bps/10000.0)*fill_px; eff=fill_px - slip2 if pos.side=="long" else fill_px + slip2; commission = commission_ps*pos.qty
+                cash += (pos.qty*eff) if pos.side=="long" else (-pos.qty*eff); cash -= commission
+                pnl=(eff-pos.entry_price)*pos.qty if pos.side=="long" else (pos.entry_price-eff)*pos.qty
+                trades.append({"symbol":pend.symbol,"side":pos.side,"entry_date":pos.entry_date,"entry_price":pos.entry_price,
+                               "exit_date":day,"exit_price":eff,"qty":pos.qty,"pnl":pnl,
+                               "r_multiple":pnl/(pos.per_share_risk*pos.qty) if pos.per_share_risk>0 else np.nan,
+                               "commission":commission_ps*pos.qty*2.0,"slippage_cost":slip2*pos.qty,"reason":exit_reason})
                 del open_positions[pend.symbol]
-
-
-
             week_new_count[wk] += 1
             pending_markets.remove(pend)
 
-
-
-        # 2) try to place/fill pending limit orders
+        # 2) pending limit fills
         for pend in list(pending_limits):
             if equity <= equity_halt_floor:
-                pending_limits.clear()
-                break
+                pending_limits.clear(); break
             df = data.get(pend.symbol)
-            if df is None or day < pend.signal_date or day > pend.expires or day not in df.index:
-                if day > pend.expires:
-                    pending_limits.remove(pend)
+            if df is None or day not in df.index:
                 continue
-            o = float(df.at[day, "Open"])
-            h = float(df.at[day, "High"])
-            l = float(df.at[day, "Low"])
+            if day < pend.signal_date or day > pend.expires:
+                if day > pend.expires: pending_limits.remove(pend)
+                continue
+            o = float(df.at[day, "Open"]); h = float(df.at[day, "High"]); l = float(df.at[day, "Low"])
             hit = (l <= pend.limit_px) if pend.direction == "long" else (h >= pend.limit_px)
             if not hit:
-                if day == pend.expires:
-                    pending_limits.remove(pend)
+                if day == pend.expires: pending_limits.remove(pend)
                 continue
-
             if len(open_positions) >= max_open or (_current_total_risk() >= max_risk_pct):
                 continue
             wk = _week_key(day)
             if max_new_week > 0 and week_new_count[wk] >= max_new_week:
                 continue
-
-            # per-day cfg: override equity (no broker BP)
-            cfg_day = copy.deepcopy(cfg)
-            cfg_day["risk"]["use_broker_equity"] = False
-            cfg_day["risk"]["account_equity"] = float(equity)
-
-            # effective entry with slippage
-            raw_entry = min(o, pend.limit_px) if pend.direction == "long" else max(o, pend.limit_px)
-            slip = (slip_bps / 10000.0) * raw_entry
-            entry_px = raw_entry + slip if pend.direction == "long" else raw_entry - slip
-
-            stop, target = rm_compute_levels(
-                direction=pend.direction,
-                entry=entry_px,
-                atr=pend.atr,                                  # <-- use stored ATR
-                atr_mult=float(cfg["risk"]["atr_multiple_stop"]),
-                reward_mult=float(cfg["risk"]["reward_multiple"]),
-            )
+            cfg_day = copy.deepcopy(cfg); cfg_day["risk"]["use_broker_equity"] = False; cfg_day["risk"]["account_equity"] = float(equity)
+            cfg_day = copy.deepcopy(cfg); cfg_day["risk"]["use_broker_equity"] = False; cfg_day["risk"]["account_equity"] = float(cash)
+            raw_entry = min(o, pend.limit_px) if pend.direction=="long" else max(o, pend.limit_px)
+            slip=(slip_bps/10000.0)*raw_entry; entry_px = raw_entry + slip if pend.direction=="long" else raw_entry - slip
+            stop, target = rm_compute_levels(pend.direction, entry_px, pend.atr, float(cfg["risk"]["atr_multiple_stop"]), float(cfg["risk"]["reward_multiple"]))
             if stop is None or target is None:
                 continue
-
-            # size from live helper, then apply BP cap
-            qty = rm_size_position(cfg_day, entry=entry_px, stop=stop)
-            qty_bp = _qty_bp_cap(entry_px, equity, bp_multiple)
-            qty = min(qty, qty_bp)
+            stop, target = _enforce_floor(pend.direction, entry_px, stop, target)
+            if target <= 0:
+                continue
+            qty = rm_size_position(cfg_day, entry_px, stop); qty = min(qty, _qty_bp_cap(entry_px, equity, bp_multiple))
+            qty = rm_size_position(cfg_day, entry_px, stop); qty = min(qty, _qty_bp_cap(entry_px, cash, bp_multiple))
             if qty <= 0:
                 continue
-
-            # portfolio risk cap check
-            psr = abs(entry_px - stop)
-            new_total_risk = (_current_total_risk() * max(equity, 1e-9) + psr * qty) / max(equity, 1e-9)
-            if new_total_risk > max_risk_pct:
+            psr = abs(entry_px - stop); new_total = (_current_total_risk()*max(equity,1e-9) + psr*qty)/max(equity,1e-9)
+            if new_total > max_risk_pct:
                 continue
-
-            commission = commission_ps * qty
-            if pend.direction == "long":
-                cash -= qty * entry_px
-            else:
-                cash += qty * entry_px
-            cash -= commission
-
-            open_positions[pend.symbol] = Position(
-                symbol=pend.symbol,
-                side=pend.direction,
-                entry_date=day,
-                entry_price=entry_px,
-                qty=qty,
-                stop=stop,
-                target=target,
-                per_share_risk=psr,
-                score=pend.score,
-                be_armed=False,
-            )
-            week_new_count[wk] += 1
-            pending_limits.remove(pend)
-
-            # Immediately check same-day exit for newly filled limit orders
+            commission = commission_ps * qty; cash += (-qty*entry_px) if pend.direction=="long" else (qty*entry_px); cash -= commission
+            open_positions[pend.symbol] = Position(pend.symbol, pend.direction, day, entry_px, qty, stop, target, psr, pend.score, False)
+            week_new_count[wk] += 1; pending_limits.remove(pend)
             pos = open_positions[pend.symbol]
-            exit_reason = None
-            fill_px = None
-
-            if pos.side == "long":
-                if l <= pos.stop:
-                    fill_px = _gap_exit_price("long", o, pos.stop)
-                    exit_reason = "stop_same_day"
-                elif h >= pos.target:
-                    fill_px = pos.target if o <= pos.target else o
-                    exit_reason = "target_same_day"
+            exit_reason=None; fill_px=None
+            if pos.side=="long":
+                if l <= pos.stop: fill_px=_gap_exit_price("long", o, pos.stop); exit_reason="stop_same_day"
+                elif h >= pos.target: fill_px=pos.target if o <= pos.target else o; exit_reason="target_same_day"
             else:
-                if h >= pos.stop:
-                    fill_px = _gap_exit_price("short", o, pos.stop)
-                    exit_reason = "stop_same_day"
-                elif l <= pos.target:
-                    fill_px = pos.target if o >= pos.target else o
-                    exit_reason = "target_same_day"
-
+                if h >= pos.stop: fill_px=_gap_exit_price("short", o, pos.stop); exit_reason="stop_same_day"
+                elif l <= pos.target: fill_px=pos.target if o >= pos.target else o; exit_reason="target_same_day"
             if exit_reason:
-                slip_exit = (slip_bps / 10000.0) * fill_px
-                fill_px_eff = fill_px - slip_exit if pos.side == "long" else fill_px + slip_exit
-                commission = commission_ps * pos.qty
-                if pos.side == "long":
-                    cash += pos.qty * fill_px_eff
-                else:
-                    cash -= pos.qty * fill_px_eff
-                cash -= commission
-
-                pnl = (fill_px_eff - pos.entry_price) * pos.qty if pos.side == "long" else (pos.entry_price - fill_px_eff) * pos.qty
-                trades.append({
-                    "symbol": pend.symbol, "side": pos.side,
-                    "entry_date": pos.entry_date, "entry_price": pos.entry_price,
-                    "exit_date": day, "exit_price": fill_px_eff, "qty": pos.qty,
-                    "pnl": pnl,
-                    "r_multiple": pnl / (pos.per_share_risk * pos.qty) if pos.per_share_risk > 0 else np.nan,
-                    "commission": commission_ps * pos.qty * 2.0,
-                    "slippage_cost": slip_exit * pos.qty,
-                    "reason": exit_reason,
-                })
+                slip2=(slip_bps/10000.0)*fill_px; eff=fill_px - slip2 if pos.side=="long" else fill_px + slip2; commission=commission_ps*pos.qty
+                cash += (pos.qty*eff) if pos.side=="long" else (-pos.qty*eff); cash -= commission
+                pnl=(eff-pos.entry_price)*pos.qty if pos.side=="long" else (pos.entry_price-eff)*pos.qty
+                trades.append({"symbol":pend.symbol,"side":pos.side,"entry_date":pos.entry_date,"entry_price":pos.entry_price,
+                               "exit_date":day,"exit_price":eff,"qty":pos.qty,"pnl":pnl,
+                               "r_multiple":pnl/(pos.per_share_risk*pos.qty) if pos.per_share_risk>0 else np.nan,
+                               "commission":commission_ps*pos.qty*2.0,"slippage_cost":slip2*pos.qty,"reason":exit_reason})
                 del open_positions[pend.symbol]
 
-
-        # 3) new signals for this day (respect caps; market enters at next open)
-        day_candidates = sorted(
-            candidates_by_day.get(day, []),
-            key=lambda s: (-s.get("score_eff", s["score"]), s["close"])
-        )
-
-        for sig in day_candidates:
-            if equity <= equity_halt_floor:
-                break
-            if sig["symbol"] in open_positions:
-                continue
-            if len(open_positions) >= max_open or (_current_total_risk() >= max_risk_pct):
-                break
+        # 3) new signals (queued for future fills)
+        candidates_today = sorted(candidates_by_day.get(day, []), key=lambda s: (
+            -s.get("score_eff", s["score"]),
+            -s.get("adx", 0.0),
+            -s.get("atr", 0.0),
+            -s.get("close", 0.0)
+        ))
+        for sig in candidates_today:
+            if equity <= equity_halt_floor: break
+            if sig["symbol"] in open_positions: continue
+            if len(open_positions) >= max_open or (_current_total_risk() >= max_risk_pct): break
             df = data[sig["symbol"]]
-
             if entry_type == "market":
                 idx = df.index.get_indexer([sig["date"]])[0]
-                if idx == -1 or idx + 1 >= len(df.index):
-                    continue
-                nd = df.index[idx + 1]
-                wk_nd = _week_key(nd)
-                if max_new_week > 0 and week_new_count[wk_nd] >= max_new_week:
-                    continue
-
-                pending_markets.append(PendingMarket(
-                    symbol=sig["symbol"],
-                    direction=sig["direction"],
-                    fill_date=nd,
-                    atr=float(sig["atr"]),
-                    score=int(sig.get("score_eff", sig["score"])),
-                ))
-
-
+                if idx == -1 or idx+1 >= len(df.index): continue
+                nd = df.index[idx+1]; wk_nd = _week_key(nd)
+                if max_new_week > 0 and week_new_count[wk_nd] >= max_new_week: continue
+                pending_markets.append(PendingMarket(sig["symbol"], sig["direction"], nd, float(sig["atr"]), int(sig.get("score_eff", sig["score"]))))
             elif entry_type == "limit_retrace":
                 ema = sig["ema20"] if retrace_ref == "EMA20" else sig["close"]
                 limit_px = (ema - atr_frac * sig["atr"]) if sig["direction"] == "long" else (ema + atr_frac * sig["atr"])
-                stop, target = rm_compute_levels(
-                    direction=sig["direction"],
-                    entry=float(limit_px),
-                    atr=sig["atr"],
-                    atr_mult=float(cfg["risk"]["atr_multiple_stop"]),
-                    reward_mult=float(cfg["risk"]["reward_multiple"]),
-                )
-                if stop is None or target is None:
-                    continue
+                stop, target = rm_compute_levels(sig["direction"], float(limit_px), sig["atr"], float(cfg["risk"]["atr_multiple_stop"]), float(cfg["risk"]["reward_multiple"]))
+                if stop is None or target is None: continue
+                stop, target = _enforce_floor(sig["direction"], limit_px, stop, target)
+                if target <= 0: continue
+                pending_limits.append(PendingLimit(sig["symbol"], sig["direction"], sig["date"], sig["date"] + pd.tseries.offsets.BDay(horizon), float(limit_px), float(sig["atr"]), int(sig.get("score_eff", sig["score"])) ))
 
-                pending_limits.append(PendingLimit(
-                    symbol=sig["symbol"],
-                    direction=sig["direction"],
-                    signal_date=sig["date"],
-                    expires=sig["date"] + pd.tseries.offsets.BDay(horizon),
-                    limit_px=float(limit_px),
-                    atr=float(sig["atr"]),        # <-- NEW
-                    score=int(sig.get("score_eff", sig["score"])),
-                ))
-
-        # 4) mark-to-market equity for the day (close)
+        # 4) mark-to-market
         mv = 0.0
         for sym, pos in open_positions.items():
             df = data.get(sym)
-            if df is None or day not in df.index:
-                continue
-            c = float(df.at[day, "Close"])
-            mv += pos.market_value(c)
-        equity_today = cash + mv
-        equity_curve.append((day, equity_today))
-        equity = float(equity_today)
+            if df is None or day not in df.index: continue
+            mv += pos.market_value(float(df.at[day, "Close"]))
+        equity_today = cash + mv; equity_curve.append((day, equity_today)); equity = float(equity_today)
 
-        # 5) Force-close all open positions on last day (so PnL reconciles)
+        # 5) force-close at end
         if force_close_on_end and (day == calendar[-1]) and open_positions:
             for sym, pos in list(open_positions.items()):
                 df = data[sym]
-                if day not in df.index:
-                    continue
-                c = float(df.at[day, "Close"])
-                slip = (slip_bps / 10000.0) * c
-                fill_px_eff = c - slip if pos.side == "long" else c + slip
+                if day not in df.index: continue
+                c = float(df.at[day, "Close"]); slip = (slip_bps/10000.0)*c; eff = c - slip if pos.side=="long" else c + slip
                 commission = commission_ps * pos.qty
-                if pos.side == "long":
-                    cash += pos.qty * fill_px_eff
-                else:
-                    cash -= pos.qty * fill_px_eff
-                cash -= commission
-                pnl = (fill_px_eff - pos.entry_price) * pos.qty if pos.side == "long" else (pos.entry_price - fill_px_eff) * pos.qty
-                trades.append({
-                    "symbol": sym,
-                    "side": pos.side,
-                    "entry_date": pos.entry_date,
-                    "entry_price": pos.entry_price,
-                    "exit_date": day,
-                    "exit_price": fill_px_eff,
-                    "qty": pos.qty,
-                    "pnl": pnl,
-                    "r_multiple": pnl / (pos.per_share_risk * pos.qty) if pos.per_share_risk > 0 else np.nan,
-                    "commission": commission_ps * pos.qty * 2.0,
-                    "slippage_cost": slip * pos.qty,
-                    "reason": "force_end",
-                })
+                cash += (pos.qty*eff) if pos.side=="long" else (-pos.qty*eff); cash -= commission
+                pnl = (eff-pos.entry_price)*pos.qty if pos.side=="long" else (pos.entry_price-eff)*pos.qty
+                trades.append({"symbol":sym,"side":pos.side,"entry_date":pos.entry_date,"entry_price":pos.entry_price,
+                               "exit_date":day,"exit_price":eff,"qty":pos.qty,"pnl":pnl,
+                               "r_multiple":pnl/(pos.per_share_risk*pos.qty) if pos.per_share_risk>0 else np.nan,
+                               "commission":commission_ps*pos.qty*2.0,"slippage_cost":slip*pos.qty,"reason":"force_end"})
                 del open_positions[sym]
-            # mark equity after forced liquidation
-            equity_today = cash
-            equity_curve[-1] = (day, equity_today)
-            equity = float(equity_today)
+            equity_today = cash; equity_curve[-1] = (day, equity_today); equity = float(equity_today)
 
     # ---------- wrap up ----------
     eq_df = pd.DataFrame(equity_curve, columns=["date", "equity"]).set_index("date")

@@ -58,6 +58,28 @@ def compute_levels(
     stop = _round_cent(stop)
     tgt  = _round_cent(tgt)
 
+    # --- Enforce minimum stop distance (percent of entry) if configured in config.yaml ---
+    try:
+        from utils.config import load_config  # local import to avoid cycles
+        cfg = load_config("config.yaml")
+        min_stop_pct = float(cfg.get("risk", {}).get("min_stop_pct", 0.0))
+    except Exception:
+        min_stop_pct = 0.0
+    if min_stop_pct > 0 and entry > 0:
+        floor_dist = entry * min_stop_pct
+        dist = abs(entry - stop)
+        if dist < floor_dist:
+            if d in {"long", "buy", "bull"}:
+                stop = _round_cent(entry - floor_dist)
+                r = entry - stop
+                tgt = _round_cent(entry + reward_mult * r)
+            else:
+                stop = _round_cent(entry + floor_dist)
+                r = stop - entry
+                tgt = _round_cent(entry - reward_mult * r)
+                if tgt <= 0:
+                    return None, None
+
     # Guard against rounding collapsing R to zero
     if abs(entry - stop) < 0.01:
         if d in {"long", "buy", "bull"}:
@@ -119,7 +141,14 @@ def size_position(cfg: dict, entry: float, stop: float) -> int:
     if risk_dollars <= 0:
         return 0
 
-    # Base size from risk
+    # Apply floor to per-share risk if configured (avoid micro-stop oversizing)
+    min_stop_pct = float(risk.get("min_stop_pct", 0.0))
+    if min_stop_pct > 0 and entry > 0:
+        psr_floor = entry * min_stop_pct
+        if per_share_risk < psr_floor:
+            per_share_risk = psr_floor
+
+    # Base size from risk (recomputed after floor)
     qty = floor(risk_dollars / per_share_risk)
 
     # Enforce min_shares
@@ -127,10 +156,11 @@ def size_position(cfg: dict, entry: float, stop: float) -> int:
     if qty < min_shares:
         return 0
 
-    # Optional: cap by % of equity as notional
-    max_notional_pct = float(risk.get("max_notional_pct", 1.0))
-    if 0.0 < max_notional_pct < 1.0:
-        max_qty_by_notional = floor((equity * max_notional_pct) / entry)
+    # Optional: cap by % of equity as notional (backward compat) OR new key max_position_notional_pct
+    max_notional_pct_legacy = float(risk.get("max_notional_pct", 1.0))
+    max_pos_notional_pct = float(risk.get("max_position_notional_pct", max_notional_pct_legacy))
+    if 0.0 < max_pos_notional_pct < 1.0:
+        max_qty_by_notional = floor((equity * max_pos_notional_pct) / entry)
         qty = min(qty, max_qty_by_notional)
 
     # Optional: absolute share cap

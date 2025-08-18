@@ -3,12 +3,14 @@ dry_run: false   # set true to preview/log only (no orders)
 risk:
   account_equity: 50000        # used only if use_broker_equity: false
   use_broker_equity: true      # pull live equity from Alpaca paper acct
-  risk_per_trade_pct: 0.02     # 2% risk per trade
+  risk_per_trade_pct: 0.01     # lowered to 1% risk per trade (stricter)
   atr_multiple_stop: 1.5       # stop = 1.5 * ATR(14)
   reward_multiple: 2.0         # target = entry + 2R
   max_total_risk_pct: 0.10     # cap total risk across open stops
   bp_utilization: 0.95         # spend at most 95% of available buying power
   min_shares: 1
+  min_stop_pct: 0.010          # NEW: minimum stop distance (1% of entry) to avoid micro stops
+  max_position_notional_pct: 0.25   # cap single position notional to 25% of equity
 
 signals:
   sr_pivots:
@@ -19,6 +21,7 @@ signals:
     near_atr_mult: 0.50
     ema50_fallback_pct: 0.025    # fallback tolerance (percent of price); set null to disable check
     allow_fallback_as_core: false # if true, EMA50 proximity alone can satisfy S/R energy
+    tolerance_mode: "min"        # choose narrower of ATR*mult vs pct (stricter); "max" uses wider
     # yesterday_touch_ok: true    # enabled by default in code
 
 # --- cycle (stochastic) hysteresis ---
@@ -29,12 +32,13 @@ cycle:
 # --- momentum quality controls ---
 momentum:
   rsi_filter: true
-  rsi_threshold: 50
+  rsi_threshold: 55              # raised for higher momentum quality
   use_macd_expansion: false      # if you re-enable, keep expansion_min_steps: 1
   expansion_lookback: 3
   expansion_min_steps: 1
   zero_line_mode: "confirm"
   zero_cross_lookback: 3
+  macd_abs_min: 0.08             # stricter MACD abs threshold
 
 # --- volume confirmation (any-of) ---
 volume:
@@ -102,8 +106,14 @@ trading:
 
   # Post-energy pattern trigger (must pass if enabled)
   patterns:
-    enabled: false
+    enabled: true
     modes: ["engulf", "inside_break", "nr4_break"]
+
+  # Additional trade-level filters
+  filters:
+    min_atr_pct: 0.012          # require ATR14/Close >= 1.2% for new signals (liquidity/volatility floor)
+    max_extension_pct: 0.06     # reject if price >6% beyond EMA20 (long) or below (short)
+    pullback_tolerance_pct: 0.04 # require price within 4% of EMA20 (avoid chasing extremes)
 
   # ---- Higher timeframe (MTF) confirmation ----
   mtf:
