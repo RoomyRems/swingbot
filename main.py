@@ -85,7 +85,7 @@ for i, sym in enumerate(tqdm(tickers, desc="TA + signals"), start=1):
             "momentum": energies["momentum"],
             "cycle": energies["cycle"],
             "sr": energies["sr"],
-            "fractal": energies.get("fractal"),
+            "scale": energies.get("scale"),
             "volume_confirm": energies.get("volume"),
         })
 
@@ -102,7 +102,7 @@ for i, sym in enumerate(tqdm(tickers, desc="TA + signals"), start=1):
 # ---- diagnostics: show top candidates by score -----------------------
 if all_evals:
     ev = pd.DataFrame(all_evals).sort_values("score", ascending=False)
-    cols = ["symbol", "score", "direction", "trend", "momentum", "cycle", "sr", "fractal", "volume_confirm"]
+    cols = ["symbol", "score", "direction", "trend", "momentum", "cycle", "sr", "scale", "volume_confirm"]
     print("\nTop candidates by score:")
     print(ev[cols].head(10).to_string(index=False))
 

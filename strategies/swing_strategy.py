@@ -57,6 +57,9 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     # Trend
     ema20 = talib.EMA(close, timeperiod=20)
     ema50 = talib.EMA(close, timeperiod=50)
+    sma50 = talib.SMA(close, timeperiod=50)
+    # simple slope proxy: delta vs prior
+    sma50_delta = pd.Series(sma50, index=df.index).diff()
 
     # Momentum
     macd, macds, macdh = talib.MACD(close, fastperiod=12, slowperiod=26, signalperiod=9)
@@ -93,6 +96,8 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     out["EMA20"]    = pd.Series(ema20, index=df.index)
     out["EMA50"]    = pd.Series(ema50, index=df.index)
+    out["SMA50"]    = pd.Series(sma50, index=df.index)
+    out["SMA50_SLOPE"] = sma50_delta
     out["MACD"]     = pd.Series(macd,  index=df.index)
     out["MACDs"]    = pd.Series(macds, index=df.index)
     out["MACDh"]    = pd.Series(macdh, index=df.index)
@@ -105,6 +110,8 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     out["AvgVol50"] = pd.Series(avgvol50, index=df.index)
     out["RVOL20"]   = rvol20
     out["ADLine"]   = ad_line
+    # ATR percent of price for adaptive logic (avoid division by zero)
+    out["ATR_PCT"]  = out["ATR14"] / out["Close"].where(out["Close"] != 0, np.nan)
     return out
 
 
@@ -186,6 +193,45 @@ def _nearest_pivot_levels(df: pd.DataFrame, lookback: int, left: int, right: int
     return support, resistance
 
 
+def _last_swing_levels(df: pd.DataFrame, lookback: int, left: int, right: int) -> tuple[float | None, float | None]:
+    """Return (swing_low, swing_high) for the most recent completed swing using pivots within lookback."""
+    tail = df.tail(lookback)
+    highs_idx, lows_idx = _find_pivots(tail["High"], tail["Low"], left, right)
+    if not highs_idx and not lows_idx:
+        return None, None
+    base = len(df) - len(tail)
+    highs_abs = [base + i for i in highs_idx]
+    lows_abs  = [base + i for i in lows_idx]
+    last_hi = max(highs_abs) if highs_abs else -1
+    last_lo = max(lows_abs) if lows_abs else -1
+    if last_hi < 0 and last_lo < 0:
+        return None, None
+    if last_hi > last_lo and last_lo >= 0:
+        # up-leg low -> high
+        lo = float(df["Low"].iloc[last_lo])
+        hi = float(df["High"].iloc[last_hi])
+        return (lo, hi)
+    if last_lo > last_hi and last_hi >= 0:
+        # down-leg high -> low
+        hi = float(df["High"].iloc[last_hi])
+        lo = float(df["Low"].iloc[last_lo])
+        return (lo, hi)
+    return None, None
+
+
+def _fib_confluence_ok(df: pd.DataFrame, direction: str, lookback: int, left: int, right: int, price: float, tol_abs: float, tol_pct: float) -> bool:
+    """Check if current price is near a key Fibonacci retrace of the last swing leg."""
+    lo, hi = _last_swing_levels(df, lookback, left, right)
+    if lo is None or hi is None or lo <= 0 or hi <= 0 or lo == hi:
+        return False
+    low = min(lo, hi); high = max(lo, hi)
+    # classic retracement set
+    ratios = [0.382, 0.5, 0.618]
+    levels = [high - r * (high - low) for r in ratios] if direction == "long" else [low + r * (high - low) for r in ratios]
+    tol = min(tol_abs, tol_pct)
+    return any(abs(price - lvl) <= tol for lvl in levels if np.isfinite(lvl))
+
+
 # ---------- momentum quality ----------
 def _macd_expansion_ok(df: pd.DataFrame, direction: str, mcfg: dict) -> bool:
     if direction not in {"long", "short"}:
@@ -229,303 +275,236 @@ def _macd_zero_line_ok(df: pd.DataFrame, direction: str, mcfg: dict) -> bool:
 
 
 # ---------- volume context (ANY-OF) ----------
-def _volume_energy_ok(df: pd.DataFrame, direction: str, vcfg: dict) -> tuple[bool, dict]:
-    """
-    Pass if AT LEAST `min_components` of {RVOL, AD slope, OBV tick/slope} agree with direction.
-    Config:
-      rvol_threshold (float)
-      ad_trend_lookback (int)
-      obv_mode: "tick" (last>prev) or "slope" (lookback)
-      min_components: int (default 1)
-    """
-    if direction not in {"long", "short"}:
-        return False, {"reason": "no-direction"}
-
-    rvol_thr = _get_float(vcfg, "rvol_threshold", 1.20)
-    ad_look  = _get_int(vcfg, "ad_trend_lookback", 3)
-    obv_mode = str(vcfg.get("obv_mode", "tick")).lower()   # "tick" or "slope"
-    # default stricter now (>=2 components) unless user overrides
-    min_components = _get_int(vcfg, "min_components", 2)
-
-    row = df.iloc[-1]
-    rvol = float(row.get("RVOL20", np.nan))
-    rvol_ok = bool(np.isfinite(rvol) and (rvol >= rvol_thr))
-
-    # A/D slope over exactly `ad_look` bars (compare -1 vs -ad_look)
-    if ad_look < 1:
-        ad_ok = False
-        ad_now = ad_prev = np.nan
-        ad_available = False
-    elif len(df) <= ad_look:
-        ad_ok = False
-        ad_now = ad_prev = np.nan
-        ad_available = False
-    else:
-        ad_now  = float(df["ADLine"].iloc[-1])
-        ad_prev = float(df["ADLine"].iloc[-ad_look])
-        ad_ok   = (ad_now > ad_prev) if direction == "long" else (ad_now < ad_prev)
-        ad_available = True
-
-    # OBV confirmation: tick or slope mode
-    if obv_mode == "slope" and ad_look >= 1 and len(df) > ad_look:
-        obv_now  = float(df["OBV"].iloc[-1])
-        obv_prev = float(df["OBV"].iloc[-ad_look])
-        obv_ok   = (obv_now > obv_prev) if direction == "long" else (obv_now < obv_prev)
-        obv_available = True
-    else:
-        if len(df) >= 2:
-            obv_now  = float(df["OBV"].iloc[-1])
-            obv_prev = float(df["OBV"].iloc[-2])
-            obv_ok   = (obv_now > obv_prev) if direction == "long" else (obv_now < obv_prev)
-            obv_available = True
-        else:
-            obv_now = obv_prev = np.nan
-            obv_ok = False
-            obv_available = False
-
-    # Only count components that are available
-    components = []
-    if np.isfinite(rvol):
-        components.append(rvol_ok)
-    if ad_available:
-        components.append(ad_ok)
-    if obv_available:
-        components.append(obv_ok)
-    passed = int(sum(1 for c in components if c))
-    avail = max(1, len(components))
-    ok = passed >= max(1, min_components)
-
-    details = {
-        "rvol": f"{rvol:.2f}" if np.isfinite(rvol) else "nan",
-        "rvol_ok": rvol_ok, "rvol_thr": rvol_thr,
-        "ad_look": ad_look, "ad_ok": ad_ok,
-    "obv_mode": obv_mode, "obv_ok": obv_ok,
-    "passed": passed, "available_components": avail, "min_components": min_components,
-    }
-    return ok, details
+# (Removed) _volume_energy_ok
 
 # ---------- 2) five energies on the last bar ----------
-def evaluate_five_energies(df: pd.DataFrame, cfg: dict | None = None) -> dict:
+"""Note: removed extended evaluator and fractal/volume helpers to standardize on pure Burns."""
+
+
+
+# -------- Pure Dr. Barry Burns 5 Energies evaluation (simplified canonical form) --------
+def evaluate_five_energies(df: pd.DataFrame, cfg: dict | None = None, weekly_ctx: dict | None = None) -> dict:
+    """Pure Burns style energies:
+    1. Trend: EMA20 above EMA50 & price within value zone (pullback) or valid breakout (close above recent pivot cluster with momentum).
+    2. Momentum: MACD histogram expanding in direction OR MACD > signal (bull) / < signal (bear) with positive slope.
+    3. Cycle: Stochastic SlowK turns up (crosses above SlowD) out of oversold (< oversold_thr) within lookback OR turns down out of overbought (> overbought_thr).
+    4. Support/Resistance (Value Zone / Pivot Confluence): Pullback touches EMA20-EMA50 band with rejection tail OR breakout above (below) resistance (support) pivot cluster.
+    5. Scale (MTF momentum): weekly MACD alignment in the direction.
+    Volume confirmation is advisory (not counted in 5 but can veto marginal case if configured).
+    """
     if len(df) < 60:
         raise ValueError("Need ~60 bars for stable signals")
+    cfg = cfg or {}
+    filt = (cfg.get("trading", {}).get("filters", {}) or {})
+    oversold = float(filt.get("cycle_oversold", 25))
+    overbought = float(filt.get("cycle_overbought", 75))
+    cycle_cross_lb = int(filt.get("cycle_cross_lookback", 3))
+    hist_expand_lb = int(filt.get("momentum_hist_expand_lookback", 2))
+    macd_min = float(filt.get("momentum_macd_min", 0.0))
+    # removed legacy fractal-specific thresholds; Scale (weekly) is the 5th energy
+    value_ext_max = float(filt.get("value_zone_max_ext_pct", 0.025))
+    # Relaxed tail minima (allow more passes); original 0.55
+    tail_min_long = float(filt.get("value_zone_reject_tail_min", 0.40))
+    tail_min_short = float(filt.get("value_zone_reject_tail_min_short", 0.40))
+    touch_atr_max = float(filt.get("value_zone_touch_atr_max", 0.60))
 
-    row  = df.iloc[-1]
-    prev = df.iloc[-2]
+    row = df.iloc[-1]; prev = df.iloc[-2]
+    ema20 = float(row["EMA20"]); ema50 = float(row["EMA50"])
+    sma50 = float(row.get("SMA50", np.nan)); sma50_slope = float(row.get("SMA50_SLOPE", np.nan))
+    close = float(row["Close"]); high = float(row["High"]); low = float(row["Low"])
+    atr = float(row.get("ATR14", np.nan))
+    macd = float(row.get("MACD", np.nan)); macds = float(row.get("MACDs", np.nan)); macdh = float(row.get("MACDh", np.nan))
+    k = float(row.get("SlowK", np.nan)); d = float(row.get("SlowD", np.nan))
+    adx = float(row.get("ADX14", np.nan)) if "ADX14" in row.index else np.nan
 
-    # 1) TREND
-    bullish_trend = (row["EMA20"] > row["EMA50"]) and (row["Close"] > row["EMA50"])
-    bearish_trend = (row["EMA20"] < row["EMA50"]) and (row["Close"] < row["EMA50"])
-    direction = "long" if bullish_trend else "short" if bearish_trend else "none"
-    trend_ok = bullish_trend or bearish_trend
+    # 1 Trend baseline direction
+    bullish = (ema20 > ema50) and (close >= ema50) and (np.isfinite(sma50_slope) and sma50_slope > 0)
+    bearish = (ema20 < ema50) and (close <= ema50) and (np.isfinite(sma50_slope) and sma50_slope < 0)
+    direction = "long" if bullish else "short" if bearish else "none"
 
-    # 2) MOMENTUM with quality gates (expansion optional)
-    mcfg = _cfg_path(cfg, "momentum", default={})
-    rsi_filter     = _get_bool(mcfg, "rsi_filter", True)
-    rsi_threshold  = _get_float(mcfg, "rsi_threshold", 50.0)
-    use_expansion  = _get_bool(mcfg, "use_macd_expansion", False)
-    macd_abs_min   = _get_float(mcfg, "macd_abs_min", 0.0)  # require |MACD - signal| >= threshold or |MACD| >= threshold if signal NA
+    # Value zone proximity (pullback) ext pct
+    ext_pct = (close - ema20)/ema20 if ema20>0 else np.nan
+    in_value_zone = np.isfinite(ext_pct) and abs(ext_pct) <= value_ext_max
 
-    base_bull = (row["MACD"] > row["MACDs"])
-    base_bear = (row["MACD"] < row["MACDs"])
-    if rsi_filter:
-        base_bull = base_bull and (row["RSI14"] >= rsi_threshold)
-        base_bear = base_bear and (row["RSI14"] <= (100 - rsi_threshold))
-
-    zl_ok   = _macd_zero_line_ok(df, direction, mcfg) if direction in {"long","short"} else False
-    exp_ok  = _macd_expansion_ok(df, direction, mcfg) if (use_expansion and direction in {"long","short"}) else True
-
+    # 2 Momentum (MACD)
+    momentum_ok = False
     if direction == "long":
-        momentum_ok = bool(base_bull and zl_ok and exp_ok)
+        if np.isfinite(macd) and np.isfinite(macds):
+            slope_ok = len(df) >= 3 and (macd - float(df.iloc[-2]["MACD"])) > 0
+            hist_expand = True
+            if hist_expand_lb > 0 and len(df) >= hist_expand_lb + 1:
+                recent_h = df["MACDh"].iloc[-(hist_expand_lb+1):].to_numpy()
+                diffs = np.diff(recent_h)
+                hist_expand = np.all(diffs > 0)
+            # Burns emphasis: zero-line confirm on pullback
+            zl_ok = macd > 0
+            momentum_ok = (macd > macds) and slope_ok and hist_expand and zl_ok and (abs(macd) >= macd_min)
     elif direction == "short":
-        momentum_ok = bool(base_bear and zl_ok and exp_ok)
-    else:
-        momentum_ok = False
+        if np.isfinite(macd) and np.isfinite(macds):
+            slope_ok = len(df) >= 3 and (macd - float(df.iloc[-2]["MACD"])) < 0
+            hist_expand = True
+            if hist_expand_lb > 0 and len(df) >= hist_expand_lb + 1:
+                recent_h = df["MACDh"].iloc[-(hist_expand_lb+1):].to_numpy()
+                diffs = np.diff(recent_h)
+                hist_expand = np.all(diffs < 0)
+            zl_ok = macd < 0
+            momentum_ok = (macd < macds) and slope_ok and hist_expand and zl_ok and (abs(macd) >= macd_min)
 
-    if momentum_ok and macd_abs_min > 0:
-        macd_val = float(row["MACD"])
-        macds_val = float(row["MACDs"]) if np.isfinite(row["MACDs"]) else macd_val
-        dist = abs(macd_val - macds_val)
-        if dist < macd_abs_min and abs(macd_val) < macd_abs_min:
-            momentum_ok = False
+    # 3 Cycle (Stoch cross out of extreme) within lookback
+    cycle_ok = False
+    if direction in {"long","short"} and cycle_cross_lb > 0 and len(df) >= cycle_cross_lb + 2:
+        # backward scan up to lookback for qualifying cross
+        k_series = df["SlowK"].tail(cycle_cross_lb+1).to_numpy()
+        d_series = df["SlowD"].tail(cycle_cross_lb+1).to_numpy()
+        if direction == "long":
+            for i in range(1, len(k_series)):
+                if (k_series[i-1] < d_series[i-1]) and (k_series[i] > d_series[i]) and (k_series[i-1] <= oversold):
+                    cycle_ok = True; break
+        else:
+            for i in range(1, len(k_series)):
+                if (k_series[i-1] > d_series[i-1]) and (k_series[i] < d_series[i]) and (k_series[i-1] >= overbought):
+                    cycle_ok = True; break
 
-    # 3) CYCLE with optional hysteresis / debounce
-    cycfg = _cfg_path(cfg, "cycle", default={})
-    rise_bars = _get_int(cycfg, "rise_bars", 0)  # number of prior bars %K must be strictly rising (0 = disabled)
-    require_d_slope = _get_bool(cycfg, "require_d_slope", False)
-    # base triggers
-    bull_cycle_raw = (prev["SlowK"] < 20) and (row["SlowK"] > row["SlowD"])
-    bear_cycle_raw = (prev["SlowK"] > 80) and (row["SlowK"] < row["SlowD"])
-    def _k_rising(n: int) -> bool:
-        if n <= 1:
-            return True
-        if len(df) < n:
-            return False
-        k_vals = df["SlowK"].iloc[-n:].to_numpy()
-        return np.all(np.diff(k_vals) > 0)
-    def _k_falling(n: int) -> bool:
-        if n <= 1:
-            return True
-        if len(df) < n:
-            return False
-        k_vals = df["SlowK"].iloc[-n:].to_numpy()
-        return np.all(np.diff(k_vals) < 0)
-    bull_cycle = bull_cycle_raw and _k_rising(rise_bars) and (not require_d_slope or row["SlowD"] > prev["SlowD"])
-    bear_cycle = bear_cycle_raw and _k_falling(rise_bars) and (not require_d_slope or row["SlowD"] < prev["SlowD"])
-    cycle_ok = bull_cycle if direction == "long" else bear_cycle if direction == "short" else False
-
-    # 4) SUPPORT/RESISTANCE — pivot structure; EMA fallback optional separate flag (not alone unless enabled)
-    scfg = _cfg_path(cfg, "signals", "sr_pivots", default={})
-    lookback = _get_int(scfg, "lookback", 60)
-    left     = _get_int(scfg, "left", 3)
-    right    = _get_int(scfg, "right", 3)
-    near_pct = _get_float(scfg, "near_pct", 0.02)
-    near_atr = _get_float(scfg, "near_atr_mult", 0.75)
-    yday_ok  = _get_bool(scfg, "yesterday_touch_ok", True)
-
-    ema_fall_raw = scfg.get("ema50_fallback_pct", 0.025)
-    allow_fallback_as_sr = _get_bool(scfg, "allow_fallback_as_core", False)  # new: fallback alone can't satisfy S/R unless True
-    ema_fall = None
-    try:
-        if ema_fall_raw is not None:
-            ema_fall = float(ema_fall_raw)
-    except Exception:
-        ema_fall = None
-
-    price = float(row["Close"])
-    support, resistance = _nearest_pivot_levels(df, lookback, left, right, price=price)
-
-    tol_abs = float(row["ATR14"]) * near_atr if np.isfinite(row["ATR14"]) else np.inf
-    tol_pct = price * near_pct
-    # tolerance mode configurable: "max" (original) or "min"
-    tol_mode = str(scfg.get("tolerance_mode", "max")).lower()
-    tol = max(tol_abs, tol_pct) if tol_mode == "max" else min(tol_abs, tol_pct)
-
-    sr_used = None
+    # 4 Support/Resistance & Value Zone (Burns: pullback = value zone + tail/depth, breakout = close above resistance + momentum)
     sr_ok = False
+    reject_ok = False
+    setup_type = ""
+    # Pullback: in value zone, require tail or depth
+    if direction == "long" and in_value_zone and np.isfinite(atr) and atr>0:
+        body_low = min(row.Open, row.Close)
+        tail_len = body_low - low
+        full_range = high - low
+        tail_ratio = (tail_len/full_range) if full_range>0 else 0.0
+        depth_atr = (ema20 - low)/atr if atr>0 else np.nan
+        reject_ok = (tail_ratio >= tail_min_long and np.isfinite(depth_atr) and depth_atr <= touch_atr_max)
+        sr_ok = bool(reject_ok or (abs(ext_pct) <= value_ext_max and (np.isfinite(depth_atr) and depth_atr <= touch_atr_max)))
+        setup_type = "pullback"
+    elif direction == "short" and in_value_zone and np.isfinite(atr) and atr>0:
+        body_high = max(row.Open, row.Close)
+        tail_len = high - body_high
+        full_range = high - low
+        tail_ratio = (tail_len/full_range) if full_range>0 else 0.0
+        depth_atr = (high - ema20)/atr if atr>0 else np.nan
+        reject_ok = (tail_ratio >= tail_min_short and np.isfinite(depth_atr) and depth_atr <= touch_atr_max)
+        sr_ok = bool(reject_ok or (abs(ext_pct) <= value_ext_max and (np.isfinite(depth_atr) and depth_atr <= touch_atr_max)))
+        setup_type = "pullback"
+    # Breakout: close above resistance (not implemented: pivot cluster), require momentum
+    elif direction == "long" and not in_value_zone and momentum_ok:
+        sr_ok = True
+        setup_type = "breakout"
+    elif direction == "short" and not in_value_zone and momentum_ok:
+        sr_ok = True
+        setup_type = "breakout"
 
-    if direction == "long" and (support is not None):
-        sr_ok = (support <= price) and (abs(price - support) <= tol)
-        sr_used = "pivot-support" if sr_ok else None
-        # yesterday touch
-        if (not sr_ok) and yday_ok and len(df) >= 2:
-            prev_price = float(prev["Close"])
-            prev_atr = float(prev.get("ATR14", np.nan))
-            tol_prev = max((prev_atr * near_atr) if np.isfinite(prev_atr) else 0.0, prev_price * near_pct)
-            if (support <= prev_price) and (abs(prev_price - support) <= tol_prev):
+    # Optional: Fibonacci confluence near current price
+    scfg = _cfg_path(cfg, "signals", "sr_pivots", default={})
+    fib_cfg = (scfg.get("fib", {}) or {})
+    fib_enabled = bool(fib_cfg.get("enabled", False))
+    fib_used = False
+    if fib_enabled and direction in {"long","short"} and np.isfinite(atr) and atr>0:
+        lookback = int(scfg.get("lookback", 60))
+        left     = int(scfg.get("left", 3))
+        right    = int(scfg.get("right", 3))
+        tol_abs  = float(scfg.get("near_atr_mult", 0.75)) * atr
+        tol_pct  = float(scfg.get("near_pct", 0.02)) * close
+        if _fib_confluence_ok(df, direction, lookback, left, right, close, tol_abs, tol_pct):
+            fib_used = True
+            # if SR not already ok, allow fib alone to satisfy SR when enabled
+            if not sr_ok:
                 sr_ok = True
-                sr_used = "pivot-support-yday"
-    elif direction == "short" and (resistance is not None):
-        sr_ok = (resistance >= price) and (abs(resistance - price) <= tol)
-        sr_used = "pivot-resistance" if sr_ok else None
-        if (not sr_ok) and yday_ok and len(df) >= 2:
-            prev_price = float(prev["Close"])
-            prev_atr = float(prev.get("ATR14", np.nan))
-            tol_prev = max((prev_atr * near_atr) if np.isfinite(prev_atr) else 0.0, prev_price * near_pct)
-            if (resistance >= prev_price) and (abs(resistance - prev_price) <= tol_prev):
-                sr_ok = True
-                sr_used = "pivot-resistance-yday"
 
-    sr_fallback_used = False
-    if (not sr_ok) and (ema_fall is not None):
-        sr_fallback_hit = (abs(price - float(row["EMA50"])) / price) <= ema_fall
-        if sr_fallback_hit:
-            sr_fallback_used = True
-            if allow_fallback_as_sr:
-                sr_ok = True
-                sr_used = "ema50-fallback"
-
-    # 5) FRACTAL / VOLATILITY ENERGY (new core component) using ADX + (optional) choppiness
-    fcfg = _cfg_path(cfg, "fractal", default={})
-    f_enabled = _get_bool(fcfg, "enabled", True)
-    f_use_chop = _get_bool(fcfg, "use_chop", True)
-    f_adx_min = _get_float(fcfg, "adx_min", 18.0)
-    f_chop_max = _get_float(fcfg, "chop_max", 58.0)
-    # reuse existing values if present
-    adx_val = float(row.get("ADX14", np.nan))
-    # compute choppiness via regime helper if not already explained
-    # we'll lazily compute with last 14 window by calling _chop_index_latest
-    if f_use_chop:
-        high_np = df["High"].to_numpy(dtype="float64")
-        low_np = df["Low"].to_numpy(dtype="float64")
-        close_np = df["Close"].to_numpy(dtype="float64")
-        chop_val = _chop_index_latest(high_np, low_np, close_np, int(fcfg.get("chop_window", 14)))
-    else:
-        chop_val = np.nan
-    adx_ok_f = (not np.isfinite(adx_val)) or (adx_val >= f_adx_min)
-    chop_ok_f = (not f_use_chop) or (not np.isfinite(chop_val)) or (chop_val <= f_chop_max)
-    fractal_ok = (not f_enabled) or (adx_ok_f and chop_ok_f)
-
-    # VOLUME now treated as confirmation (not core energy)
-    vcfg = _cfg_path(cfg, "volume", default={})
-    volume_ok, vol_details = _volume_energy_ok(df, direction, vcfg)
-    vol_details["counts_in_score"] = False
-
-    # Energy weighting (core five only) - default weight=1 each unless provided
-    weights_cfg = (cfg.get("trading", {}) or {}).get("energy_weights", {}) or {}
-    def w(name: str) -> float:
+    # 5 SCALE / MTF MOMENTUM (weekly MACD alignment per Burns "use momentum on higher timeframe")
+    scale_ok = True
+    mtf_cfg = (cfg.get("trading", {}).get("mtf") or {})
+    if bool(mtf_cfg.get("enabled", True)):
         try:
-            return float(weights_cfg.get(name, 1.0))
+            if weekly_ctx is not None:
+                wmacd = float(weekly_ctx.get("wmacd", np.nan)); wmacds = float(weekly_ctx.get("wmacds", np.nan)); wmacdh = float(weekly_ctx.get("wmacdh", np.nan))
+            else:
+                wk = _resample_weekly_ohlcv(df)
+                wk_ind = add_indicators(wk)
+                wrow = wk_ind.iloc[-1]
+                wmacd = float(wrow.get("MACD", np.nan)); wmacds = float(wrow.get("MACDs", np.nan)); wmacdh = float(wrow.get("MACDh", np.nan))
+            if direction == "long":
+                scale_ok = np.isfinite(wmacd) and np.isfinite(wmacds) and (wmacd > 0) and (wmacd > wmacds) and (wmacdh > 0)
+            elif direction == "short":
+                scale_ok = np.isfinite(wmacd) and np.isfinite(wmacds) and (wmacd < 0) and (wmacd < wmacds) and (wmacdh < 0)
+            else:
+                scale_ok = False
         except Exception:
-            return 1.0
+            scale_ok = True  # if weekly unavailable, don't block
+
+    # Volume confirmation (optional, advisory) – RVOL > 1 or OBV uptick for long
+    volume_ok = True
+    if "RVOL20" in df.columns and direction=="long":
+        rv = float(row.get("RVOL20", np.nan))
+        if np.isfinite(rv) and rv < 1.0:
+            volume_ok = False
+    if "RVOL20" in df.columns and direction=="short":
+        rv = float(row.get("RVOL20", np.nan))
+        if np.isfinite(rv) and rv < 1.0:
+            volume_ok = False
+
+    trend_ok = direction in {"long","short"}
+    # Early-in-trend gating: allow only first two pullbacks after SMA50 slope turned in favor
+    waves_ok = True
+    try:
+        # detect last slope sign change
+        s = df["SMA50_SLOPE"].dropna()
+        if len(s) >= 3:
+            recent = s.tail(30)
+            sign = np.sign(recent)
+            # find most recent index where sign crossed zero
+            idxs = np.where(np.diff(np.signbit(recent)))[0]
+            if len(idxs) > 0:
+                anchor_idx = recent.index[idxs[-1]]
+                # count stochastic dips since anchor
+                seg = df.loc[anchor_idx:]
+                dips = 0
+                if direction == "long":
+                    kd = seg[["SlowK","SlowD"]].dropna()
+                    for i in range(1, len(kd)):
+                        if (kd["SlowK"].iloc[i-1] < kd["SlowD"].iloc[i-1]) and (kd["SlowK"].iloc[i-1] <= 55) and (kd["SlowK"].iloc[i] > kd["SlowD"].iloc[i]):
+                            dips += 1
+                    waves_ok = dips <= 2
+                elif direction == "short":
+                    kd = seg[["SlowK","SlowD"]].dropna()
+                    for i in range(1, len(kd)):
+                        if (kd["SlowK"].iloc[i-1] > kd["SlowD"].iloc[i-1]) and (kd["SlowK"].iloc[i-1] >= 45) and (kd["SlowK"].iloc[i] < kd["SlowD"].iloc[i]):
+                            dips += 1
+                    waves_ok = dips <= 2
+    except Exception:
+        waves_ok = True
+
     core_pass = {
-        "trend": trend_ok,
+        "trend": trend_ok and waves_ok,
         "momentum": momentum_ok,
         "cycle": cycle_ok,
         "sr": sr_ok,
-        "fractal": fractal_ok,
+        "scale": scale_ok,
     }
-    score_count = int(sum(core_pass.values()))
-    score_weighted = float(sum(w(k) for k, v in core_pass.items() if v))
-    # maintain backward-compatible 'score' as count
-    score = score_count
-
+    score = sum(core_pass.values())
     return {
         "direction": direction,
         "trend": trend_ok,
         "momentum": momentum_ok,
         "cycle": cycle_ok,
         "sr": sr_ok,
-        "fractal": fractal_ok,
-        "volume": volume_ok,  # confirmation only
-        "score": score,  # count of core passes
-        "score_weighted": score_weighted,
-        "core_pass_count": score_count,
+    "scale": scale_ok,
+        "volume": volume_ok,
+        "score": score,
+        "core_pass_count": score,
+        "ext_pct": ext_pct,
+        "setup_type": setup_type,
         "explain": {
-            "trend": {"bull": bool(bullish_trend), "bear": bool(bearish_trend)},
-            "momentum": {
-                "base_bull": bool(base_bull), "base_bear": bool(base_bear),
-                "rsi_filter": rsi_filter, "rsi_threshold": rsi_threshold,
-                "zero_line_mode": mcfg.get("zero_line_mode", "confirm"),
-                "zl_ok": bool(zl_ok),
-                "use_expansion": use_expansion,
-                "exp_lookback": _get_int(mcfg, "expansion_lookback", 3),
-                "exp_min_steps": _get_int(mcfg, "expansion_min_steps", 1),
-                "exp_ok": bool(exp_ok),
-                "macd_abs_min": macd_abs_min,
-            },
-            "cycle": {"bull": bool(bull_cycle), "bear": bool(bear_cycle), "rise_bars": rise_bars, "require_d_slope": require_d_slope},
-            "sr": {
-                "support": support, "resistance": resistance,
-                "tol": tol, "near_pct": near_pct, "near_atr_mult": near_atr,
-                "ema50_fallback_pct": ema_fall, "used": sr_used,
-                "fallback_used": sr_fallback_used,
-                "allow_fallback_as_core": allow_fallback_as_sr,
-                "yesterday_touch_ok": yday_ok
-            },
-            "fractal": {
-                "adx": adx_val if np.isfinite(adx_val) else None,
-                "adx_min": f_adx_min,
-                "chop": chop_val if np.isfinite(chop_val) else None,
-                "chop_max": f_chop_max,
-                "use_chop": f_use_chop,
-                "enabled": f_enabled,
-                "ok": fractal_ok,
-            },
-            "volume": vol_details,
-            "weights": {k: w(k) for k in core_pass.keys()},
+            "trend": {"ema20": ema20, "ema50": ema50, "bull": bullish, "bear": bearish},
+            "momentum": {"macd": macd, "macds": macds, "macdh": macdh, "expand_lb": hist_expand_lb},
+            "cycle": {"oversold": oversold, "overbought": overbought, "found": cycle_ok},
+        "sr": {"value_zone": in_value_zone, "reject": reject_ok, "ext_pct": ext_pct, "fib_used": fib_used},
+            "scale": {"ok": scale_ok, "mode": "weekly_macd"},
+            "volume": {"ok": volume_ok},
         }
     }
-
 
 # ---------- 2.5) Higher-timeframe (weekly) confirmation helpers ----------
 def _ensure_dt_index(df: pd.DataFrame) -> pd.DataFrame:
@@ -585,6 +564,27 @@ def _mtf_alignment_ok(daily_direction: str, weekly_trend: str, mtf_cfg: dict) ->
         return True, f"mtf-mismatch-allowed({weekly_trend})"
 
 
+# ---------- small perf helper for engine ----------
+def weekly_context(df_slice: pd.DataFrame) -> dict:
+    """Return a tiny dict with current weekly MACD values from the provided daily slice.
+    Engine can cache per-symbol per-day to avoid repeated resamples.
+    Keys: wmacd, wmacds, wmacdh. Empty when not available.
+    """
+    try:
+        wk = _resample_weekly_ohlcv(df_slice)
+        wk_ind = add_indicators(wk)
+        if wk_ind.empty:
+            return {}
+        r = wk_ind.iloc[-1]
+        return {
+            "wmacd": float(r.get("MACD", np.nan)),
+            "wmacds": float(r.get("MACDs", np.nan)),
+            "wmacdh": float(r.get("MACDh", np.nan)),
+        }
+    except Exception:
+        return {}
+
+
 # ---------- market regime filters (with details for logging) ----------
 def _chop_index_latest(high: np.ndarray, low: np.ndarray, close: np.ndarray, window: int) -> float:
     if window <= 1 or len(close) < window:
@@ -614,15 +614,8 @@ def _regime_check(df: pd.DataFrame, cfg: dict) -> tuple[bool, dict]:
     det = {"adx_min": adx_min, "atr_pct_min": atr_pct_min, "use_chop": use_chop,
            "chop_window": chop_window, "chop_max": chop_max}
 
-    # Optionally skip ADX in regime if fractal energy already handles it
-    skip_adx_if_fractal = bool(rcfg.get("skip_adx_if_fractal", True))
-    fractal_enabled = bool((cfg.get("fractal", {}) or {}).get("enabled", True))
     adx_val = float(last.get("ADX14", np.nan))
-    if skip_adx_if_fractal and fractal_enabled:
-        adx_ok = True
-        det["adx_skipped"] = True
-    else:
-        adx_ok = True if np.isnan(adx_val) else (adx_val >= adx_min)
+    adx_ok = True if np.isnan(adx_val) else (adx_val >= adx_min)
     det["adx"] = f"{adx_val:.2f}" if np.isfinite(adx_val) else "nan"
     det["adx_ok"] = adx_ok
 
@@ -674,9 +667,18 @@ def build_trade_signal(symbol: str, df: pd.DataFrame, cfg: dict) -> TradeSignal 
         _explain_log(symbol, "no-trend", {"ema20>ema50 & price>ema50 (long) OR opposite (short)": False}, cfg)
         return None
 
+    # Volume tie-break when exactly at core minimum (H)
+    core_min_tb = int(cfg.get("trading", {}).get("min_core_energies", cfg.get("trading", {}).get("min_score", 4)))
+    vt_enabled = bool(cfg.get("trading", {}).get("volume_tiebreak_core4", True))
+    if vt_enabled and int(energies.get("score", 0)) == core_min_tb and not energies.get("volume", False):
+        _explain_log(symbol, "vol_tiebreak_fail", {"core": energies.get("score"), "volume": energies.get("volume")}, cfg)
+        return None
+
     # ---- MTF as BONUS energy ----
     mtf_cfg = (cfg.get("trading", {}).get("mtf") or {})
-    mtf_counts = bool(mtf_cfg.get("counts_as_energy", True))        # whether weekly adds +1
+    burns_mode = bool((cfg.get("trading", {}) or {}).get("burns_mode", False))
+    # In pure Burns mode, Scale is already counted as a core energy; do not add MTF as a separate bonus
+    mtf_counts = False if burns_mode else bool(mtf_cfg.get("counts_as_energy", True))
     mtf_reject = bool(mtf_cfg.get("reject_on_mismatch", False))     # hard veto or not
 
     mtf_ok = True
@@ -695,7 +697,7 @@ def build_trade_signal(symbol: str, df: pd.DataFrame, cfg: dict) -> TradeSignal 
     eff_score = int(energies["score"]) + mtf_bonus
     # enforce core_min BEFORE bonus (strict Burns 4 of 5 rule)
     if int(energies["score"]) < core_min:
-        passes = {k: bool(energies.get(k)) for k in ("trend","momentum","cycle","sr","fractal")}
+        passes = {k: bool(energies.get(k)) for k in ("trend","momentum","cycle","sr","scale")}
         passes["core_pass_count"] = int(energies["score"])
         _explain_log(symbol, f"core<{core_min}", passes, cfg)
         return None
@@ -707,7 +709,7 @@ def build_trade_signal(symbol: str, df: pd.DataFrame, cfg: dict) -> TradeSignal 
         return None
 
     if eff_score < min_score:
-        passes = {k: bool(energies.get(k)) for k in ("trend","momentum","cycle","sr","fractal")}
+        passes = {k: bool(energies.get(k)) for k in ("trend","momentum","cycle","sr","scale")}
         passes["mtf_bonus"] = bool(mtf_bonus)
         passes["volume_confirm"] = bool(energies.get("volume"))
         _explain_log(symbol, f"eff_score<{min_score}", passes, cfg)
@@ -772,6 +774,41 @@ def build_trade_signal(symbol: str, df: pd.DataFrame, cfg: dict) -> TradeSignal 
         _explain_log(symbol, "levels-none", {"atr": atr}, cfg)
         return None
 
+    # In Burns mode, prefer a pivot-based stop just beyond recent S/R
+    if burns_mode:
+        try:
+            # reuse S/R nearest levels for pivot stop
+            scfg = _cfg_path(cfg, "signals", "sr_pivots", default={})
+            lookback = _get_int(scfg, "lookback", 60)
+            left     = _get_int(scfg, "left", 3)
+            right    = _get_int(scfg, "right", 3)
+            support, resistance = _nearest_pivot_levels(df, lookback, left, right, price=close)
+            pad_atr_mult = float(cfg.get("risk", {}).get("pad_atr_for_pivot_stop", 0.25))
+            min_stop_pct = float(cfg.get("risk", {}).get("min_stop_pct", 0.0))
+            pad = 0.0
+            if np.isfinite(atr) and atr > 0:
+                pad = max(pad, pad_atr_mult * atr)
+            if close > 0 and min_stop_pct > 0:
+                pad = max(pad, min_stop_pct * close)
+            if energies["direction"] == "long" and support is not None:
+                stop_pivot = max(0.01, support - pad)
+                stop = round(stop_pivot, 2)
+                per_r = close - stop
+                if per_r <= 0:
+                    _explain_log(symbol, "pivot_stop_invalid", {"support": support, "pad": pad}, cfg)
+                    return None
+                target = round(close + float(cfg["risk"]["reward_multiple"]) * per_r, 2)
+            elif energies["direction"] == "short" and resistance is not None:
+                stop_pivot = resistance + pad
+                stop = round(stop_pivot, 2)
+                per_r = stop - close
+                if per_r <= 0:
+                    _explain_log(symbol, "pivot_stop_invalid", {"resistance": resistance, "pad": pad}, cfg)
+                    return None
+                target = round(close - float(cfg["risk"]["reward_multiple"]) * per_r, 2)
+        except Exception as e:
+            _explain_log(symbol, "pivot_stop_error", {"err": str(e)}, cfg)
+
     qty = size_position(cfg=cfg, entry=close, stop=stop)
     if qty <= 0:
         _explain_log(symbol, "qty<=0", {"entry": close, "stop": stop}, cfg)
@@ -792,8 +829,8 @@ def build_trade_signal(symbol: str, df: pd.DataFrame, cfg: dict) -> TradeSignal 
         total_risk = total_risk,
         notes = (
             f"Trend:{energies['trend']} Mom:{energies['momentum']} Cycle:{energies['cycle']} "
-            f"S/R:{energies['sr']} Frac:{energies['fractal']} VolC:{energies['volume']} | "
-            f"core:{energies['score']} w:{energies['score_weighted']:.2f} MTF:{mtf_reason} (+{mtf_bonus})"
+            f"S/R:{energies['sr']} Scale:{energies.get('scale')} VolC:{energies['volume']} | "
+            f"core:{energies['score']} MTF:{mtf_reason} (+{mtf_bonus})"
         ),
     )
 

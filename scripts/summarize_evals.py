@@ -53,8 +53,8 @@ def main(path: str | None = None):
     # Energy component “true rates”
     def rate(col): return df[col].mean() if col in df.columns else float("nan")
     print("Energy components true-rate:")
-    # volume_confirm = confirmation layer; fractal is core energy
-    for col in ["trend","momentum","cycle","sr","fractal","volume_confirm"]:
+    # volume_confirm = confirmation layer; Scale is the 5th energy in pure Burns
+    for col in ["trend","momentum","cycle","sr","scale","volume_confirm"]:
         print(f"  {col:<13}: {rate(col):0.1%}")
     print()
 

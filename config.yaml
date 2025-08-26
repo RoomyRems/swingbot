@@ -4,13 +4,14 @@ risk:
   account_equity: 50000        # used only if use_broker_equity: false
   use_broker_equity: true      # pull live equity from Alpaca paper acct
   risk_per_trade_pct: 0.01     # lowered to 1% risk per trade (stricter)
-  atr_multiple_stop: 1.5       # stop = 1.5 * ATR(14)
-  reward_multiple: 2.0         # target = entry + 2R
+  atr_multiple_stop: 1.4       # stabilizer: tighten stop multiple from 1.8
+  reward_multiple: 2.2         # single target evaluation
   max_total_risk_pct: 0.10     # cap total risk across open stops
   bp_utilization: 0.95         # spend at most 95% of available buying power
   min_shares: 1
-  min_stop_pct: 0.010          # NEW: minimum stop distance (1% of entry) to avoid micro stops
+  min_stop_pct: 0.010          # minimum stop distance (1% of entry)
   max_position_notional_pct: 0.25   # cap single position notional to 25% of equity
+  pad_atr_for_pivot_stop: 0.25 # extra ATR padding beyond pivot for Burns pivot stop
 
 signals:
   sr_pivots:
@@ -23,22 +24,31 @@ signals:
     allow_fallback_as_core: false # if true, EMA50 proximity alone can satisfy S/R energy
     tolerance_mode: "min"        # choose narrower of ATR*mult vs pct (stricter); "max" uses wider
     # yesterday_touch_ok: true    # enabled by default in code
+    # Phase 3 (optional) pivot cluster gating (currently disabled for baseline)
+    cluster:
+      enabled: true          # require pivot cluster confirmation
+      min_pivots: 2          # minimum distinct pivot lows (or highs) comprising cluster
+      lookback: 90           # bars to search for cluster pivots
+      max_span_pct: 0.02     # vertical span (high-low of cluster) / anchor price
+      max_price_dist_pct: 0.035  # price must be within this % of anchor pivot level
+    fib:
+      enabled: true          # optional Fibonacci confluence check
 
 # --- cycle (stochastic) hysteresis ---
 cycle:
-  rise_bars: 0            # require %K strictly rising (or falling) N bars before trigger (0=off)
+  rise_bars: 2            # broaden cycle confirmation window
   require_d_slope: false  # demand SlowD rising for long trigger / falling for short
 
 # --- momentum quality controls ---
 momentum:
   rsi_filter: true
-  rsi_threshold: 55              # raised for higher momentum quality
+  rsi_threshold: 55
   use_macd_expansion: false      # if you re-enable, keep expansion_min_steps: 1
   expansion_lookback: 3
   expansion_min_steps: 1
   zero_line_mode: "confirm"
   zero_cross_lookback: 3
-  macd_abs_min: 0.08             # stricter MACD abs threshold
+  macd_abs_min: 0.06             # keep momentum floor
 
 # --- volume confirmation (any-of) ---
 volume:
@@ -48,12 +58,7 @@ volume:
   obv_mode: "tick"               # or "slope"
   min_components: 2              # require 2 of {RVOL, AD, OBV}
 
-# --- fractal/volatility (5th core energy) ---
-fractal:
-  adx_min: 18            # ADX threshold for trend strength (passes if missing)
-  use_chop: true         # include choppiness constraint
-  chop_window: 14
-  chop_max: 58
+# (Removed) fractal energy. Pure Burns uses Scale (weekly momentum) as the 5th energy.
 
 regime:
   enabled: true
@@ -88,45 +93,66 @@ fundamentals:
       - "going concern"
 
 trading:
-  # MTF counts as a 6th "bonus" energy but also vetoes mismatches
-  min_score: 4             # effective score threshold (core + MTF bonus)
-  min_core_energies: 4     # STRICT: must have at least this many of 5 core before bonus
+  # Pure Burns: require 4-of-5 core energies; no MTF bonus
+  min_score: 4
+  min_core_energies: 4
+  momentum_cycle_or: true
+  burns_mode: true
   confirm_before_place: true
   time_in_force: "gtc"
-  order_type: "market"           # live only; backtest has its own entry model
+  order_type: "market"
   max_signals_per_run: 0
 
-  # Optional weighting of core energies (trend, momentum, cycle, sr, fractal)
-  energy_weights:
+  energy_weights:               # optional weighting (informational)
     trend: 1.0
     momentum: 1.0
     cycle: 1.0
     sr: 1.0
-    fractal: 1.0
+    scale: 1.0
 
-  # Post-energy pattern trigger (must pass if enabled)
-  patterns:
-    enabled: true
-    modes: ["engulf", "inside_break", "nr4_break"]
+  patterns:                     # post-energy pattern triggers
+    enabled: false              # disabled temporarily to expand flow for diagnostics
+    modes:
+      - engulf
+      - inside_break
+      - nr4_break
 
-  # Additional trade-level filters
-  filters:
-    min_atr_pct: 0.012          # require ATR14/Close >= 1.2% for new signals (liquidity/volatility floor)
-    max_extension_pct: 0.06     # reject if price >6% beyond EMA20 (long) or below (short)
-    pullback_tolerance_pct: 0.04 # require price within 4% of EMA20 (avoid chasing extremes)
+  filters:                      # additional trade-level gating
+    min_atr_pct: 0.011          # relaxed to admit slightly lower volatility names
+    max_extension_pct: 0.06     # reject stretched entries
+    min_avg_vol50: 300000       # liquidity floor (50d avg volume)
+    pullback_tolerance_pct: 0.035  # loosened to capture more pullbacks
+    value_zone_max_ext_pct: 0.025   # Burns: acceptable extension from EMA20 for valid pullback entry
+    value_zone_reject_tail_min: 0.40 # relaxed from 0.55 (long)
+    value_zone_reject_tail_min_short: 0.40 # relaxed from 0.55 (short)
+    value_zone_touch_atr_max: 0.60    # max ATR multiple below EMA20 (or above for shorts) allowed for pullback low/high
+    cycle_oversold: 25               # SlowK threshold oversold (long)
+    cycle_overbought: 75             # SlowK threshold overbought (short)
+    cycle_cross_lookback: 3          # bars within which a valid stochastic cross must have occurred
+    momentum_hist_expand_lookback: 2 # MACD histogram expansion bars required
+    momentum_macd_min: 0.00          # floor for MACD magnitude (Burns often flexible)
+  # removed legacy fractal thresholds (Scale covers MTF alignment)
 
-  # ---- Higher timeframe (MTF) confirmation ----
-  mtf:
+  targets:                      # scaling / runner configuration
+    enabled: false              # phase1 disable scaling; evaluate raw expectancy
+    primary_R: 2.2              # placeholder (unused while disabled)
+    runner_R: 0.0
+    scale_out_pct: 0.0
+    adx_min_for_runner: 0
+
+  volume_tiebreak_core4: false  # relaxed: allow core-min without volume confirm (diagnostic)
+
+  mtf:                          # higher timeframe confirmation
     enabled: true
     timeframe: "W"
-    trend_filter: "ema"          # or "macd"
+    trend_filter: "macd"       # Burns: use momentum on higher timeframe
     ema_fast: 20
     ema_slow: 50
     macd_fast: 12
     macd_slow: 26
     macd_signal: 9
-    counts_as_energy: true       # bonus point if aligned
-    reject_on_mismatch: true     # veto trades against weekly
+    counts_as_energy: false     # in Burns, Scale is core inside evaluator; no extra bonus
+    reject_on_mismatch: true    # veto mismatches
 
 ### ---------- For backtesting ---------- ###
 backtest:
@@ -142,14 +168,30 @@ backtest:
   bp_multiple: 1.0
   halt_on_equity_at_or_below: 0
   force_close_on_end: true
+  time_stop:
+    enabled: false   # phase1 off to allow winners time
+    bars: 0
+    min_R: 0.0
+  early_stop:                # new soft-stop pruning
+    enabled: false
+    bars: 0
+    min_mfe_R: 0.0
+    adverse_atr_mult: 0.0
+  gap_fail_safe:             # mitigate large overnight gaps
+    enabled: true
+    gap_R_multiple: 1.8      # tightened to reduce catastrophic losses
+  loss_guard:                # early MAE hard cap
+    enabled: true
+    mae_R_threshold: 1.2
+    bars: 5
 
   # Breakeven controls (engine.py uses these)
-  breakeven_at_R: 0.8
+  breakeven_at_R: 1.0          # re-enabled at 1R for protection
   breakeven_intrabar: "favor_be"   # or "favor_stop"
 
   # Backtest entry model (independent of live order_type)
   entry_model:
-    type: "market"        # "limit_retrace" or "market"
+    type: "limit_retrace"        # switch to pullback limit model
     retrace_to: "EMA20"
-    atr_fraction: 0.20
+    atr_fraction: 0.15
     horizon_days: 3
