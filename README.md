@@ -92,6 +92,46 @@ python main.py
 python scripts/run_backtest.py
 ```
 
+## Environment & Credentials
+The project reads API credentials from environment variables (loaded automatically via `python-dotenv` if a `.env` file is present in the project root).
+
+Required / Optional keys:
+
+| Purpose | Variable | Required | Notes |
+|---------|----------|----------|-------|
+| Alpaca API Key | `ALPACA_API_KEY` | Yes (for live/data) | Needed for fresh daily bars & any live/account operations |
+| Alpaca API Secret | `ALPACA_API_SECRET` | Yes (for live/data) | Without these, broker features are disabled (tests use a stub) |
+| Alpaca Paper Endpoint | `ALPACA_PAPER_ENDPOINT` | No | Defaults to `https://paper-api.alpaca.markets` |
+| Financial Modeling Prep | `FMP_API_KEY` | Optional | Enables earnings blackout + fundamentals filters |
+| Marketaux News | `MARKETAUX_API_KEY` | Optional | Enables news/sentiment veto if turned on in config |
+
+### Creating a `.env` file
+```
+ALPACA_API_KEY=YOUR_KEY
+ALPACA_API_SECRET=YOUR_SECRET
+ALPACA_PAPER_ENDPOINT=https://paper-api.alpaca.markets
+FMP_API_KEY=YOUR_FMP_KEY
+MARKETAUX_API_KEY=YOUR_NEWS_KEY
+```
+`.env` is **git-ignored** (see `.gitignore`). Do not commit secrets.
+
+### Loading env vars in PowerShell
+Either restart VS Code (auto-load via `dotenv`) or dot-source the helper script:
+```
+. ./scripts/load_env.ps1
+```
+You should see:
+```
+[load_env] Loaded N variable(s) from <path>
+```
+
+### Verifying
+```
+python -c "import os; print(os.getenv('ALPACA_API_KEY') is not None, os.getenv('FMP_API_KEY') is not None)"
+```
+
+If running tests without keys, the Alpaca module now provides a dummy stub so the suite passes. For live usage, ensure real credentials are present.
+
 ## Future Ideas
 -- Add alternative scale/HTF momentum filters.
 - Incorporate volatility contraction pattern detection.
