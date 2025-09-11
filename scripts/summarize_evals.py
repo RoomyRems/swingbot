@@ -50,12 +50,22 @@ def main(path: str | None = None):
         print(f"  mtf_ok         : {mtf_ok:0.1%}")
     print()
 
-    # Energy component “true rates”
-    def rate(col): return df[col].mean() if col in df.columns else float("nan")
-    print("Energy components true-rate:")
-    # volume_confirm = confirmation layer; Scale is the 5th energy in pure Burns
+    # Energy component “true rates” (eligible rows only)
+    elig = df.copy()
+    if "regime_ok" in elig.columns:
+        elig = elig[elig["regime_ok"] == True]
+    if "direction" in elig.columns:
+        elig = elig[elig["direction"].isin(["long","short"])]
+    def rate(col):
+        if col not in elig.columns or len(elig) == 0:
+            return float("nan")
+        return float(elig[col].mean())
+    print("Energy components true-rate (eligible rows):")
     for col in ["trend","momentum","cycle","sr","scale","volume_confirm"]:
         print(f"  {col:<13}: {rate(col):0.1%}")
+    # If trend_raw is present, show it (represents 'has direction' trend prior to waves gating)
+    if "trend_raw" in elig.columns:
+        print(f"  {'trend_raw':<13}: {rate('trend_raw'):0.1%}  (direction present)")
     print()
 
     # Score distribution (effective if available)

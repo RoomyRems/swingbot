@@ -9,9 +9,9 @@ risk:
   max_total_risk_pct: 0.10     # cap total risk across open stops
   bp_utilization: 0.95         # spend at most 95% of available buying power
   min_shares: 1
-  min_stop_pct: 0.010          # minimum stop distance (1% of entry)
+  min_stop_pct: 0.0            # disable absolute stop floor; use pivots+ATR padding
   max_position_notional_pct: 0.25   # cap single position notional to 25% of equity
-  pad_atr_for_pivot_stop: 0.25 # extra ATR padding beyond pivot for Burns pivot stop
+  pad_atr_for_pivot_stop: 0.20 # slightly reduced ATR padding beyond pivot for Burns pivot stop
 
 signals:
   sr_pivots:
@@ -36,11 +36,20 @@ signals:
 
 # --- cycle (stochastic) hysteresis ---
 cycle:
+  stoch_mode: "burns_5_3_2"  # use Burns timing (5-3-2) instead of legacy 14-3-3
+  from_extreme: true          # require cross to originate from oversold/overbought
+  lookback: 10                # bars window to find the most recent valid cross
+  extreme_lookback: 10        # prior window for origin-from-extreme check
+  oversold: 25                # 25/75 often suits daily swings better than 20/80
+  overbought: 75
+  confirm_bars: 1             # require %K to continue rising/falling at least N bars
+  relax_midline_in_value_zone: 5.0  # loosen midline by N points when price is in value zone
   rise_bars: 2            # broaden cycle confirmation window
   require_d_slope: false  # demand SlowD rising for long trigger / falling for short
 
 # --- momentum quality controls ---
 momentum:
+  recent_confirm_lookback: 2      # allow MACD cross within last N bars (alignment window)
   rsi_filter: true
   rsi_threshold: 55
   use_macd_expansion: false      # if you re-enable, keep expansion_min_steps: 1
@@ -49,6 +58,8 @@ momentum:
   zero_line_mode: "confirm"
   zero_cross_lookback: 3
   macd_abs_min: 0.06             # keep momentum floor
+  # minimum MACD-vs-signal distance to avoid hairline crosses (in MACD units)
+  min_cross_distance: 0.03
 
 # --- volume confirmation (any-of) ---
 volume:
@@ -57,6 +68,7 @@ volume:
   ad_trend_lookback: 3
   obv_mode: "tick"               # or "slope"
   min_components: 2              # require 2 of {RVOL, AD, OBV}
+  window: 20                     # window for AD/OBV slope components and for RVOL aggregation
 
 # (Removed) fractal energy. Pure Burns uses Scale (weekly momentum) as the 5th energy.
 
@@ -72,7 +84,9 @@ logging:
   explain_rejects: true
 
 fundamentals:
-  enabled: false
+  enabled: true
+  only_earnings_blackout: true
+  exit_before_earnings: true
   min_price: 5
   max_price: 1000
   min_avg_vol: 1000000
@@ -84,13 +98,53 @@ fundamentals:
     require_positive_eps_ttm: true
     min_revenue_yoy_growth_pct: 0
   news:
-    enabled: true
+    enabled: false   # default off in backtests to avoid rate limits
     lookback_days: 3
     min_sentiment: -0.10
     forbid_red_flags:
       - bankruptcy
       - fraud
       - "going concern"
+  # Backtest-only networking policy and cache settings
+  backtest_mode:
+    network: prefetch_only   # off | prefetch_only | live_ok
+    cache_dir: cache/fundamentals
+    ttl_days: 14
+    fail_policy: fail_open   # if network=off and cache miss: fail_open | fail_closed
+
+# --- strengthened Trend energy controls (Burns-consistent) ---
+trend_energy:
+  min_adx: 20                # 18–20 is reasonable; 25 can be too strict
+  min_ema_gap_pct: 0.003     # 0.30% min separation between EMA20 and EMA50
+  slope:
+    lookback: 20
+    min_bps_per_day: 1.5     # 1.5 bps/day ≈ 0.015%/day slope on SMA50
+    method: "llr"            # linear regression over SMA50
+  pivots:
+    enabled: true
+    lookback: 60
+    require_hh_hl: true
+signals:
+  trend:
+    # points logic: trend is true if score >= min_points
+    min_points: 3            # 3 of 5
+    # alignment
+    require_ema20_gt_ema50: true
+    # slope checks (lookback in bars)
+    slope_lookback: 3
+    min_slope_ema50_bp: 0.0  # > 0 bps over lookback (relative to price)
+    allow_ema20_slope_substitute: true
+    # separation vs volatility
+    sep_min_atr_mult: 0.25   # separation% >= 0.25 * ATR%
+    # price location (value zone bias)
+    require_close_above_ema50: true
+    # ADX assist (soft)
+    adx_soft_min: 16
+    adx_required_if_sep_below_mult: 0.50
+    # debounce: 2-of-3
+    confirm_n_of_m: [2, 3]
+    # optional structure assist (Donchian up/down adds 1 soft point)
+  structure_donchian: 20
 
 trading:
   # Pure Burns: require 4-of-5 core energies; no MTF bonus
@@ -102,6 +156,14 @@ trading:
   time_in_force: "gtc"
   order_type: "market"
   max_signals_per_run: 0
+  # engine acceptance reads this directly (not from filters)
+  min_atr_pct: 0.011
+
+  # Revalidate core energies at fill time for limit orders
+  core_at_fill:
+    enabled: true              # require N-of-5 core at fill (prevents stale fills)
+    min_core_energies: 4       # minimum core passes at fill
+    require_same_direction: true  # direction must still align at fill
 
   energy_weights:               # optional weighting (informational)
     trend: 1.0
@@ -152,7 +214,8 @@ trading:
     macd_slow: 26
     macd_signal: 9
     counts_as_energy: false     # in Burns, Scale is core inside evaluator; no extra bonus
-    reject_on_mismatch: true    # veto mismatches
+  filter_at_fill: true        # enforce MTF alignment at fill time only (scoring unchanged)
+  reject_on_mismatch: false   # do not hard-veto; Scale is already in the core
 
 ### ---------- For backtesting ---------- ###
 backtest:
@@ -161,17 +224,27 @@ backtest:
   commission_per_share: 0.00
   slippage_bps: 2.0
   allow_short: false             # optional: start long-only; re-enable later
-  max_open_positions: 6
+  max_open_positions: 1000       # effectively unlimited for this universe
   max_total_risk_pct: 0.08
-  max_new_trades_per_week: 3
+  max_new_trades_per_week: 0     # 0 = unlimited
   touch_priority: "stop_first"
   bp_multiple: 1.0
   halt_on_equity_at_or_below: 0
   force_close_on_end: true
+  logging:
+    write_evaluations_csv: true      # set false to skip evaluations CSV
+    write_daily_metrics_csv: true    # set false to skip daily metrics CSV
+    write_drawdowns_csv: true        # set false to skip drawdowns CSV
+    write_meta: true                 # set false to skip config + meta YAML snapshots
+    print_rollups: true              # grouped rollups in console
+    print_pending_stats: true        # pending/fill stats + rates in console
+    print_reconciliation: true       # reconciliation and audit prints
+    print_top_bottom_trades: true    # top/bottom R tables
+    print_recap: false               # extra recap from script (engine already prints)
   time_stop:
-    enabled: false   # phase1 off to allow winners time
-    bars: 0
-    min_R: 0.0
+    enabled: true              # exit if no progress within horizon
+    bars: 15                   # bars elapsed
+    min_R: 0.5                 # required MFE in R; else exit
   early_stop:                # new soft-stop pruning
     enabled: false
     bars: 0
@@ -184,6 +257,53 @@ backtest:
     enabled: true
     mae_R_threshold: 1.2
     bars: 5
+
+  # Burns-aligned evidence-based exit controls
+  evidence_exit:
+    enabled: true
+    pre1R_max_bars: 8        # if not reaching min MFE by this many bars, exit
+    pre1R_min_mfe: 0.5       # required MFE in R before 1R; else exit
+    momentum_fail: true      # MACD vs signal/zero fail
+    cycle_fail: true         # SlowK vs SlowD fail
+    value_zone_fail: true    # price lost EMA50 bias
+    # --- softening toggles (Gentle recipe) ---
+    min_hold_bars: 2
+    consecutive_fails_default: 1
+    momentum_consecutive: null
+    cycle_consecutive: 2
+    value_zone_consecutive: null
+
+    weights:
+      momentum: 0.5
+      cycle: 0.5
+      value_zone: 1.0
+    threshold_single: 1.0
+    threshold_two_bar: 1.5
+
+    value_zone_fail_buffer_pct: 0.0015
+    cycle_fail_gap_min: 1.5
+    momentum_need_zero_cross: false
+
+    setup_overrides:
+      pullback:
+        cycle_consecutive: 2
+      breakout:
+        momentum_consecutive: 2
+
+    intraday_recovery:
+      enabled: false
+      minutes: 60
+      require_reclaim: "EMA20"
+
+  # Trail stop to EMA20 after reaching a minimum R
+  trail_after_R:
+    enabled: true
+    start_R: 1.0
+
+  # Exit positions if no fresh bars for a while (data staleness)
+  stale_data_exit:
+    enabled: true
+    max_gap_days: 5
 
   # Breakeven controls (engine.py uses these)
   breakeven_at_R: 1.0          # re-enabled at 1R for protection

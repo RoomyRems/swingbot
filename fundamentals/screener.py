@@ -6,7 +6,7 @@ import time
 import math
 import datetime as dt
 from dataclasses import dataclass
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Any
 
 import requests
 import pandas as pd
@@ -14,6 +14,7 @@ from dotenv import load_dotenv
 
 # Prefer Alpaca for price/avgvol (cheap + reliable)
 from broker.alpaca import get_daily_bars
+from utils.file_cache import FileCache
 
 load_dotenv()
 
@@ -44,6 +45,28 @@ def _canon_for_mx(sym: str) -> str:
     # Marketaux typically accepts dot form; keep original unless you’ve seen issues.
     return sym.upper().strip()
 
+def _get_backtest_network_mode(cfg: dict) -> str:
+    try:
+        return (cfg.get("fundamentals", {})
+                  .get("backtest_mode", {})
+                  .get("network", "off"))
+    except Exception:
+        return "off"
+
+def _is_live_ok(cfg: dict) -> bool:
+    return _get_backtest_network_mode(cfg) == "live_ok"
+
+def _is_backtest_prefetch_only(cfg: dict) -> bool:
+    return _get_backtest_network_mode(cfg) == "prefetch_only"
+
+def _min_avg_vol(cfg: dict) -> int:
+    """Return a unified min avg volume. In backtests, match technical filter to avoid contradictory gates."""
+    fmv = (cfg.get("fundamentals", {}) or {}).get("min_avg_vol")
+    tfv = (cfg.get("trading", {}).get("filters", {}) or {}).get("min_avg_vol50")
+    if not _is_live_ok(cfg):
+        return int(tfv or fmv or 300000)
+    return int(fmv or tfv or 300000)
+
 def _get_json(url: str, params: Optional[dict] = None, timeout: int = 15, retries: int = 2) -> Optional[dict | list]:
     """
     GET with small retry/backoff for 429/5xx.
@@ -69,6 +92,53 @@ def _get_json(url: str, params: Optional[dict] = None, timeout: int = 15, retrie
                 continue
             return None
     return None
+
+# ---- request counters (observability) --------------------------------
+REQUEST_COUNTER: Dict[str, int] = {
+    "fmp": 0,
+    "mx": 0,
+    "alpaca": 0,
+    "cache_hit": 0,
+}
+
+def _inc(key: str, n: int = 1) -> None:
+    try:
+        REQUEST_COUNTER[key] = REQUEST_COUNTER.get(key, 0) + int(n)
+    except Exception:
+        pass
+
+# ---- cached JSON fetcher ---------------------------------------------
+
+def _cached_get_json(url: str, params: Optional[dict], cache: Optional[FileCache], vendor: str, network: str = "live_ok") -> Optional[dict | list]:
+    """
+    vendor: 'fmp' | 'mx' (used for counters)
+    network:
+      - 'off'            -> never hit network; return cache if present else None
+      - 'prefetch_only'  -> allowed during prefetch (callers should only use in prefetch stage)
+      - 'live_ok'        -> may call network freely
+    """
+    key = None
+    if cache is not None:
+        try:
+            key = f"{url}?{sorted(params.items()) if params else ''}"
+            v = cache.get(key)
+            if v is not None:
+                _inc("cache_hit")
+                return v
+        except Exception:
+            pass
+    if network == "off":
+        return None
+    # network allowed
+    js = _get_json(url, params=params)
+    if js is not None and cache is not None and key is not None:
+        try:
+            cache.set(key, js)
+        except Exception:
+            pass
+    if vendor in ("fmp","mx"):
+        _inc(vendor)
+    return js
 
 # ---- Alpaca (preferred) ----------------------------------------------
 
@@ -111,12 +181,12 @@ def fmp_profile(symbol: str) -> Optional[dict]:
         return js[0]
     return None
 
-def fmp_earnings_window(symbol: str, days: int) -> bool:
+def fmp_earnings_window(symbol: str, days: int, ref_date: Optional[dt.date] = None) -> bool:
     if not FMP_KEY or days <= 0:
         return False
-    today = _today_utc_date()
-    start = _iso_date(today - dt.timedelta(days=days))
-    end   = _iso_date(today + dt.timedelta(days=days))
+    base = ref_date or _today_utc_date()
+    start = _iso_date(base - dt.timedelta(days=days))
+    end   = _iso_date(base + dt.timedelta(days=days))
     sym = _canon_for_fmp(symbol)
     url = f"{FMP_BASE}/earning_calendar"
     js = _get_json(url, params={"symbol": sym, "from": start, "to": end, "apikey": FMP_KEY})
@@ -162,15 +232,18 @@ def fmp_revenue_yoy_pct(symbol: str) -> Optional[float]:
 
 RED_FLAG_KEYWORDS = ("bankruptcy", "fraud", "going concern")
 
-def mx_news_scan(symbol: str, lookback_days: int, min_sentiment: float, forbid_terms: List[str]) -> Tuple[bool, dict]:
+def mx_news_scan(symbol: str, lookback_days: int, min_sentiment: float, forbid_terms: List[str], ref_datetime: Optional[dt.datetime] = None) -> Tuple[bool, dict]:
     if not MX_KEY or lookback_days <= 0:
         return True, {"reason": "news-skip (no key or disabled)"}
 
-    published_after = dt.datetime.utcnow() - dt.timedelta(days=lookback_days)
+    now_ref = ref_datetime or dt.datetime.utcnow()
+    published_after = now_ref - dt.timedelta(days=lookback_days)
     params = {
         "symbols": _canon_for_mx(symbol),
         "filter_entities": "true",
         "published_after": published_after.strftime("%Y-%m-%dT%H:%M"),
+        # Try to bound by simulated time to reduce lookahead; API may ignore if unsupported
+        "published_before": now_ref.strftime("%Y-%m-%dT%H:%M"),
         "limit": 50,
         "api_token": MX_KEY,
     }
@@ -202,6 +275,85 @@ def mx_news_scan(symbol: str, lookback_days: int, min_sentiment: float, forbid_t
         return True, {"reason": f"news-sentiment-ok({avg:.2f})"}
     return True, {"reason": "news-no-sentiment-fields"}
 
+# ---- Backtest prefetch helpers --------------------------------------
+
+def init_fundamentals_cache(cfg: dict) -> FileCache:
+    fcfg = (cfg.get("fundamentals", {}) or {})
+    btcfg = (fcfg.get("backtest_mode", {}) or {})
+    cache_dir = str(btcfg.get("cache_dir", os.path.join("cache", "fundamentals")))
+    ttl_days = int(btcfg.get("ttl_days", 14))
+    return FileCache(cache_dir, ttl_days=ttl_days)
+
+def prefetch_earnings_calendar(symbols: List[str], start_date: dt.date, end_date: dt.date, cache: FileCache, cfg: dict) -> Dict[str, List[dt.date]]:
+    if not FMP_KEY:
+        return {s: [] for s in symbols}
+    fcfg = (cfg.get("fundamentals", {}) or {})
+    btcfg = (fcfg.get("backtest_mode", {}) or {})
+    network = str(btcfg.get("network", "prefetch_only"))
+    out: Dict[str, List[dt.date]] = {}
+    for s in symbols:
+        sym = _canon_for_fmp(s)
+        url = f"{FMP_BASE}/earning_calendar"
+        params = {
+            "symbol": sym,
+            "from": _iso_date(start_date),
+            "to": _iso_date(end_date),
+            "apikey": FMP_KEY,
+        }
+        js = _cached_get_json(url, params, cache, vendor="fmp", network=network)
+        dates: List[dt.date] = []
+        if isinstance(js, list):
+            for row in js:
+                for k in ("date","reportedDate","epsDate","fiscalDateEnding"):
+                    v = row.get(k)
+                    if v:
+                        try:
+                            d = dt.datetime.fromisoformat(str(v).split("T")[0]).date()
+                            dates.append(d)
+                            break
+                        except Exception:
+                            continue
+        out[s] = sorted(set(dates))
+    return out
+
+def build_fund_ctx(cfg: dict, symbols: List[str], start_date: dt.date, end_date: dt.date) -> Dict[str, Any]:
+    fcfg = (cfg.get("fundamentals", {}) or {})
+    blackout = int(fcfg.get("earnings_blackout_days", 0))
+    cache = init_fundamentals_cache(cfg)
+    # pad range by blackout window to cover near-boundary fills
+    pad = max(blackout, 0)
+    s = start_date - dt.timedelta(days=pad)
+    e = end_date + dt.timedelta(days=pad)
+    cal = prefetch_earnings_calendar(symbols, s, e, cache, cfg)
+    return {
+        "earnings_calendar": cal,
+        "blackout_days": blackout,
+        "request_counter": dict(REQUEST_COUNTER),
+    }
+
+def earnings_in_window(symbol: str, day: dt.date, blackout_days: int, ctx: Dict[str, Any]) -> bool:
+    cal = (ctx or {}).get("earnings_calendar", {}) or {}
+    dates = cal.get(symbol, []) or []
+    if blackout_days <= 0 or not dates:
+        return False
+    for d in dates:
+        if abs((day - d).days) <= blackout_days:
+            return True
+    return False
+
+def fundamentals_pass_at_fill(symbol: str, fill_date: dt.date, cfg: dict, ctx: Optional[Dict[str, Any]]) -> Tuple[bool, str]:
+    fcfg = (cfg.get("fundamentals", {}) or {})
+    blackout = int(fcfg.get("earnings_blackout_days", 0))
+    if blackout <= 0:
+        return True, "no-blackout"
+    if ctx is None:
+        # offline path: fail open by default in backtests
+        return True, "no-ctx"
+    blocked = earnings_in_window(symbol, fill_date, blackout, ctx)
+    if blocked:
+        return False, f"earnings_blackout(+/-{blackout}d)"
+    return True, "ok"
+
 # ---- Public screen function ------------------------------------------
 
 @dataclass
@@ -209,7 +361,15 @@ class ScreenResult:
     keep: bool
     reasons: Dict[str, str]  # details for logging/inspection
 
-def screen_symbol(symbol: str, cfg: dict, throttle: float = 0.10) -> ScreenResult:
+def screen_symbol(
+    symbol: str,
+    cfg: dict,
+    throttle: float = 0.10,
+    asof_date: Optional[dt.date] = None,
+    asof_datetime: Optional[dt.datetime] = None,
+    price_override: Optional[float] = None,
+    avgvol_override: Optional[float] = None,
+) -> ScreenResult:
     """Apply fundamentals filters against one symbol."""
     fcfg = cfg.get("fundamentals", {}) or {}
     reasons: Dict[str, str] = {}
@@ -219,10 +379,14 @@ def screen_symbol(symbol: str, cfg: dict, throttle: float = 0.10) -> ScreenResul
     max_p   = float(fcfg.get("max_price", math.inf))
     min_vol = float(fcfg.get("min_avg_vol", 0))
 
-    # Prefer Alpaca for price/avgVol; fallback to FMP quote if needed
-    q = _alpaca_price_avgvol(symbol)
-    if not q and FMP_KEY:
-        q = fmp_quote(symbol); _throttle(throttle)
+    # Prefer overrides from caller (e.g., backtest) to avoid lookahead and network
+    q: Optional[dict]
+    if price_override is not None and avgvol_override is not None:
+        q = {"price": float(price_override), "avgVolume": float(avgvol_override)}
+    else:
+        q = _alpaca_price_avgvol(symbol)
+        if not q and FMP_KEY:
+            q = fmp_quote(symbol); _throttle(throttle)
 
     if not q:
         return ScreenResult(False, {"error": "quote-unavailable"})
@@ -243,7 +407,7 @@ def screen_symbol(symbol: str, cfg: dict, throttle: float = 0.10) -> ScreenResul
     # 2) earnings blackout
     blackout_days = int(fcfg.get("earnings_blackout_days", 0))
     if blackout_days > 0:
-        if fmp_earnings_window(symbol, blackout_days):
+        if fmp_earnings_window(symbol, blackout_days, ref_date=asof_date):
             _throttle(throttle)
             return ScreenResult(False, {"earnings": f"within +/-{blackout_days}d"})
         _throttle(throttle)
@@ -283,6 +447,7 @@ def screen_symbol(symbol: str, cfg: dict, throttle: float = 0.10) -> ScreenResul
             lookback_days=int(ncfg.get("lookback_days", 3)),
             min_sentiment=float(ncfg.get("min_sentiment", -0.1)),
             forbid_terms=list(ncfg.get("forbid_red_flags", [])),
+            ref_datetime=asof_datetime,
         ); _throttle(throttle)
         if not ok:
             return ScreenResult(False, {"news": info.get("reason", "blocked")})
@@ -294,16 +459,92 @@ def screen_symbol(symbol: str, cfg: dict, throttle: float = 0.10) -> ScreenResul
     return ScreenResult(True, reasons)
 
 def screen_universe(symbols: List[str], cfg: dict) -> Tuple[List[str], pd.DataFrame]:
+    """Backtest-safe universe pre-screen.
+
+    - Fail-open on any API/network error when not in live_ok mode.
+    - Avoid per-symbol network calls unless live_ok.
+    - Use one volume floor that matches technical filter in backtests.
+    - Skip earnings blackout here (engine enforces at fill).
+    - Skip news in backtests.
+    Returns (kept_symbols, report_df) and writes an audit CSV to logs/.
     """
-    Apply screen_symbol to a list; return (kept, report_df).
-    """
-    rows: List[dict] = []
-    kept: List[str]  = []
-    for s in symbols:
-        res = screen_symbol(s, cfg)
-        row = {"symbol": s, "keep": res.keep, **res.reasons}
-        rows.append(row)
-        if res.keep:
-            kept.append(s)
-    report = pd.DataFrame(rows)
+    import random
+    def _tiny_jitter():
+        time.sleep(random.uniform(0.075, 0.150))
+
+    live_ok = _is_live_ok(cfg)
+    prefetch_only = _is_backtest_prefetch_only(cfg)
+    fail_open = not live_ok
+    use_news = bool(((cfg.get("fundamentals", {}).get("news", {}) or {}).get("enabled", False)) and live_ok)
+    min_avg_vol = _min_avg_vol(cfg)
+    min_price = float((cfg.get("fundamentals", {}) or {}).get("min_price", 0))
+
+    drop_log: List[dict] = []
+    kept: List[str] = []
+
+    for sym in symbols:
+        try:
+            price = None
+            avgvol = None
+
+            # Price/avgvol: avoid network in backtests
+            if live_ok:
+                q = _alpaca_price_avgvol(sym)
+                _tiny_jitter()
+                if q:
+                    price = float(q.get("price")) if q.get("price") is not None else None
+                    avgvol = float(q.get("avgVolume")) if q.get("avgVolume") is not None else None
+            # Apply min checks (permissive when no local data or not live_ok)
+            price_ok = True if (not live_ok or price is None) else (price >= min_price)
+            vol_ok = True if (not live_ok or avgvol is None) else (avgvol >= min_avg_vol)
+            if not price_ok:
+                drop_log.append({"symbol": sym, "kept": False, "reason": f"price_below_min({price}<{min_price})"})
+                continue
+            if not vol_ok:
+                drop_log.append({"symbol": sym, "kept": False, "reason": f"avgvol_below_min({avgvol}<{min_avg_vol})"})
+                continue
+
+            # News only in live_ok and enabled
+            if use_news:
+                ncfg = (cfg.get("fundamentals", {}).get("news", {}) or {})
+                try:
+                    ok_news, info = mx_news_scan(
+                        symbol=sym,
+                        lookback_days=int(ncfg.get("lookback_days", 3)),
+                        min_sentiment=float(ncfg.get("min_sentiment", -0.1)),
+                        forbid_terms=list(ncfg.get("forbid_red_flags", [])),
+                        ref_datetime=None,
+                    )
+                    _tiny_jitter()
+                except Exception as e:
+                    if fail_open:
+                        ok_news = True
+                        info = {"reason": f"news_api_error_fail_open:{type(e).__name__}"}
+                    else:
+                        raise
+                if not ok_news:
+                    drop_log.append({"symbol": sym, "kept": False, "reason": info.get("reason", "news_block")})
+                    continue
+
+            # Earnings blackout skipped here (enforced at fill via engine prefetch)
+            kept.append(sym)
+            drop_log.append({"symbol": sym, "kept": True, "reason": "kept"})
+        except Exception as e:
+            if fail_open:
+                kept.append(sym)
+                drop_log.append({"symbol": sym, "kept": True, "reason": f"api_error_fail_open:{type(e).__name__}"})
+            else:
+                drop_log.append({"symbol": sym, "kept": False, "reason": f"api_error_fail_closed:{type(e).__name__}"})
+
+    # Write screen log CSV
+    try:
+        ts = dt.datetime.now().strftime("%Y-%m-%d_%H%M%S")
+        out = os.path.join("logs", f"fundamentals_screen_{ts}.csv")
+        os.makedirs("logs", exist_ok=True)
+        pd.DataFrame(drop_log, columns=["symbol","kept","reason"]).to_csv(out, index=False)
+        print(f"[Fundamentals] Wrote screen log → {out}")
+    except Exception:
+        pass
+    print(f"[Fundamentals] Kept {len(kept)} / {len(symbols)} symbols (mode={_get_backtest_network_mode(cfg)}, min_avg_vol={min_avg_vol}, min_price={min_price}, news={'ON' if use_news else 'OFF'})")
+    report = pd.DataFrame(drop_log, columns=["symbol","kept","reason"])  # compatibility
     return kept, report

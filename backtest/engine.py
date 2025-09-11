@@ -8,11 +8,17 @@ import copy
 import pandas as pd
 import numpy as np
 from tqdm import tqdm
+from pathlib import Path
+import hashlib
+import yaml
+import sys as _sys
+import platform as _platform
 
 from risk.manager import compute_levels as rm_compute_levels, size_position as rm_size_position
 from utils.config import load_config
 from utils.logger import today_filename, log_dataframe
 from broker.alpaca import get_daily_bars
+from fundamentals.screener import build_fund_ctx, fundamentals_pass_at_fill, earnings_in_window, _min_avg_vol, _get_backtest_network_mode
 from strategies.swing_strategy import (
     add_indicators,
     evaluate_five_energies,
@@ -61,6 +67,41 @@ def _qty_bp_cap(entry_px: float, cash: float, bp_multiple: float) -> int:
         return 0
     return int(math.floor((cash * bp_multiple) / entry_px))
 
+def _derive_mtf_state_from_ctx(weekly_ctx: dict | None) -> str:
+    """Return 'up' | 'down' | 'none' from cached weekly MACD context when available."""
+    try:
+        if weekly_ctx is None:
+            return "none"
+        wmacd = weekly_ctx.get("wmacd"); wmacds = weekly_ctx.get("wmacds"); wmacdh = weekly_ctx.get("wmacdh")
+        if all([np.isfinite(wmacd), np.isfinite(wmacds), np.isfinite(wmacdh)]):
+            if (wmacd > wmacds) and (wmacdh > 0):
+                return "up"
+            elif (wmacd < wmacds) and (wmacdh < 0):
+                return "down"
+        return "none"
+    except Exception:
+        return "none"
+
+def _compute_rvol20(df: pd.DataFrame, day: pd.Timestamp) -> float:
+    """Return RVOL20 at day if present else fallback Volume/mean(20) from history up to day."""
+    try:
+        if (day in df.index) and ("RVOL20" in df.columns) and np.isfinite(float(df.at[day, "RVOL20"])):
+            return float(df.at[day, "RVOL20"])
+    except Exception:
+        pass
+    try:
+        if (day in df.index) and ("Volume" in df.columns):
+            idx = df.index.get_loc(day)
+            sl = df.iloc[: idx + 1]
+            if len(sl) >= 2:
+                v = float(sl.iloc[-1]["Volume"]) if np.isfinite(sl.iloc[-1]["Volume"]) else np.nan
+                mv = float(sl["Volume"].rolling(20, min_periods=1).mean().iloc[-1])
+                if np.isfinite(v) and np.isfinite(mv) and mv > 0:
+                    return v / mv
+    except Exception:
+        pass
+    return float("nan")
+
 def _detect_split(prev_close: float, today_open: float) -> int:
     """Return forward split factor (>=2) if a likely corporate split occurred, else 1.
     Heuristic: large downward gap where ratio prev_close / today_open is near an integer >= 2
@@ -91,6 +132,15 @@ def _apply_split_adjustment(pos, factor: int):
     pos.target /= factor
     pos.per_share_risk = abs(pos.entry_price - pos.stop)
     pos.qty *= factor
+
+def _intraday_recover_check(symbol: str, day: pd.Timestamp, level_px: float, minutes: int) -> bool:
+        """
+        Return True if, in the last `minutes` of the session for `day`, price reclaimed `level_px`.
+        Default stub returns False (no intraday data wired). If you have a feed, implement:
+            - fetch intraday bars for `day` within [close - minutes, close]
+            - for long: any bar close >= level_px; for short: close <= level_px
+        """
+        return False
 
 @dataclass
 class PendingLimit:
@@ -143,6 +193,28 @@ class Position:
     entry_commission: float = 0.0
     entry_slippage_cost: float = 0.0
     position_id: int = field(default=-1)
+    # Evidence-exit hysteresis state
+    mom_fail_streak: int = 0
+    cycle_fail_streak: int = 0
+    val_fail_streak: int = 0
+    prev_evidence_weight: float = 0.0
+    prev_evidence_date: pd.Timestamp | None = None
+    # Entry diagnostics (persist to exit rows)
+    entry_setup_type: str = ""
+    entry_adx14: float = float("nan")
+    entry_rvol20: float = float("nan")
+    entry_ema20_dist_pct: float = float("nan")
+    entry_pivot_dist_pct: float = float("nan")
+    entry_atr_pct: float = float("nan")
+    entry_mtf_state: str = ""
+    qty_cap_reason: str = "full_size"
+    order_type: str = "market"
+    days_to_fill: float = float("nan")
+    # Lifecycle flags / timers
+    time_to_BE_bars: int | None = None
+    time_to_1R_bars: int | None = None
+    be_armed_bar: pd.Timestamp | None = None
+    trail_active_bar: pd.Timestamp | None = None
 
     def market_value(self, close_px: float) -> float:
         sign = 1 if self.side == "long" else -1
@@ -225,6 +297,81 @@ def run_backtest(
     gap_cfg = bt_cfg.get("gap_fail_safe", {}) or {}
     gap_enabled = bool(gap_cfg.get("enabled", False))
     gap_R_multiple = float(gap_cfg.get("gap_R_multiple", 0.0))
+    # Logging controls (gate outputs to avoid redundancy)
+    log_cfg = (bt_cfg.get("logging", {}) or {})
+    log_eval_csv      = bool(log_cfg.get("write_evaluations_csv", True))
+    log_daily_csv     = bool(log_cfg.get("write_daily_metrics_csv", True))
+    log_drawdowns_csv = bool(log_cfg.get("write_drawdowns_csv", True))
+    log_meta_files    = bool(log_cfg.get("write_meta", True))
+    print_rollups     = bool(log_cfg.get("print_rollups", True))
+    print_pending     = bool(log_cfg.get("print_pending_stats", True))
+    print_recon       = bool(log_cfg.get("print_reconciliation", True))
+    print_topbottom   = bool(log_cfg.get("print_top_bottom_trades", True))
+    # Evidence-based exit (Burns: exit when the case weakens)
+    evx_cfg = (bt_cfg.get("evidence_exit", {}) or {})
+    evx_enabled   = bool(evx_cfg.get("enabled", True))
+    evx_pre1R_bars= int(evx_cfg.get("pre1R_max_bars", 8))
+    evx_pre1R_mfe = float(evx_cfg.get("pre1R_min_mfe", 0.5))
+    evx_mom_fail  = bool(evx_cfg.get("momentum_fail", True))
+    evx_cycle_fail= bool(evx_cfg.get("cycle_fail", True))
+    evx_val_fail  = bool(evx_cfg.get("value_zone_fail", True))
+    # NEW — softness / hysteresis with safe defaults
+    evx_min_hold_bars = int(evx_cfg.get("min_hold_bars", 0))
+    consec_default = int(evx_cfg.get("consecutive_fails_default", 1))
+    mom_consec_default = int(evx_cfg.get("momentum_consecutive", consec_default) or consec_default)
+    cyc_consec_default = int(evx_cfg.get("cycle_consecutive", consec_default) or consec_default)
+    val_consec_default = int(evx_cfg.get("value_zone_consecutive", consec_default) or consec_default)
+
+    w_cfg = (evx_cfg.get("weights") or {})
+    w_mom_default = float(w_cfg.get("momentum", 0.5))
+    w_cyc_default = float(w_cfg.get("cycle", 0.5))
+    w_val_default = float(w_cfg.get("value_zone", 1.0))
+    thr_single_default = float(evx_cfg.get("threshold_single", 1.0))
+    thr_two_default = float(evx_cfg.get("threshold_two_bar", 1.5))
+
+    vz_buf_pct_default = float(evx_cfg.get("value_zone_fail_buffer_pct", 0.0))
+    cyc_gap_min_default = float(evx_cfg.get("cycle_fail_gap_min", 0.0))
+    mom_need_zero_default = bool(evx_cfg.get("momentum_need_zero_cross", False))
+
+    # Setup-aware overrides
+    setup_ovr = (evx_cfg.get("setup_overrides") or {})
+
+    def _evx_params_for(pos_setup: str):
+        params = {
+            "mom_consec": mom_consec_default,
+            "cyc_consec": cyc_consec_default,
+            "val_consec": val_consec_default,
+            "w_mom": w_mom_default,
+            "w_cyc": w_cyc_default,
+            "w_val": w_val_default,
+            "thr_single": thr_single_default,
+            "thr_two": thr_two_default,
+            "vz_buf_pct": vz_buf_pct_default,
+            "cyc_gap_min": cyc_gap_min_default,
+            "mom_need_zero": mom_need_zero_default,
+        }
+        ovr = (setup_ovr.get(pos_setup or "", {}) or {})
+        if "momentum_consecutive" in ovr:
+            params["mom_consec"] = int(ovr["momentum_consecutive"])  # type: ignore
+        if "cycle_consecutive" in ovr:
+            params["cyc_consec"] = int(ovr["cycle_consecutive"])  # type: ignore
+        if "value_zone_consecutive" in ovr:
+            params["val_consec"] = int(ovr["value_zone_consecutive"])  # type: ignore
+        if "value_zone_fail_buffer_pct" in ovr:
+            params["vz_buf_pct"] = float(ovr["value_zone_fail_buffer_pct"])  # type: ignore
+        if "cycle_fail_gap_min" in ovr:
+            params["cyc_gap_min"] = float(ovr["cycle_fail_gap_min"])  # type: ignore
+        if "momentum_need_zero_cross" in ovr:
+            params["mom_need_zero"] = bool(ovr["momentum_need_zero_cross"])  # type: ignore
+        return params
+    # Trailing after R
+    trail_cfg = (bt_cfg.get("trail_after_R", {}) or {})
+    trail_enabled = bool(trail_cfg.get("enabled", False))
+    trail_start_R = float(trail_cfg.get("start_R", 1.0))
+    # Stale data exit
+    stale_cfg = (bt_cfg.get("stale_data_exit", {}) or {})
+    stale_enabled = bool(stale_cfg.get("enabled", False))
+    stale_max_days = int(stale_cfg.get("max_gap_days", 5))
     # Loss guard early MAE cap
     lg_cfg = bt_cfg.get("loss_guard", {}) or {}
     lg_enabled = bool(lg_cfg.get("enabled", False))
@@ -281,6 +428,15 @@ def run_backtest(
     calendar = sorted(calendar)
     if not calendar:
         raise RuntimeError("No trading days in range.")
+
+    # ---------- fundamentals prefetch/context (backtest-friendly) ----------
+    fcfg = (cfg.get("fundamentals", {}) or {})
+    fund_ctx = None
+    if bool(fcfg.get("enabled", False)):
+        try:
+            fund_ctx = build_fund_ctx(cfg, list(data.keys()), start_date.date(), end_date.date())
+        except Exception:
+            fund_ctx = None
 
     # Precompute daily candidates by date
     candidates_by_day: Dict[pd.Timestamp, List[dict]] = {d: [] for d in calendar}
@@ -343,6 +499,37 @@ def run_backtest(
                 value_zone = bool(eng.get("explain", {}).get("sr", {}).get("value_zone", False))
             except Exception:
                 value_zone = False
+            # Fundamentals gate at scan-time: support earnings-only blackout mode
+            fcfg_scan = (cfg.get("fundamentals", {}) or {})
+            fundamentals_ok = True
+            reason_fund = "fundamentals"
+            if bool(fcfg_scan.get("enabled", False)):
+                if bool(fcfg_scan.get("only_earnings_blackout", False)):
+                    try:
+                        blk = int(fcfg_scan.get("earnings_blackout_days", 0))
+                    except Exception:
+                        blk = 0
+                    if blk > 0 and fund_ctx is not None:
+                        if earnings_in_window(sym, pd.to_datetime(d).date(), blk, fund_ctx):
+                            fundamentals_ok = False
+                            reason_fund = "earnings"
+                else:
+                    try:
+                        price_o = float(row.get("Close", np.nan))
+                        avgv_o = float(sl["Volume"].tail(50).mean()) if "Volume" in sl.columns else float("nan")
+                    except Exception:
+                        price_o = float("nan"); avgv_o = float("nan")
+                    min_p = float(fcfg_scan.get("min_price", 0))
+                    try:
+                        min_vol = float(_min_avg_vol(cfg))
+                    except Exception:
+                        min_vol = float((cfg.get("trading", {}).get("filters", {}) or {}).get("min_avg_vol50", 300000))
+                    fundamentals_ok = (
+                        np.isfinite(price_o) and np.isfinite(avgv_o) and price_o > 0 and avgv_o > 0 and
+                        (price_o >= min_p) and (avgv_o >= min_vol)
+                    )
+                    reason_fund = "fundamentals"
+
             if burns_mode_active:
                 # Burns canonical: 5 energies are Trend, Momentum, Cycle, S/R, Scale (weekly momentum).
                 # Accept when at least core_min of these are true (default 4). Breakouts must also have momentum.
@@ -362,7 +549,12 @@ def run_backtest(
                     min_R_ok = R >= max(1.2, reward_mult * 0.8)
                 else:
                     min_R_ok = False
-                if not regime_ok:
+                if not fundamentals_ok:
+                    reason = reason_fund
+                    if reason == "earnings":
+                        earnings_block_scan += 1
+                    accept = False
+                elif not regime_ok:
                     reason = "regime"
                     accept = False
                 elif direction not in ("long", "short"):
@@ -405,7 +597,11 @@ def run_backtest(
                     min_R_ok = R >= max(1.2, reward_mult * 0.8)
                 else:
                     min_R_ok = False
-                if not regime_ok:
+                if not fundamentals_ok:
+                    reason = reason_fund; accept = False
+                    if reason == "earnings":
+                        earnings_block_scan += 1
+                elif not regime_ok:
                     reason = "regime"; accept = False
                 elif direction not in ("long","short"):
                     reason = "no_dir"; accept = False
@@ -425,20 +621,11 @@ def run_backtest(
                     reason = "pass"; accept = True
 
             # Evaluation row
-            # Compute setup classification heuristic: pullback if Close within 1 ATR of EMA20 and not extended; else breakout
             try:
                 ema20_val = float(row.get("EMA20", np.nan))
                 close_val = float(row.get("Close", np.nan))
-                atr_val = float(row.get("ATR14", np.nan))
-                ext_pct = float(eng.get("ext_pct", np.nan)) if eng else np.nan
-                if np.isfinite(ema20_val) and np.isfinite(close_val) and np.isfinite(atr_val) and atr_val > 0:
-                    pullback_cond = abs(close_val - ema20_val) <= atr_val and (abs(ext_pct) <= 0.035 if np.isfinite(ext_pct) else True)
-                else:
-                    pullback_cond = False
-                setup_type = "pullback" if pullback_cond else "breakout"
                 ema20_dist_pct = ((close_val - ema20_val)/ema20_val) if np.isfinite(ema20_val) and ema20_val>0 and np.isfinite(close_val) else np.nan
             except Exception:
-                setup_type = ""
                 ema20_dist_pct = np.nan
             evaluations.append({
                 "date": d,
@@ -498,6 +685,13 @@ def run_backtest(
     entries_audit: List[dict] = []
     equity_curve: List[Tuple[pd.Timestamp, float]] = []
     trades: List[dict] = []
+    daily_metrics: List[dict] = []
+    limit_signals_count = 0
+    limit_expired_count = 0
+    # Fundamentals gating counters
+    earnings_block_market = 0
+    earnings_block_limit_skip = 0
+    earnings_block_scan = 0
     week_new_count: defaultdict[pd.Period, int] = defaultdict(int)
 
     def _current_total_risk() -> float:
@@ -533,7 +727,47 @@ def run_backtest(
         # 1) exits first
         for sym, pos in list(open_positions.items()):
             df = data.get(sym)
-            if df is None or day not in df.index:
+            if df is None:
+                continue
+            # If today's bar is missing, optionally trigger stale-data exit; otherwise skip processing for this symbol today
+            if day not in df.index:
+                if stale_enabled:
+                    try:
+                        prior = df.index[df.index <= day]
+                        if len(prior) > 0:
+                            last_day = prior[-1]
+                            if (day - last_day).days >= stale_max_days:
+                                c_last = float(df.at[last_day, "Close"])
+                                fill_px = c_last
+                                slip = (slip_bps / 10000.0) * fill_px
+                                fill_eff = fill_px - slip if pos.side == "long" else fill_px + slip
+                                commission = commission_ps * pos.qty
+                                cash += (pos.qty * fill_eff) if pos.side == "long" else (-pos.qty * fill_eff)
+                                cash -= commission
+                                pnl = (fill_eff - pos.entry_price) * pos.qty if pos.side == "long" else (pos.entry_price - fill_eff) * pos.qty
+                                trades.append({
+                                    "symbol": sym,
+                                    "side": pos.side,
+                                    "entry_date": pos.entry_date,
+                                    "entry_price": pos.entry_price,
+                                    "exit_date": last_day,
+                                    "exit_price": fill_eff,
+                                    "qty": pos.qty,
+                                    "pnl": pnl,
+                                    "r_multiple": pnl / (pos.per_share_risk * pos.qty) if pos.per_share_risk > 0 else np.nan,
+                                    "commission": commission,
+                                    "slippage_cost": slip * pos.qty,
+                                    "reason": "stale_data_exit",
+                                    "part": ("runner" if pos.scaled else "full"),
+                                    "bars_held": pos.bars_held,
+                                    "mfe_R": pos.max_favorable_R,
+                                    "position_id": pos.position_id,
+                                })
+                                del open_positions[sym]
+                                continue
+                    except Exception:
+                        pass
+                # no bar and no stale exit – skip other checks for this symbol today
                 continue
             o = float(df.at[day, "Open"]); h = float(df.at[day, "High"]); l = float(df.at[day, "Low"]); c = float(df.at[day, "Close"])
 
@@ -548,23 +782,21 @@ def run_backtest(
             except Exception:
                 pass
 
-            # Breakeven arming
-            if be_R > 0 and not pos.be_armed:
+            # Breakeven arming (safer): only after >= 1.0R; remove ratchet that pins stop at BE
+            if not pos.be_armed and pos.per_share_risk > 0:
+                arm_R = max(1.0, float(be_R)) if be_R > 0 else 1.0
                 if pos.side == "long":
-                    if h >= pos.entry_price + be_R * pos.per_share_risk and not (be_intrabar == "favor_stop" and l <= pos.stop):
+                    if h >= pos.entry_price + arm_R * pos.per_share_risk and not (be_intrabar == "favor_stop" and l <= pos.stop):
                         pos.stop = max(pos.stop, pos.entry_price); pos.be_armed = True
+                        if getattr(pos, "time_to_BE_bars", None) is None:
+                            pos.time_to_BE_bars = pos.bars_held + 1
+                            pos.be_armed_bar = day
                 else:
-                    if l <= pos.entry_price - be_R * pos.per_share_risk and not (be_intrabar == "favor_stop" and h >= pos.stop):
+                    if l <= pos.entry_price - arm_R * pos.per_share_risk and not (be_intrabar == "favor_stop" and h >= pos.stop):
                         pos.stop = min(pos.stop, pos.entry_price); pos.be_armed = True
-            # Adaptive breakeven ratchet: if armed but pullback deep and insufficient follow-through, keep stop at BE
-            if pos.be_armed and pos.per_share_risk > 0:
-                # measure max favorable R so far vs current price
-                if pos.side == "long":
-                    curr_R = (c - pos.entry_price) / pos.per_share_risk
-                else:
-                    curr_R = (pos.entry_price - c) / pos.per_share_risk
-                if pos.max_favorable_R < (be_R * 1.2) and curr_R < 0.2:
-                    pos.stop = pos.entry_price
+                        if getattr(pos, "time_to_BE_bars", None) is None:
+                            pos.time_to_BE_bars = pos.bars_held + 1
+                            pos.be_armed_bar = day
 
             # Gap fail-safe (evaluate at open before other exits if large adverse gap vs entry in R multiples)
             if gap_enabled and gap_R_multiple > 0 and pos.per_share_risk > 0:
@@ -587,11 +819,180 @@ def run_backtest(
                         "r_multiple": pnl / (pos.per_share_risk * pos.qty) if pos.per_share_risk > 0 else np.nan,
                         "commission": commission, "slippage_cost": 0.0, "reason": "gap_fail_safe",
                         "part": ("runner" if pos.scaled else "full"), "bars_held": pos.bars_held, "mfe_R": pos.max_favorable_R,
+                        "position_id": pos.position_id,
                     })
                     del open_positions[sym]
                     continue
 
             exit_reason = None; fill_px = None; target_hit = False
+
+            # Optional: stale data exit if no bar for too long
+            if exit_reason is None and stale_enabled:
+                try:
+                    # if today not present, find last bar and compute gap in days
+                    if day not in df.index:
+                        prior = df.index[df.index <= day]
+                        if len(prior) > 0:
+                            last_day = prior[-1]
+                            if (day - last_day).days >= stale_max_days:
+                                # exit at last available close
+                                c_last = float(df.at[last_day, "Close"])
+                                fill_px = c_last; exit_reason = "stale_data_exit"
+                    else:
+                        # last seen day is today; okay
+                        pass
+                except Exception:
+                    pass
+
+            # Evidence-based exit BEFORE stop/target checks
+            if exit_reason is None and evx_enabled:
+                # pre-1R no-progress budget
+                if pos.per_share_risk > 0 and pos.bars_held >= evx_pre1R_bars and pos.max_favorable_R < evx_pre1R_mfe:
+                    fill_px = c; exit_reason = "evidence_no_progress"
+                else:
+                    try:
+                        macd  = float(df.at[day, "MACD"]) if (day in df.index and "MACD" in df.columns) else np.nan
+                        macds = float(df.at[day, "MACDs"]) if (day in df.index and "MACDs" in df.columns) else np.nan
+                        # Respect configured stochastic mode for cycle evidence
+                        ccfg = (cfg.get("cycle", {}) or {})
+                        use_burns = str(ccfg.get("stoch_mode","")).lower() in {"burns","5_3_2","burns_5_3_2"}
+                        kcol = "SlowK_5_3_2" if (use_burns and "SlowK_5_3_2" in df.columns) else "SlowK"
+                        dcol = "SlowD_5_3_2" if (use_burns and "SlowD_5_3_2" in df.columns) else "SlowD"
+                        k = float(df.at[day, kcol]) if (day in df.index and kcol in df.columns) else np.nan
+                        d = float(df.at[day, dcol]) if (day in df.index and dcol in df.columns) else np.nan
+                        ema50_now = float(df.at[day, "EMA50"]) if (day in df.index and "EMA50" in df.columns) else np.nan
+                        ema20_now = float(df.at[day, "EMA20"]) if (day in df.index and "EMA20" in df.columns) else np.nan
+                    except Exception:
+                        macd = macds = k = d = ema50_now = ema20_now = np.nan
+
+                    # Setup-aware parameters
+                    params = _evx_params_for(getattr(pos, "setup_type", ""))
+
+                    # Buffered fail checks
+                    mom_fail_now = False
+                    cyc_fail_now = False
+                    val_fail_now = False
+                    if evx_mom_fail and np.isfinite(macd) and np.isfinite(macds):
+                        if params["mom_need_zero"]:
+                            if pos.side == "long":
+                                mom_fail_now = (macd < 0.0) and (macd < macds)
+                            else:
+                                mom_fail_now = (macd > 0.0) and (macd > macds)
+                        else:
+                            if pos.side == "long":
+                                mom_fail_now = (macd < 0.0) or (macd < macds)
+                            else:
+                                mom_fail_now = (macd > 0.0) or (macd > macds)
+                    if evx_cycle_fail and np.isfinite(k) and np.isfinite(d):
+                        if pos.side == "long":
+                            cyc_fail_now = (d - k) >= params["cyc_gap_min"] if params["cyc_gap_min"] > 0 else (k < d)
+                        else:
+                            cyc_fail_now = (k - d) >= params["cyc_gap_min"] if params["cyc_gap_min"] > 0 else (k > d)
+                    if evx_val_fail and np.isfinite(ema50_now):
+                        if pos.side == "long":
+                            thr_px = ema50_now * (1.0 - params["vz_buf_pct"]) if params["vz_buf_pct"] > 0 else ema50_now
+                            val_fail_now = c <= thr_px if params["vz_buf_pct"] > 0 else (c < ema50_now)
+                        else:
+                            thr_px = ema50_now * (1.0 + params["vz_buf_pct"]) if params["vz_buf_pct"] > 0 else ema50_now
+                            val_fail_now = c >= thr_px if params["vz_buf_pct"] > 0 else (c > ema50_now)
+
+                    # Initialize telemetry defaults (will persist through exit record)
+                    ev_w_now = 0.0
+                    ev_two_sum = 0.0
+                    ev_mom_streak = pos.mom_fail_streak
+                    ev_cyc_streak = pos.cycle_fail_streak
+                    ev_val_streak = pos.val_fail_streak
+
+                    # Grace period: skip evidence exits during initial bars
+                    within_grace = pos.bars_held < evx_min_hold_bars
+                    if not within_grace:
+                        # Update fail streaks
+                        pos.mom_fail_streak  = (pos.mom_fail_streak + 1) if mom_fail_now else 0
+                        pos.cycle_fail_streak= (pos.cycle_fail_streak + 1) if cyc_fail_now else 0
+                        pos.val_fail_streak  = (pos.val_fail_streak + 1) if val_fail_now else 0
+                        ev_mom_streak = pos.mom_fail_streak
+                        ev_cyc_streak = pos.cycle_fail_streak
+                        ev_val_streak = pos.val_fail_streak
+
+                        # Consecutive trigger
+                        consec_trigger = (
+                            (mom_fail_now and pos.mom_fail_streak  >= params["mom_consec"]) or
+                            (cyc_fail_now and pos.cycle_fail_streak>= params["cyc_consec"]) or
+                            (val_fail_now and pos.val_fail_streak  >= params["val_consec"])
+                        )
+
+                        # Weighted trigger
+                        ev_w_now = (
+                            (params["w_mom"] if mom_fail_now else 0.0) +
+                            (params["w_cyc"] if cyc_fail_now else 0.0) +
+                            (params["w_val"] if val_fail_now else 0.0)
+                        )
+                        prev_ok = (pos.prev_evidence_date is not None and pos.prev_evidence_date == (day - pd.tseries.offsets.BDay(1)))
+                        ev_two_sum = ev_w_now + (pos.prev_evidence_weight if prev_ok else 0.0)
+                        weighted_trigger = (ev_w_now >= params["thr_single"]) or (ev_two_sum >= params["thr_two"])
+
+                        if consec_trigger or weighted_trigger:
+                            fill_px = c
+                            if consec_trigger:
+                                exit_reason = "evidence_consecutive"
+                            else:
+                                # weighted trigger
+                                fails = [("momentum", mom_fail_now), ("cycle", cyc_fail_now), ("value_zone", val_fail_now)]
+                                fail_names = [name for name, ok in fails if ok]
+                                # If exactly one component failed and single-bar threshold met, preserve legacy reason name
+                                if (len(fail_names) == 1) and (ev_w_now >= params["thr_single"]):
+                                    only = fail_names[0]
+                                    if only == "momentum":
+                                        exit_reason = "evidence_momentum_fail"
+                                    elif only == "cycle":
+                                        exit_reason = "evidence_cycle_fail"
+                                    else:
+                                        exit_reason = "evidence_value_zone_fail"
+                                else:
+                                    exit_reason = "evidence_weighted"
+
+                    # Save rolling evidence state for 2-bar test
+                    pos.prev_evidence_weight = float(ev_w_now)
+                    pos.prev_evidence_date = day
+
+                    # Optional intraday recovery veto
+                    if exit_reason is not None:
+                        idr_cfg = (evx_cfg.get("intraday_recovery") or {})
+                        if bool(idr_cfg.get("enabled", False)):
+                            look_m = int(idr_cfg.get("minutes", 60))
+                            reclaim_line = str(idr_cfg.get("require_reclaim", "EMA20")).upper()
+                            reclaim_level = None
+                            if reclaim_line == "EMA20" and np.isfinite(ema20_now):
+                                reclaim_level = ema20_now
+                            elif reclaim_line == "EMA50" and np.isfinite(ema50_now):
+                                reclaim_level = ema50_now
+                            if reclaim_level is not None:
+                                if _intraday_recover_check(sym, day, reclaim_level, look_m):
+                                    exit_reason = None
+                                    fill_px = None
+            # Pre-earnings exit at close: sell the last trading day before an earnings date
+            if exit_reason is None and fund_ctx is not None:
+                try:
+                    fcfg_local = (cfg.get("fundamentals", {}) or {})
+                    if bool(fcfg_local.get("exit_before_earnings", False)):
+                        cal_map = (fund_ctx.get("earnings_calendar", {}) or {})
+                        e_dates = cal_map.get(sym, []) or []
+                        if e_dates:
+                            # find next trading day in the global backtest calendar
+                            try:
+                                cal_idx = calendar.index(day)
+                                next_trading = calendar[cal_idx + 1] if cal_idx + 1 < len(calendar) else None
+                            except Exception:
+                                next_trading = None
+                            if next_trading is not None:
+                                today_d = pd.to_datetime(day).date()
+                                next_d  = pd.to_datetime(next_trading).date()
+                                # If an earnings date falls between (today, next_trading] → exit today at close
+                                if any((today_d < ed <= next_d) for ed in e_dates):
+                                    fill_px = c
+                                    exit_reason = "pre_earnings"
+                except Exception:
+                    pass
             if pos.side == "long":
                 if l <= pos.stop:
                     fill_px = _gap_exit_price("long", o, pos.stop); exit_reason = "stop"
@@ -662,6 +1063,10 @@ def run_backtest(
                 if pos.per_share_risk > 0:
                     fav = (h - pos.entry_price) / pos.per_share_risk if pos.side == "long" else (pos.entry_price - l) / pos.per_share_risk
                     pos.max_favorable_R = max(pos.max_favorable_R, fav)
+                    if getattr(pos, "time_to_1R_bars", None) is None:
+                        intraday_R = ((h - pos.entry_price) / pos.per_share_risk) if pos.side == "long" else ((pos.entry_price - l) / pos.per_share_risk)
+                        if intraday_R >= 1.0:
+                            pos.time_to_1R_bars = pos.bars_held
                     # update MAE_R (adverse excursion)
                     adverse = (pos.entry_price - l)/pos.per_share_risk if pos.side=="long" else (h - pos.entry_price)/pos.per_share_risk
                     if adverse > pos.mae_R:
@@ -685,6 +1090,21 @@ def run_backtest(
                 if ts_enabled and ts_bars > 0 and ts_min_R > 0 and pos.bars_held >= ts_bars and pos.max_favorable_R < ts_min_R:
                     fill_px = c; exit_reason = "time_stop"
 
+            # Post-1R trailing to EMA20 (optional)
+            if exit_reason is None and trail_enabled and pos.per_share_risk > 0 and (day in df.index):
+                reached_R = ((h - pos.entry_price) / pos.per_share_risk) if pos.side == "long" else ((pos.entry_price - l) / pos.per_share_risk)
+                if reached_R >= trail_start_R and "EMA20" in df.columns:
+                    try:
+                        ema20_now = float(df.at[day, "EMA20"]) if np.isfinite(df.at[day, "EMA20"]) else np.nan
+                    except Exception:
+                        ema20_now = np.nan
+                    if np.isfinite(ema20_now):
+                        if pos.side == "long":
+                            pos.stop = max(pos.stop, round(ema20_now, 2))
+                        else:
+                            pos.stop = min(pos.stop, round(ema20_now, 2))
+                        if getattr(pos, "trail_active_bar", None) is None:
+                            pos.trail_active_bar = day
             if exit_reason:
                 slip = (slip_bps/10000.0)*fill_px
                 fill_eff = fill_px - slip if pos.side == "long" else fill_px + slip
@@ -707,6 +1127,40 @@ def run_backtest(
                     "signal_rvol": pos.signal_rvol,
                     "pivot_dist_pct": pos.pivot_dist_pct,
                     "ema20_dist_pct": pos.ema20_dist_pct,
+                    "evidence_w_now": float(locals().get("ev_w_now", 0.0)),
+                    "evidence_two_bar": float(locals().get("ev_two_sum", 0.0)),
+                    "mom_fail_now": bool(locals().get("mom_fail_now", False)),
+                    "cyc_fail_now": bool(locals().get("cyc_fail_now", False)),
+                    "val_fail_now": bool(locals().get("val_fail_now", False)),
+                    "mom_streak": int(getattr(pos, "mom_fail_streak", 0)),
+                    "cyc_streak": int(getattr(pos, "cycle_fail_streak", 0)),
+                    "val_streak": int(getattr(pos, "val_fail_streak", 0)),
+                    # Entry diagnostics persisted
+                    "entry_setup_type": getattr(pos, "entry_setup_type", pos.setup_type),
+                    "entry_adx14": getattr(pos, "entry_adx14", np.nan),
+                    "entry_rvol20": getattr(pos, "entry_rvol20", np.nan),
+                    "entry_ema20_dist_pct": getattr(pos, "entry_ema20_dist_pct", np.nan),
+                    "entry_pivot_dist_pct": getattr(pos, "entry_pivot_dist_pct", np.nan),
+                    "entry_atr_pct": getattr(pos, "entry_atr_pct", np.nan),
+                    "entry_mtf_state": getattr(pos, "entry_mtf_state", ""),
+                    "qty_cap_reason": getattr(pos, "qty_cap_reason", "full_size"),
+                    "order_type": getattr(pos, "order_type", "market"),
+                    "days_to_fill": getattr(pos, "days_to_fill", np.nan),
+                    # Lifecycle timers
+                    "time_to_BE_bars": getattr(pos, "time_to_BE_bars", None),
+                    "time_to_1R_bars": getattr(pos, "time_to_1R_bars", None),
+                    "be_armed_bar": getattr(pos, "be_armed_bar", None),
+                    "trail_active_bar": getattr(pos, "trail_active_bar", None),
+                    # Evidence exit snapshot (filled for evidence exits, NaN/default otherwise)
+                    "exit_macd": float(locals().get("macd", np.nan)),
+                    "exit_macds": float(locals().get("macds", np.nan)),
+                    "exit_slowk": float(locals().get("k", np.nan)),
+                    "exit_slowd": float(locals().get("d", np.nan)),
+                    "exit_ema50": float(locals().get("ema50_now", np.nan)),
+                    "exit_close": float(locals().get("c", np.nan)),
+                    "evidence_mom_fail": int(bool(locals().get("mom_fail_now", False))),
+                    "evidence_cycle_fail": int(bool(locals().get("cyc_fail_now", False))),
+                    "evidence_value_fail": int(bool(locals().get("val_fail_now", False))),
                     "position_id": pos.position_id,
                 })
                 del open_positions[sym]
@@ -720,12 +1174,45 @@ def run_backtest(
             if df is None or day not in df.index:
                 pending_markets.remove(pend)
                 continue
+            # Skip if this symbol is already open (avoid overwriting an existing position)
+            if pend.symbol in open_positions:
+                pending_markets.remove(pend)
+                continue
             if len(open_positions) >= max_open or (_current_total_risk() >= max_risk_pct):
                 pending_markets.remove(pend)
                 continue
             wk = _week_key(day)
             if max_new_week > 0 and week_new_count[wk] >= max_new_week:
                 pending_markets.remove(pend)
+                continue
+            # Fill-time MTF alignment gate: enforce higher-timeframe harmony without double-penalizing in scoring
+            mtf_rt_cfg = (cfg.get("trading", {}).get("mtf") or {})
+            # accept filter_at_fill from either trading.mtf.filter_at_fill or trading.filter_at_fill
+            filter_at_fill = bool(mtf_rt_cfg.get("filter_at_fill", (cfg.get("trading", {}) or {}).get("filter_at_fill", False)))
+            if filter_at_fill:
+                try:
+                    idx_fill = df.index.get_loc(day)
+                    sl_fill = df.iloc[: idx_fill + 1]
+                    wctx_fill = _wcache.get((pend.symbol, idx_fill))
+                    if wctx_fill is None:
+                        wctx_fill = weekly_context(sl_fill)
+                        _wcache[(pend.symbol, idx_fill)] = wctx_fill
+                    mtf_ok_fill, _ = _mtf_ok_for_slice(sl_fill, cfg, pend.direction, weekly_ctx=wctx_fill)
+                except Exception:
+                    mtf_ok_fill = True  # fail-open if anything unexpected
+                if not mtf_ok_fill:
+                    pending_markets.remove(pend)
+                    continue
+            # Fill-time fundamentals earnings blackout (no network; uses prefetched context)
+            try:
+                f_ok, _f_reason = fundamentals_pass_at_fill(pend.symbol, pd.to_datetime(day).date(), cfg, fund_ctx)
+            except Exception:
+                # fail-open if anything unexpected
+                f_ok = True; _f_reason = "fail_open_error"
+            if not f_ok:
+                # cancel this market entry; do not reschedule
+                pending_markets.remove(pend)
+                earnings_block_market += 1
                 continue
             o = float(df.at[day, "Open"])
             slip = (slip_bps / 10000.0) * o
@@ -780,12 +1267,24 @@ def run_backtest(
             cfg_day = copy.deepcopy(cfg)
             cfg_day["risk"]["use_broker_equity"] = False
             cfg_day["risk"]["account_equity"] = float(equity)
-            qty = rm_size_position(cfg_day, entry_px, stop)
-            qty = min(qty, _qty_bp_cap(entry_px, cash, bp_multiple))
+            # Compute cap reasons
+            psr = abs(entry_px - stop)
+            try:
+                risk_dollars = float(cfg_day.get("risk", {}).get("risk_per_trade_pct", 0.0)) * float(equity)
+                base_qty = int(math.floor(risk_dollars / max(psr, 1e-12))) if risk_dollars > 0 else 0
+            except Exception:
+                base_qty = 0
+            qty_mgr = rm_size_position(cfg_day, entry_px, stop)
+            qty_bp = _qty_bp_cap(entry_px, cash, bp_multiple)
+            qty = min(qty_mgr, qty_bp)
+            cap_reason = "full_size"
+            if qty_mgr < base_qty:
+                cap_reason = "risk_cap"
+            elif qty < qty_mgr:
+                cap_reason = "bp_cap"
             if qty <= 0:
                 pending_markets.remove(pend)
                 continue
-            psr = abs(entry_px - stop)
             new_total = (_current_total_risk() * max(equity, 1e-9) + psr * qty) / max(equity, 1e-9)
             if new_total > max_risk_pct:
                 pending_markets.remove(pend)
@@ -801,6 +1300,28 @@ def run_backtest(
             pos_created.target_R_at_entry = (abs(pos_created.target - pos_created.entry_price) / pos_created.per_share_risk) if pos_created.per_share_risk > 0 else np.nan
             # Phase0: placeholder setup metadata (market entries treat as 'breakout')
             pos_created.setup_type = getattr(pend, "setup_type", "breakout")
+            # Entry diagnostics
+            pos_created.entry_setup_type = pos_created.setup_type
+            try:
+                pos_created.entry_adx14 = float(df.at[day, "ADX14"]) if "ADX14" in df.columns else float("nan")
+            except Exception:
+                pos_created.entry_adx14 = float("nan")
+            pos_created.entry_rvol20 = _compute_rvol20(df, day)
+            pos_created.entry_ema20_dist_pct = getattr(pos_created, "ema20_dist_pct", float("nan"))
+            pos_created.entry_pivot_dist_pct = getattr(pos_created, "pivot_dist_pct", float("nan"))
+            pos_created.entry_atr_pct = getattr(pos_created, "atr_pct_entry", float("nan"))
+            # MTF state at fill
+            try:
+                idx_fill = df.index.get_loc(day)
+                wctx_fill = _wcache.get((pend.symbol, idx_fill))
+                if wctx_fill is None:
+                    wctx_fill = weekly_context(df.iloc[: idx_fill + 1])
+                    _wcache[(pend.symbol, idx_fill)] = wctx_fill
+                pos_created.entry_mtf_state = _derive_mtf_state_from_ctx(wctx_fill)
+            except Exception:
+                pos_created.entry_mtf_state = ""
+            pos_created.qty_cap_reason = cap_reason
+            pos_created.order_type = "market"
             entries_audit.append({
                 "position_id": pos_created.position_id,
                 "symbol": pend.symbol,
@@ -809,6 +1330,7 @@ def run_backtest(
                 "qty": qty,
                 "entry_commission": commission,
                 "entry_cash_flow": ((-qty * entry_px) if pend.direction == "long" else (qty * entry_px)) - commission,
+                "order_type": "market",
             })
             # same day exit check
             h = float(df.at[day, "High"])
@@ -856,6 +1378,22 @@ def run_backtest(
                     "atr_pct_entry": float(pend.atr / pos.entry_price) if pos.entry_price > 0 else np.nan,
                     "target_R_at_entry": (abs(pos.target - pos.entry_price) / pos.per_share_risk) if pos.per_share_risk > 0 else np.nan,
                     "adaptive_shrunk": False,
+                    # Entry diag copy
+                    "entry_setup_type": getattr(pos, "entry_setup_type", pos.setup_type),
+                    "entry_adx14": getattr(pos, "entry_adx14", np.nan),
+                    "entry_rvol20": getattr(pos, "entry_rvol20", np.nan),
+                    "entry_ema20_dist_pct": getattr(pos, "entry_ema20_dist_pct", np.nan),
+                    "entry_pivot_dist_pct": getattr(pos, "entry_pivot_dist_pct", np.nan),
+                    "entry_atr_pct": getattr(pos, "entry_atr_pct", np.nan),
+                    "entry_mtf_state": getattr(pos, "entry_mtf_state", ""),
+                    "qty_cap_reason": getattr(pos, "qty_cap_reason", "full_size"),
+                    "order_type": getattr(pos, "order_type", "market"),
+                    "days_to_fill": getattr(pos, "days_to_fill", np.nan),
+                    # Lifecycle
+                    "time_to_BE_bars": getattr(pos, "time_to_BE_bars", None),
+                    "time_to_1R_bars": getattr(pos, "time_to_1R_bars", None),
+                    "be_armed_bar": getattr(pos, "be_armed_bar", None),
+                    "trail_active_bar": getattr(pos, "trail_active_bar", None),
                     "position_id": pos.position_id,
                 })
                 del open_positions[pend.symbol]
@@ -892,9 +1430,14 @@ def run_backtest(
             df = data.get(pend.symbol)
             if df is None or day not in df.index:
                 continue
+            # Skip if symbol already has an open position (avoid duplicate entries)
+            if pend.symbol in open_positions:
+                pending_limits.remove(pend)
+                continue
             if day < pend.signal_date or day > pend.expires:
                 if day > pend.expires:
                     pending_limits.remove(pend)
+                    limit_expired_count += 1
                 continue
             o = float(df.at[day, "Open"])
             h = float(df.at[day, "High"])
@@ -903,7 +1446,66 @@ def run_backtest(
             if not hit:
                 if day == pend.expires:
                     pending_limits.remove(pend)
+                    limit_expired_count += 1
                 continue
+            # Fill-time MTF alignment gate: only applied when the limit is actually hit today.
+            # If mismatched, skip filling today but keep the pending order until expiry.
+            mtf_rt_cfg = (cfg.get("trading", {}).get("mtf") or {})
+            filter_at_fill = bool(mtf_rt_cfg.get("filter_at_fill", (cfg.get("trading", {}) or {}).get("filter_at_fill", False)))
+            if filter_at_fill:
+                try:
+                    idx_fill = df.index.get_loc(day)
+                    sl_fill = df.iloc[: idx_fill + 1]
+                    wctx_fill = _wcache.get((pend.symbol, idx_fill))
+                    if wctx_fill is None:
+                        wctx_fill = weekly_context(sl_fill)
+                        _wcache[(pend.symbol, idx_fill)] = wctx_fill
+                    mtf_ok_fill, _ = _mtf_ok_for_slice(sl_fill, cfg, pend.direction, weekly_ctx=wctx_fill)
+                except Exception:
+                    mtf_ok_fill = True
+                if not mtf_ok_fill:
+                    # skip fill today; keep pending for future bars within horizon
+                    continue
+            # Fill-time fundamentals earnings blackout (no network; uses prefetched context)
+            try:
+                f_ok, _f_reason = fundamentals_pass_at_fill(pend.symbol, pd.to_datetime(day).date(), cfg, fund_ctx)
+            except Exception:
+                f_ok = True; _f_reason = "fail_open_error"
+            if not f_ok:
+                # blocked today; keep pending for future bars within horizon
+                earnings_block_limit_skip += 1
+                continue
+            # Fill-time core revalidation (require N-of-5 core energies at fill); default enabled
+            try:
+                core_fill_cfg = (cfg.get("trading", {}).get("core_at_fill") or {})
+                core_check_enabled = bool(core_fill_cfg.get("enabled", True))
+            except Exception:
+                core_fill_cfg = {}; core_check_enabled = True
+            if core_check_enabled:
+                try:
+                    idx_fill = df.index.get_loc(day)
+                    sl_fill = df.iloc[: idx_fill + 1]
+                    # ensure weekly ctx for the slice so Scale energy is valid
+                    wctx_fill = _wcache.get((pend.symbol, idx_fill))
+                    if wctx_fill is None:
+                        wctx_fill = weekly_context(sl_fill)
+                        _wcache[(pend.symbol, idx_fill)] = wctx_fill
+                    eng_fill = evaluate_five_energies(sl_fill, cfg, weekly_ctx=wctx_fill) or {}
+                    core_count_fill = int(eng_fill.get("core_pass_count", int(eng_fill.get("score", 0))))
+                    core_min_fill = int(core_fill_cfg.get(
+                        "min_core_energies",
+                        (cfg.get("trading", {}) or {}).get("min_core_energies", (cfg.get("trading", {}) or {}).get("min_score", 4))
+                    ))
+                    if bool(core_fill_cfg.get("require_same_direction", True)):
+                        dir_ok = (str(eng_fill.get("direction", "")) == pend.direction)
+                    else:
+                        dir_ok = True
+                    if (not dir_ok) or (core_count_fill < core_min_fill):
+                        # skip fill today; keep pending for future bars within horizon
+                        continue
+                except Exception:
+                    # Fail-open on unexpected errors to avoid blocking fills due to evaluator issues
+                    pass
             if len(open_positions) >= max_open or (_current_total_risk() >= max_risk_pct):
                 continue
             wk = _week_key(day)
@@ -912,9 +1514,6 @@ def run_backtest(
             cfg_day = copy.deepcopy(cfg)
             cfg_day["risk"]["use_broker_equity"] = False
             cfg_day["risk"]["account_equity"] = float(equity)
-            cfg_day = copy.deepcopy(cfg)
-            cfg_day["risk"]["use_broker_equity"] = False
-            cfg_day["risk"]["account_equity"] = float(cash)
             raw_entry = min(o, pend.limit_px) if pend.direction == "long" else max(o, pend.limit_px)
             slip = (slip_bps / 10000.0) * raw_entry
             entry_px = raw_entry + slip if pend.direction == "long" else raw_entry - slip
@@ -962,16 +1561,27 @@ def run_backtest(
             stop, target = _enforce_floor(pend.direction, entry_px, stop, target)
             if target <= 0:
                 continue
-            qty = rm_size_position(cfg_day, entry_px, stop)
-            qty = min(qty, _qty_bp_cap(entry_px, equity, bp_multiple))
-            qty = rm_size_position(cfg_day, entry_px, stop)
-            qty = min(qty, _qty_bp_cap(entry_px, cash, bp_multiple))
+            qty_mgr = rm_size_position(cfg_day, entry_px, stop)
+            # Cap by available cash buying power only
+            qty_bp = _qty_bp_cap(entry_px, cash, bp_multiple)
+            qty = min(qty_mgr, qty_bp)
             if qty <= 0:
                 continue
             psr = abs(entry_px - stop)
             new_total = (_current_total_risk() * max(equity, 1e-9) + psr * qty) / max(equity, 1e-9)
             if new_total > max_risk_pct:
                 continue
+            # Derive cap reason (risk vs BP)
+            try:
+                risk_dollars = float(cfg_day.get("risk", {}).get("risk_per_trade_pct", 0.0)) * float(equity)
+                base_qty = int(math.floor(risk_dollars / max(psr, 1e-12))) if risk_dollars > 0 else 0
+            except Exception:
+                base_qty = 0
+            cap_reason = "full_size"
+            if qty_mgr < base_qty:
+                cap_reason = "risk_cap"
+            elif qty < qty_mgr:
+                cap_reason = "bp_cap"
             commission = commission_ps * qty
             cash += (-qty * entry_px) if pend.direction == "long" else (qty * entry_px)
             cash -= commission
@@ -985,6 +1595,7 @@ def run_backtest(
                 "qty": qty,
                 "entry_commission": commission,
                 "entry_cash_flow": ((-qty * entry_px) if pend.direction == "long" else (qty * entry_px)) - commission,
+                "order_type": "limit",
             })
             week_new_count[wk] += 1
             pending_limits.remove(pend)
@@ -993,6 +1604,33 @@ def run_backtest(
             pos_created.target_R_at_entry = (abs(pos_created.target - pos_created.entry_price) / pos_created.per_share_risk) if pos_created.per_share_risk > 0 else np.nan
             # Limit retrace assumed pullback setup
             pos_created.setup_type = getattr(pend, "setup_type", "pullback")
+            pos_created.qty_cap_reason = cap_reason
+            # Entry diagnostics
+            pos_created.entry_setup_type = pos_created.setup_type
+            try:
+                pos_created.entry_adx14 = float(df.at[day, "ADX14"]) if "ADX14" in df.columns else float("nan")
+            except Exception:
+                pos_created.entry_adx14 = float("nan")
+            pos_created.entry_rvol20 = _compute_rvol20(df, day)
+            pos_created.entry_ema20_dist_pct = getattr(pos_created, "ema20_dist_pct", float("nan"))
+            pos_created.entry_pivot_dist_pct = getattr(pos_created, "pivot_dist_pct", float("nan"))
+            pos_created.entry_atr_pct = getattr(pos_created, "atr_pct_entry", float("nan"))
+            # MTF state at fill
+            try:
+                idx_fill = df.index.get_loc(day)
+                wctx_fill = _wcache.get((pend.symbol, idx_fill))
+                if wctx_fill is None:
+                    wctx_fill = weekly_context(df.iloc[: idx_fill + 1])
+                    _wcache[(pend.symbol, idx_fill)] = wctx_fill
+                pos_created.entry_mtf_state = _derive_mtf_state_from_ctx(wctx_fill)
+            except Exception:
+                pos_created.entry_mtf_state = ""
+            # days to fill for limit (0 if same day)
+            try:
+                pos_created.days_to_fill = float((day - pend.signal_date).days)
+            except Exception:
+                pos_created.days_to_fill = float("nan")
+            pos_created.order_type = "limit"
             pos = open_positions[pend.symbol]
             exit_reason = None
             fill_px = None
@@ -1036,6 +1674,22 @@ def run_backtest(
                     "atr_pct_entry": float(pend.atr / pos.entry_price) if pos.entry_price > 0 else np.nan,
                     "target_R_at_entry": (abs(pos.target - pos.entry_price) / pos.per_share_risk) if pos.per_share_risk > 0 else np.nan,
                     "adaptive_shrunk": False,
+                    # Entry diag copy
+                    "entry_setup_type": getattr(pos, "entry_setup_type", pos.setup_type),
+                    "entry_adx14": getattr(pos, "entry_adx14", np.nan),
+                    "entry_rvol20": getattr(pos, "entry_rvol20", np.nan),
+                    "entry_ema20_dist_pct": getattr(pos, "entry_ema20_dist_pct", np.nan),
+                    "entry_pivot_dist_pct": getattr(pos, "entry_pivot_dist_pct", np.nan),
+                    "entry_atr_pct": getattr(pos, "entry_atr_pct", np.nan),
+                    "entry_mtf_state": getattr(pos, "entry_mtf_state", ""),
+                    "qty_cap_reason": getattr(pos, "qty_cap_reason", "full_size"),
+                    "order_type": getattr(pos, "order_type", "limit"),
+                    "days_to_fill": getattr(pos, "days_to_fill", np.nan),
+                    # Lifecycle
+                    "time_to_BE_bars": getattr(pos, "time_to_BE_bars", None),
+                    "time_to_1R_bars": getattr(pos, "time_to_1R_bars", None),
+                    "be_armed_bar": getattr(pos, "be_armed_bar", None),
+                    "trail_active_bar": getattr(pos, "trail_active_bar", None),
                     "position_id": pos.position_id,
                 })
                 del open_positions[pend.symbol]
@@ -1116,17 +1770,40 @@ def run_backtest(
                         ema20_dist_pct=float(sig.get("ema20_dist_pct", np.nan)),
                     )
                 )
+                limit_signals_count += 1
 
         # 4) mark-to-market (once per day)
         mv = 0.0
         for sym, pos in open_positions.items():
             df = data.get(sym)
-            if df is None or day not in df.index:
+            if df is None:
                 continue
-            mv += pos.market_value(float(df.at[day, "Close"]))
+            if day in df.index:
+                px = float(df.at[day, "Close"]) if np.isfinite(df.at[day, "Close"]) else np.nan
+            else:
+                # fallback to last available close <= day to avoid zeroing MV on missing bars
+                prior = df.index[df.index <= day]
+                if len(prior) > 0:
+                    ld = prior[-1]
+                    px = float(df.at[ld, "Close"]) if np.isfinite(df.at[ld, "Close"]) else np.nan
+                else:
+                    px = np.nan
+            if np.isfinite(px):
+                mv += pos.market_value(px)
         equity_today = cash + mv
         equity_curve.append((day, equity_today))
         equity = float(equity_today)
+        # Daily metrics snapshot
+        try:
+            daily_metrics.append({
+                "date": day,
+                "equity": equity_today,
+                "open_positions_count": int(len(open_positions)),
+                "risk_utilization_pct": float(_current_total_risk()),
+                "cash": float(cash),
+            })
+        except Exception:
+            pass
 
         # 5) force-close at end (once per day if final day)
         if force_close_on_end and (day == calendar[-1]) and open_positions:
@@ -1228,7 +1905,8 @@ def run_backtest(
     if not entries_df.empty and not trades_df.empty and "position_id" in trades_df.columns:
         exit_qty = trades_df.groupby("position_id")["qty"].sum().rename("exit_qty")
         audit_qty = entries_df.set_index("position_id").join(exit_qty, how="left")
-        audit_qty["exit_qty"].fillna(0, inplace=True)
+        # Avoid chained-assignment; assign the filled series back to the DataFrame
+        audit_qty["exit_qty"] = audit_qty["exit_qty"].fillna(0)
         audit_qty["qty_diff"] = audit_qty["qty"] - audit_qty["exit_qty"]
         unmatched_positions = audit_qty[audit_qty["qty_diff"] != 0]
     else:
@@ -1290,23 +1968,79 @@ def run_backtest(
         entry_cash_flow_sum = exit_cash_flow_sum = cash_end_reconstructed = recon_residual_cashflow = 0.0
         unrealized_pnl = 0.0
 
+    # ---- Drawdown forensics: top episodes with attribution ----
+    def _drawdown_episodes(eq: pd.Series, top_n: int = 3):
+        if eq.empty:
+            return []
+        peak = eq.cummax()
+        dd = (eq / peak) - 1.0
+        troughs = dd.nsmallest(min(len(dd), top_n * 5))
+        episodes = []
+        used: List[pd.Timestamp] = []
+        for tr_idx, depth in troughs.items():
+            if any(abs((tr_idx - u).days) <= 5 for u in used):
+                continue
+            prior = eq.loc[:tr_idx]
+            pk_val = float(prior.cummax().iloc[-1])
+            pk_idx = prior[prior == pk_val].index[-1]
+            after = eq.loc[tr_idx:]
+            rc_idx = after[after >= pk_val].index.min() if (after >= pk_val).any() else after.index[-1]
+            episodes.append((pk_idx, tr_idx, rc_idx, float(depth)))
+            used.append(tr_idx)
+            if len(episodes) >= top_n:
+                break
+        return episodes
+
+    dd_eps = _drawdown_episodes(eq_df["equity"] if not eq_df.empty else pd.Series(dtype=float), top_n=3)
+    dd_rows = []
+    if not trades_df.empty:
+        if "exit_date" in trades_df.columns:
+            trades_df["exit_date"] = pd.to_datetime(trades_df["exit_date"], errors="coerce")
+    for (pk, tr, rc, depth) in dd_eps:
+        if not trades_df.empty and "exit_date" in trades_df.columns:
+            seg_trades = trades_df[(trades_df["exit_date"] > pk) & (trades_df["exit_date"] <= rc)]
+        else:
+            seg_trades = pd.DataFrame()
+        gross_loss_seg = float(seg_trades.loc[seg_trades["pnl"] < 0, "pnl"].sum()) if (not seg_trades.empty and "pnl" in seg_trades.columns) else 0.0
+        worst = seg_trades.nsmallest(1, "pnl") if (not seg_trades.empty and "pnl" in seg_trades.columns) else pd.DataFrame()
+        worst_sym = worst["symbol"].iloc[0] if not worst.empty and "symbol" in worst.columns else ""
+        worst_reason = worst["reason"].iloc[0] if not worst.empty and "reason" in worst.columns else ""
+        dd_rows.append({
+            "peak_date": pk, "trough_date": tr, "recovery_date": rc,
+            "depth_pct": depth, "gross_loss": gross_loss_seg,
+            "worst_symbol": worst_sym, "worst_reason": worst_reason,
+            "trades_in_window": int(len(seg_trades))
+        })
+    dd_df = pd.DataFrame(dd_rows)
+    if not dd_df.empty:
+        if log_drawdowns_csv:
+            dd_path = today_filename("backtest_drawdowns", unique=True)
+            log_dataframe(dd_df, dd_path)
+        if print_rollups:
+            print("\nTop drawdowns:")
+            print(dd_df.assign(depth_pct=lambda d: (d["depth_pct"] * 100).round(2)).to_string(index=False))
+
     # write CSVs
     eval_df = pd.DataFrame(evaluations)
     # Use unique timestamped filenames to avoid cross-run contamination
     eval_path = today_filename("backtest_evaluations", unique=True)
-    if not eval_df.empty:
+    if log_eval_csv and not eval_df.empty:
         eval_df = eval_df.sort_values(["date", "symbol"])
         log_dataframe(eval_df, eval_path)
 
     trades_path = today_filename("backtest_trades", unique=True)
     equity_path = today_filename("backtest_equity", unique=True)
+    daily_metrics_path = today_filename("backtest_daily_metrics", unique=True)
     if not trades_df.empty:
         log_dataframe(trades_df, trades_path, overwrite=True)
     log_dataframe(eq_df.reset_index(), equity_path, overwrite=True)
+    if log_daily_csv and len(daily_metrics) > 0:
+        log_dataframe(pd.DataFrame(daily_metrics), daily_metrics_path, overwrite=True)
 
     # ---- Additional diagnostics ----
     exit_reason_counts = trades_df["reason"].value_counts().to_dict() if not trades_df.empty else {}
     scale_out_count = int(exit_reason_counts.get("scale_out", 0))
+    pre_earnings_exits = int(exit_reason_counts.get("pre_earnings", 0))
     runner_exits = trades_df[trades_df["part"] == "runner"] if not trades_df.empty and "part" in trades_df.columns else pd.DataFrame()
     runner_target_wins = int(len(runner_exits[runner_exits["reason"].isin(["target","force_end"]) & (runner_exits["pnl"]>0)])) if not runner_exits.empty else 0
     time_stop_exits = int(exit_reason_counts.get("time_stop", 0))
@@ -1315,6 +2049,59 @@ def run_backtest(
     median_bars_held = float(trades_df["bars_held"].median()) if (not trades_df.empty and "bars_held" in trades_df.columns) else 0.0
     median_mfe_R_wins = float(trades_df.loc[trades_df["pnl"]>0, "mfe_R"].median()) if (not trades_df.empty and "mfe_R" in trades_df.columns and len(trades_df[trades_df["pnl"]>0])>0) else 0.0
     median_mfe_R_losses = float(trades_df.loc[trades_df["pnl"]<=0, "mfe_R"].median()) if (not trades_df.empty and "mfe_R" in trades_df.columns and len(trades_df[trades_df["pnl"]<=0])>0) else 0.0
+
+    # Pending/fill diagnostics
+    limit_filled = int(entries_df[entries_df.get("order_type","market") == "limit"].shape[0]) if not entries_df.empty else 0
+    market_fills = int(entries_df[entries_df.get("order_type","market") == "market"].shape[0]) if not entries_df.empty else 0
+    avg_days_to_fill = float(trades_df["days_to_fill"].mean(skipna=True)) if (not trades_df.empty and "days_to_fill" in trades_df.columns) else float("nan")
+
+    # Rollups
+    def _safe_rate(n, d):
+        return float(n / d) if d else 0.0
+    same_day_exit_rate = _safe_rate(int(trades_df[trades_df["reason"].isin(["stop_same_day","target_same_day"])].shape[0]) if not trades_df.empty else 0, int(len(trades_df)))
+    one_bar_exit_rate = _safe_rate(int(trades_df[trades_df.get("bars_held", 0) <= 1].shape[0]) if not trades_df.empty else 0, int(len(trades_df)))
+    # Buckets
+    def _bucket_adx(x):
+        try:
+            if not np.isfinite(x):
+                return "nan"
+            if x < 18: return "<18"
+            if x < 25: return "18-25"
+            return ">=25"
+        except Exception:
+            return "nan"
+    def _bucket_atr_pct(x):
+        try:
+            if not np.isfinite(x):
+                return "nan"
+            if x < 0.01: return "<1%"
+            if x < 0.015: return "1-1.5%"
+            return ">=1.5%"
+        except Exception:
+            return "nan"
+
+    if not trades_df.empty:
+        roll = {}
+        # by exit reason
+        roll["by_exit_reason"] = trades_df.groupby("reason")["pnl"].agg(["count","sum"]).reset_index().to_dict(orient="records")
+        # by entry setup
+        if "entry_setup_type" in trades_df.columns:
+            roll["by_setup"] = trades_df.groupby("entry_setup_type")["pnl"].agg(["count","sum"]).reset_index().to_dict(orient="records")
+        # by MTF state
+        if "entry_mtf_state" in trades_df.columns:
+            roll["by_mtf"] = trades_df.groupby("entry_mtf_state")["pnl"].agg(["count","sum"]).reset_index().to_dict(orient="records")
+        # by ADX bucket (use entry_adx14)
+        if "entry_adx14" in trades_df.columns:
+            tmp = trades_df.copy()
+            tmp["adx_bucket"] = tmp["entry_adx14"].apply(_bucket_adx)
+            roll["by_adx_bucket"] = tmp.groupby("adx_bucket")["pnl"].agg(["count","sum"]).reset_index().to_dict(orient="records")
+        # by ATR% bucket (use entry_atr_pct)
+        if "entry_atr_pct" in trades_df.columns:
+            tmp = trades_df.copy()
+            tmp["atr_bucket"] = tmp["entry_atr_pct"].apply(_bucket_atr_pct)
+            roll["by_atr_bucket"] = tmp.groupby("atr_bucket")["pnl"].agg(["count","sum"]).reset_index().to_dict(orient="records")
+    else:
+        roll = {}
 
     summary = {
         "start_equity": start_eq,
@@ -1357,15 +2144,37 @@ def run_backtest(
     "scale_out_trades": scale_out_count,
     "runner_exits": int(len(runner_exits)),
     "runner_target_wins": runner_target_wins,
+    "pre_earnings_exits": int(pre_earnings_exits),
     "median_bars_held": median_bars_held,
     "median_mfe_R_wins": median_mfe_R_wins,
     "median_mfe_R_losses": median_mfe_R_losses,
-        "files": [str(trades_path.name), str(equity_path.name)],
+    # pending / fills
+    "limit_signals": int(limit_signals_count),
+    "limit_filled": int(limit_filled),
+    "limit_expired": int(limit_expired_count),
+    "avg_days_to_fill": float(avg_days_to_fill),
+    "market_fills": int(market_fills),
+    # rates
+    "same_day_exit_rate": float(same_day_exit_rate),
+    "one_bar_exit_rate": float(one_bar_exit_rate),
+    # rollups
+    "rollups": roll,
+    "files": [str(trades_path.name), str(equity_path.name)],
     }
+
+    # Add worst-episode markers into summary if computed
+    try:
+        if 'dd_df' in locals() and not dd_df.empty:
+            worst = dd_df.nsmallest(1, "depth_pct").iloc[0]
+            summary["max_dd_start"] = worst["peak_date"]
+            summary["max_dd_trough"] = worst["trough_date"]
+            summary["max_dd_depth"] = float(worst["depth_pct"])
+    except Exception:
+        pass
 
     print("\n— Backtest Summary —")
     for k in ("start_equity","end_equity","total_return","CAGR","max_drawdown","daily_sharpe","days","trades","win_rate","avg_win","avg_loss","profit_factor","profit_factor_net","avg_R",
-              "stop_exits","target_exits","time_stop_exits","scale_out_trades","runner_exits","runner_target_wins","median_bars_held","median_mfe_R_wins","median_mfe_R_losses"):
+              "stop_exits","target_exits","time_stop_exits","scale_out_trades","runner_exits","runner_target_wins","pre_earnings_exits","median_bars_held","median_mfe_R_wins","median_mfe_R_losses"):
         v = summary[k]
         if k in {"total_return","CAGR","max_drawdown","win_rate"}:
             if isinstance(v, float) and not np.isnan(v):
@@ -1376,31 +2185,32 @@ def run_backtest(
             print(f"{k:<15}: {v:.4f}" if isinstance(v, float) and not np.isnan(v) else f"{k:<15}: {v}")
 
     # Reconciliation print
-    print("\nReconciliation:")
-    print(f"  equity_delta            : {summary['equity_delta']:.2f}")
-    print(f"  price_pnl_sum (gross)   : {summary['price_pnl_sum']:.2f}")
-    print(f"  entry_commissions_sum   : {summary['entry_commissions_sum']:.2f}")
-    print(f"  exit_commissions_sum    : {summary['exit_commissions_sum']:.2f}")
-    print(f"  expected_end_from_trades: {summary['expected_end_from_trades']:.2f}")
-    print(f"  recon_residual          : {summary['recon_residual']:.2f}")
-    print(f"  entry_cash_flow_sum     : {summary['entry_cash_flow_sum']:.2f}")
-    print(f"  exit_cash_flow_sum      : {summary['exit_cash_flow_sum']:.2f}")
-    print(f"  cash_end_reconstructed  : {summary['cash_end_reconstructed']:.2f}")
-    print(f"  recon_residual_cashflow : {summary['recon_residual_cashflow']:.2f}")
-    print(f"  unrealized_pnl (post-close): {summary['unrealized_pnl']:.2f}")
-    print(f"  residual_force_closes   : {summary['residual_force_closes']}")
-    if not entries_df.empty:
-        if unmatched_positions.empty:
-            print("  AUDIT qty               : OK (entry qty == summed exit qty per position)")
-        else:
-            print(f"  AUDIT qty MISMATCH      : {len(unmatched_positions)} position(s); first 5")
-            print(unmatched_positions.head(5).to_string())
-    print(f"  gross_profit            : {summary['gross_profit']:.2f}")
-    print(f"  gross_loss              : {summary['gross_loss']:.2f}")
-    print(f"  PF_gross                : {summary['profit_factor']:.3f}")
-    print(f"  PF_net                  : {summary['profit_factor_net']:.3f}")
+    if print_recon:
+        print("\nReconciliation:")
+        print(f"  equity_delta            : {summary['equity_delta']:.2f}")
+        print(f"  price_pnl_sum (gross)   : {summary['price_pnl_sum']:.2f}")
+        print(f"  entry_commissions_sum   : {summary['entry_commissions_sum']:.2f}")
+        print(f"  exit_commissions_sum    : {summary['exit_commissions_sum']:.2f}")
+        print(f"  expected_end_from_trades: {summary['expected_end_from_trades']:.2f}")
+        print(f"  recon_residual          : {summary['recon_residual']:.2f}")
+        print(f"  entry_cash_flow_sum     : {summary['entry_cash_flow_sum']:.2f}")
+        print(f"  exit_cash_flow_sum      : {summary['exit_cash_flow_sum']:.2f}")
+        print(f"  cash_end_reconstructed  : {summary['cash_end_reconstructed']:.2f}")
+        print(f"  recon_residual_cashflow : {summary['recon_residual_cashflow']:.2f}")
+        print(f"  unrealized_pnl (post-close): {summary['unrealized_pnl']:.2f}")
+        print(f"  residual_force_closes   : {summary['residual_force_closes']}")
+        if not entries_df.empty:
+            if unmatched_positions.empty:
+                print("  AUDIT qty               : OK (entry qty == summed exit qty per position)")
+            else:
+                print(f"  AUDIT qty MISMATCH      : {len(unmatched_positions)} position(s); first 5")
+                print(unmatched_positions.head(5).to_string())
+        print(f"  gross_profit            : {summary['gross_profit']:.2f}")
+        print(f"  gross_loss              : {summary['gross_loss']:.2f}")
+        print(f"  PF_gross                : {summary['profit_factor']:.3f}")
+        print(f"  PF_net                  : {summary['profit_factor_net']:.3f}")
 
-    if not trades_df.empty:
+    if print_topbottom and not trades_df.empty:
         t5 = trades_df.sort_values("r_multiple", ascending=False).head(5)
         b5 = trades_df.sort_values("r_multiple", ascending=True).head(5)
         print("\nTop 5 trades by R:")
@@ -1409,8 +2219,88 @@ def run_backtest(
         print(b5[["symbol","side","entry_date","entry_price","exit_date","exit_price","qty","pnl","r_multiple","commission","slippage_cost"]].to_string(index=False))
 
     print("\nFiles written:")
-    if not eval_df.empty:
+    if log_eval_csv and not eval_df.empty:
         print(f"  - {eval_path.name}")
     print(f"  - {trades_path.name}")
     print(f"  - {equity_path.name}")
+    if log_daily_csv and len(daily_metrics) > 0:
+        print(f"  - {daily_metrics_path.name}")
+        summary["files"].append(str(daily_metrics_path.name))
+
+    # Reproducibility snapshot
+    try:
+        cfg_snap_path = today_filename("config_used", unique=True).with_suffix(".yaml")
+        if log_meta_files:
+            with open(cfg_snap_path, "w", encoding="utf-8") as f:
+                yaml.safe_dump(cfg, f, sort_keys=False)
+        from strategies import swing_strategy as _ss
+        ss_path = Path(_ss.__file__)
+        engine_hash = hashlib.sha1(Path(__file__).read_bytes()).hexdigest()[:12]
+        swing_hash = hashlib.sha1(ss_path.read_bytes()).hexdigest()[:12]
+        meta = {
+            "universe_size": int(len(tickers)),
+            "date_start": str(pd.to_datetime(start_date).date()),
+            "date_end": str(pd.to_datetime(end_date).date()),
+            "timezone": str(eq_df.index.tz) if hasattr(eq_df.index, "tz") else "naive",
+            "pandas": pd.__version__,
+            "numpy": np.__version__,
+            "python": _sys.version.split(" ")[0],
+            "platform": _platform.platform(),
+            "engine_sha": engine_hash,
+            "swing_strategy_sha": swing_hash,
+        }
+        # fundamentals diagnostics
+        try:
+            fcfg_meta = (cfg.get("fundamentals", {}) or {})
+            btcfg_meta = (fcfg_meta.get("backtest_mode", {}) or {})
+            if fund_ctx is not None:
+                cal = fund_ctx.get("earnings_calendar", {}) or {}
+                total_events = int(sum(len(v or []) for v in cal.values()))
+                meta["fundamentals"] = {
+                    "enabled": bool(fcfg_meta.get("enabled", False)),
+                    "network_mode": str(btcfg_meta.get("network", "prefetch_only")),
+                    "symbols_prefetched": int(len(cal)),
+                    "earnings_events": total_events,
+                    "request_counter": fund_ctx.get("request_counter", {}),
+                }
+        except Exception:
+            pass
+        meta_path = today_filename("run_meta", unique=True).with_suffix(".yaml")
+        if log_meta_files:
+            with open(meta_path, "w", encoding="utf-8") as f:
+                yaml.safe_dump(meta, f, sort_keys=False)
+            print(f"  - {cfg_snap_path.name}")
+            print(f"  - {meta_path.name}")
+            summary["files"].extend([str(cfg_snap_path.name), str(meta_path.name)])
+        summary["meta"] = meta
+    except Exception:
+        pass
+    # Print grouped rollups and pending/fill stats
+    if print_pending:
+        print("\nPending/fill stats:")
+        print(f"  limit_signals        : {summary['limit_signals']}")
+        print(f"  limit_filled         : {summary['limit_filled']}")
+        print(f"  limit_expired        : {summary['limit_expired']}")
+        print(f"  avg_days_to_fill     : {summary['avg_days_to_fill']:.2f}" if np.isfinite(summary['avg_days_to_fill']) else "  avg_days_to_fill     : N/A")
+        print(f"  market_fills         : {summary['market_fills']}")
+        if (earnings_block_market + earnings_block_limit_skip + earnings_block_scan) > 0:
+            print("  fundamentals blocks  :")
+            if earnings_block_scan > 0:
+                print(f"    earnings_blocked_scan   : {earnings_block_scan}")
+            print(f"    earnings_cancelled_market : {earnings_block_market}")
+            print(f"    earnings_skipped_limit    : {earnings_block_limit_skip}")
+        print("\nRates:")
+        print(f"  same_day_exit_rate   : {summary['same_day_exit_rate']*100:.2f}%")
+        print(f"  one_bar_exit_rate    : {summary['one_bar_exit_rate']*100:.2f}%")
+    if print_rollups and summary.get("rollups"):
+        print("\nRollups:")
+        for key, rows in summary["rollups"].items():
+            try:
+                df_print = pd.DataFrame(rows)
+                if not df_print.empty:
+                    print(f"  {key}:")
+                    cols = [c for c in ["reason","entry_setup_type","entry_mtf_state","adx_bucket","atr_bucket","count","sum"] if c in df_print.columns]
+                    print(df_print[cols].to_string(index=False))
+            except Exception:
+                pass
     return summary
