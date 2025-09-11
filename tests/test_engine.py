@@ -8,7 +8,6 @@ import pandas as pd
 def test_normalize_columns_case_and_spaces(monkeypatch):
     # Ensure broker.alpaca can import without real credentials
     monkeypatch.setenv("ALPACA_API_KEY", "x")
-    monkeypatch.setenv("ALPACA_API_SECRET", "y")
 
     # Ensure repository root on sys.path then import
     root = Path(__file__).resolve().parents[1]

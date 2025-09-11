@@ -25,13 +25,11 @@ ENDPOINT   = os.getenv("ALPACA_PAPER_ENDPOINT", "https://paper-api.alpaca.market
 
 _ALPACA_DISABLED = False
 if not API_KEY or not API_SECRET:
-    # When running tests we want a graceful stub so importers (engine, etc.) don't crash.
     if "PYTEST_CURRENT_TEST" in os.environ:
         _ALPACA_DISABLED = True
-
         class _DummyAPI:
             def get_account(self):
-                class _Acct: equity = 0
+                class _Acct: equity = 0; buying_power = 0
                 return _Acct()
             def get_latest_trade(self, symbol):
                 class _Trade: price = 0; p = 0
@@ -41,12 +39,14 @@ if not API_KEY or not API_SECRET:
                 return _Order()
             def get_bars(self, *a, **k):
                 import pandas as _pd
-                from collections import namedtuple
-                # Return empty df shaped like Alpaca's .df property wrapper expects
                 class _Bars:
                     df = _pd.DataFrame(columns=["open","high","low","close","volume"])
                 return _Bars()
             def list_assets(self, *a, **k):
+                return []
+            def list_positions(self):
+                return []
+            def list_orders(self, *a, **k):
                 return []
         api = _DummyAPI()  # type: ignore
     else:

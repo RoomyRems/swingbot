@@ -84,7 +84,7 @@ logging:
   explain_rejects: true
 
 fundamentals:
-  enabled: true
+  enabled: false
   only_earnings_blackout: true
   exit_before_earnings: true
   min_price: 5

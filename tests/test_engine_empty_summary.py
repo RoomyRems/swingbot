@@ -12,7 +12,6 @@ class DummyAPI:
 def test_summary_counts_after_sanity_check(monkeypatch, tmp_path, capsys):
     # Provide dummy API credentials before importing the module
     monkeypatch.setenv("ALPACA_API_KEY", "key")
-    monkeypatch.setenv("ALPACA_API_SECRET", "secret")
 
     # Ensure repository root is on sys.path then import the function
     import sys

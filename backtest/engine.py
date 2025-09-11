@@ -15,6 +15,7 @@ import sys as _sys
 import platform as _platform
 
 from risk.manager import compute_levels as rm_compute_levels, size_position as rm_size_position
+import os
 from utils.config import load_config
 from utils.logger import today_filename, log_dataframe
 from broker.alpaca import get_daily_bars
@@ -227,8 +228,53 @@ class Position:
 # ---------- Core engine ----------
 
 def _load_symbol_df(sym: str, start_date: pd.Timestamp, end_date: pd.Timestamp) -> pd.DataFrame:
+    """Load and indicator‑augment daily bars for *sym*.
+
+    If environment variable SB_SYNTHETIC_DATA=1, or an Alpaca 401 Unauthorized
+    occurs AND SB_SYNTHETIC_DATA=1, we fall back to a deterministic synthetic
+    series so that the backtest engine can execute without live data credentials.
+    """
+    synthetic_mode = os.getenv("SB_SYNTHETIC_DATA", "0") == "1"
+
+    def _synthetic_daily_df(lookback_days: int) -> pd.DataFrame:
+        # Build deterministic series based on symbol hash (stable across runs)
+        total = max(lookback_days + 220, 300)
+        rng = pd.bdate_range(end=end_date.normalize(), periods=total)
+        seed = int(hashlib.sha1(sym.encode()).hexdigest(), 16) % (2**32 - 1)
+        rs = np.random.default_rng(seed)
+        # Drift + cyclical + noise
+        t = np.linspace(0, 1, len(rng))
+        drift = 0.10 * t  # 10% over the full window
+        cycle = 0.02 * np.sin(8 * math.pi * t)
+        base = 50 + 5 * (seed % 7)  # slight symbol-dependent offset
+        price = base * (1 + drift + cycle) * (1 + rs.normal(0, 0.003, len(rng)))
+        close = price
+        open_ = close * (1 + rs.normal(0, 0.0015, len(rng)))
+        high = np.maximum(open_, close) * (1 + rs.uniform(0, 0.002, len(rng)))
+        low = np.minimum(open_, close) * (1 - rs.uniform(0, 0.002, len(rng)))
+        vol = rs.integers(800_000, 1_400_000, len(rng))
+        df_syn = pd.DataFrame({
+            "Open": open_.round(2),
+            "High": high.round(2),
+            "Low": low.round(2),
+            "Close": close.round(2),
+            "Volume": vol
+        }, index=rng)
+        return df_syn
+
     lookback_days = int((end_date - start_date).days) + 220
-    df = get_daily_bars(sym, lookback_days=lookback_days)
+    try:
+        df = get_daily_bars(sym, lookback_days=lookback_days)
+    except Exception as e:
+        if synthetic_mode and ("401" in str(e) or "Unauthorized" in str(e) or True):
+            df = _synthetic_daily_df(lookback_days)
+            df.__dict__["_synthetic"] = True  # tag for later summary if needed
+        else:
+            raise
+    if df.empty and synthetic_mode:
+        # Fall back even if no exception (e.g., empty due to auth stub)
+        df = _synthetic_daily_df(lookback_days)
+        df.__dict__["_synthetic"] = True
     if df.empty:
         return df
     if not isinstance(df.index, pd.DatetimeIndex):
@@ -307,6 +353,7 @@ def run_backtest(
     print_pending     = bool(log_cfg.get("print_pending_stats", True))
     print_recon       = bool(log_cfg.get("print_reconciliation", True))
     print_topbottom   = bool(log_cfg.get("print_top_bottom_trades", True))
+    print_data_load_errors = bool(log_cfg.get("print_data_load_errors", True))  # new: surface fetch issues when empty
     # Evidence-based exit (Burns: exit when the case weakens)
     evx_cfg = (bt_cfg.get("evidence_exit", {}) or {})
     evx_enabled   = bool(evx_cfg.get("enabled", True))
@@ -413,16 +460,31 @@ def run_backtest(
 
     # ---------- load data ----------
     data: Dict[str, pd.DataFrame] = {}
+    _load_errors: list[tuple[str, str]] = []
     for sym in tqdm(tickers, desc="Load+indicators", leave=False):
         try:
             df = _load_symbol_df(sym, start_date, end_date)
             if df.empty:
+                # treat empty as failure for diagnostics (likely auth / symbol / throttle)
+                if print_data_load_errors and len(_load_errors) < 12:
+                    _load_errors.append((sym, "empty"))
                 continue
             data[sym] = df
-        except Exception:
+        except Exception as e:
+            if print_data_load_errors and len(_load_errors) < 12:
+                _load_errors.append((sym, f"{type(e).__name__}: {e}"))
             continue
     if not data:
-        raise RuntimeError("No data loaded for backtest.")
+        # Heuristic guidance for common causes (e.g., invalid Alpaca credentials)
+        hint = []
+        if _load_errors:
+            sample = ", ".join(f"{s}={msg}" for s, msg in _load_errors[:5])
+            hint.append(f"sample_failures: {sample}")
+        hint.append("Check: 1) Alpaca credentials valid (ALPACA_API_KEY/SECRET) 2) Data subscription/feed access 3) Network connectivity 4) Symbol list correctness.")
+        hint.append("If running offline or with placeholder secret, all requests will 401 and be swallowed. Provide a real secret or monkeypatch get_daily_bars in tests.")
+        raise RuntimeError("No data loaded for backtest. " + " | ".join(hint))
+    if os.getenv("SB_SYNTHETIC_DATA", "0") == "1":
+        print(f"[Data] Synthetic mode active (SB_SYNTHETIC_DATA=1). Loaded {len(data)} symbols with generated OHLCV.")
 
     calendar = [d for d in _trading_calendar(data) if (start_date <= d <= end_date)]
     calendar = sorted(calendar)
