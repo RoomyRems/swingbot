@@ -1,0 +1,20 @@
+trading:
+  min_score: 1
+  min_core_energies: 1
+  mtf:
+    enabled: false
+risk:
+  atr_multiple_stop: 1.4
+  reward_multiple: 1.8
+  max_total_risk_pct: 0.5
+  account_equity: 20000
+backtest:
+  initial_equity: 20000
+  max_open_positions: 5
+  commission_per_share: 0.0
+  slippage_bps: 0.0
+  force_close_on_end: true
+  entry_model:
+    type: market
+  evidence_exit:
+    enabled: true

@@ -84,13 +84,12 @@ logging:
   explain_rejects: true
 
 fundamentals:
-  enabled: true
-  only_earnings_blackout: false
-  exit_before_earnings: false
-  earnings_blackout_enabled: false  # new master toggle for earnings blackout screening (prefetch + fill veto)
+  enabled: false
+  earnings_blackout: false          # unified toggle for earnings blackout screening (prefetch + fill veto)
+  exit_before_earnings: false       # optional: exit positions before upcoming earnings event
+  prescreen_price: true      # when false, skip price fetch in fundamentals prescreen (falls back to fail-open keep)
   min_price: 5
   max_price: 1000
-  min_avg_vol: 800000
   earnings_blackout_days: 3
   sectors_allow: []
   sectors_deny: []
@@ -183,7 +182,7 @@ trading:
   filters:                      # additional trade-level gating
     min_atr_pct: 0.011          # relaxed to admit slightly lower volatility names
     max_extension_pct: 0.06     # reject stretched entries
-    min_avg_vol50: 300000       # liquidity floor (50d avg volume)
+    min_avg_vol50: 800000       # liquidity floor (50d avg volume)
     pullback_tolerance_pct: 0.035  # loosened to capture more pullbacks
     value_zone_max_ext_pct: 0.025   # Burns: acceptable extension from EMA20 for valid pullback entry
     value_zone_reject_tail_min: 0.40 # relaxed from 0.55 (long)

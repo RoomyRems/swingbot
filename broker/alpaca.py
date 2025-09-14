@@ -56,8 +56,9 @@ else:
     api = REST(key_id=API_KEY, secret_key=API_SECRET, base_url=ENDPOINT, api_version="v2")
 
     # ---- simple rate limiting & retry -----------------------------------
-    _RL_MAX_PER_MIN = 180  # keep buffer below 200 limit
-    _RL_TOKENS = _RL_MAX_PER_MIN
+    _RL_MAX_PER_MIN = 180  # soft cap (leave headroom below 200/min)
+    _RL_RATE_PER_SEC = _RL_MAX_PER_MIN / 60.0
+    _RL_TOKENS = float(_RL_MAX_PER_MIN)
     _RL_LAST_REFILL = time.time()
     _RL_LOCK = threading.Lock()
     _RL_429_COUNT = 0
@@ -65,19 +66,31 @@ else:
     _RL_RETRIES = 0
 
     def _rate_acquire():
+        """Leaky-bucket style limiter.
+
+        Allows smoother distribution instead of a hard minute cliff that caused
+        ~60s stalls after the first ~180 calls. Refill occurs continuously based
+        on elapsed time. If <1 token available, sleeps just enough to accrue it.
+        """
         global _RL_TOKENS, _RL_LAST_REFILL
-        with _RL_LOCK:
-            now = time.time()
-            elapsed = now - _RL_LAST_REFILL
-            if elapsed >= 60.0:
-                _RL_TOKENS = _RL_MAX_PER_MIN
-                _RL_LAST_REFILL = now
-            if _RL_TOKENS <= 0:
-                # sleep until next refill window
-                to_sleep = max(0.25, 60.0 - elapsed)
-                time.sleep(to_sleep)
-                return _rate_acquire()
-            _RL_TOKENS -= 1
+        while True:
+            with _RL_LOCK:
+                now = time.time()
+                elapsed = now - _RL_LAST_REFILL
+                if elapsed > 0:
+                    _RL_TOKENS = min(float(_RL_MAX_PER_MIN), _RL_TOKENS + elapsed * _RL_RATE_PER_SEC)
+                    _RL_LAST_REFILL = now
+                if _RL_TOKENS >= 1.0:
+                    _RL_TOKENS -= 1.0
+                    return
+                # need to wait for deficit
+                deficit = 1.0 - _RL_TOKENS
+                wait = deficit / _RL_RATE_PER_SEC
+            # outside lock
+            if wait > 0.0:
+                if wait > 0.25 and os.getenv("SB_RATE_LIMIT_VERBOSE"):
+                    print(f"[rate-limit] sleeping {wait:.2f}s (tokens={_RL_TOKENS:.2f})")
+                time.sleep(wait)
 
     def _alpaca_call(fn, *a, **kw):
         """Wrap Alpaca SDK call with client-side rate limiting + retry for 429/timeouts.

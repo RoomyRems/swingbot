@@ -1,0 +1,10 @@
+universe_size: 2
+date_start: '2025-08-05'
+date_end: '2025-09-14'
+timezone: None
+pandas: 2.2.2
+numpy: 2.2.6
+python: 3.10.6
+platform: Windows-10-10.0.26100-SP0
+engine_sha: 31cff068c616
+swing_strategy_sha: 94da89a53495

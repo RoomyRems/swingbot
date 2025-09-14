@@ -561,36 +561,30 @@ def run_backtest(
                 value_zone = bool(eng.get("explain", {}).get("sr", {}).get("value_zone", False))
             except Exception:
                 value_zone = False
-            # Fundamentals gate at scan-time: support earnings-only blackout mode
+            # Fundamentals gate at scan-time (price + optional earnings blackout). Volume gating removed here.
             fcfg_scan = (cfg.get("fundamentals", {}) or {})
             fundamentals_ok = True
             reason_fund = "fundamentals"
             if bool(fcfg_scan.get("enabled", False)):
-                if bool(fcfg_scan.get("only_earnings_blackout", False)):
+                try:
+                    price_o = float(row.get("Close", np.nan))
+                except Exception:
+                    price_o = float("nan")
+                min_p = float(fcfg_scan.get("min_price", 0))
+                # Earnings blackout (unified flag)
+                blk_days = 0
+                if bool(fcfg_scan.get("earnings_blackout", False)):
                     try:
-                        blk = int(fcfg_scan.get("earnings_blackout_days", 0))
+                        blk_days = int(fcfg_scan.get("earnings_blackout_days", 0))
                     except Exception:
-                        blk = 0
-                    if blk > 0 and fund_ctx is not None:
-                        if earnings_in_window(sym, pd.to_datetime(d).date(), blk, fund_ctx):
-                            fundamentals_ok = False
-                            reason_fund = "earnings"
-                else:
-                    try:
-                        price_o = float(row.get("Close", np.nan))
-                        avgv_o = float(sl["Volume"].tail(50).mean()) if "Volume" in sl.columns else float("nan")
-                    except Exception:
-                        price_o = float("nan"); avgv_o = float("nan")
-                    min_p = float(fcfg_scan.get("min_price", 0))
-                    try:
-                        min_vol = float(_min_avg_vol(cfg))
-                    except Exception:
-                        min_vol = float((cfg.get("trading", {}).get("filters", {}) or {}).get("min_avg_vol50", 300000))
-                    fundamentals_ok = (
-                        np.isfinite(price_o) and np.isfinite(avgv_o) and price_o > 0 and avgv_o > 0 and
-                        (price_o >= min_p) and (avgv_o >= min_vol)
-                    )
-                    reason_fund = "fundamentals"
+                        blk_days = 0
+                if blk_days > 0 and fund_ctx is not None:
+                    if earnings_in_window(sym, pd.to_datetime(d).date(), blk_days, fund_ctx):
+                        fundamentals_ok = False
+                        reason_fund = "earnings"
+                if fundamentals_ok:  # only price gate if not blocked by earnings
+                    fundamentals_ok = (np.isfinite(price_o) and price_o > 0 and price_o >= min_p)
+                    reason_fund = "fundamentals" if not fundamentals_ok else reason_fund
 
             if burns_mode_active:
                 # Burns canonical: 5 energies are Trend, Momentum, Cycle, S/R, Scale (weekly momentum).
@@ -600,9 +594,19 @@ def run_backtest(
                 # Basic marketability filters
                 min_atr_pct = float(cfg.get("trading", {}).get("min_atr_pct", 0.008))
                 min_price = float(cfg.get("trading", {}).get("min_price", 5.0))
+                # Always-on liquidity floor (50d average volume) independent of fundamentals.enabled
+                try:
+                    avgvol50 = float(sl["Volume"].tail(50).mean()) if "Volume" in sl.columns else float("nan")
+                except Exception:
+                    avgvol50 = float("nan")
+                vol_floor = float((cfg.get("trading", {}).get("filters", {}) or {}).get("min_avg_vol50", 0) or 0)
                 atr_pct = float(row.get("ATR_PCT", np.nan))
                 price_ok = float(row.get("Close", 0.0)) >= min_price
                 atr_ok = np.isfinite(atr_pct) and atr_pct >= min_atr_pct
+                vol_hard_ok = True
+                if vol_floor > 0:
+                    if (not np.isfinite(avgvol50)) or avgvol50 < vol_floor:
+                        vol_hard_ok = False
                 # Min R expectancy guard (use ATR-based as a quick proxy; final stop may use pivots at fill)
                 reward_mult = float(cfg.get("risk", {}).get("reward_multiple", 2.0))
                 stop_tmp, target_tmp = rm_compute_levels(direction, float(row.get("Close", np.nan)), float(row.get("ATR14", np.nan)), float(cfg["risk"]["atr_multiple_stop"]), reward_mult)
@@ -615,6 +619,9 @@ def run_backtest(
                     reason = reason_fund
                     if reason == "earnings":
                         earnings_block_scan += 1
+                    accept = False
+                elif not vol_hard_ok:
+                    reason = "avgvol"
                     accept = False
                 elif not regime_ok:
                     reason = "regime"
@@ -649,9 +656,18 @@ def run_backtest(
                 core_count = int(eng.get("core_pass_count", score))
                 min_atr_pct = float(cfg.get("trading", {}).get("min_atr_pct", 0.008))
                 min_price = float(cfg.get("trading", {}).get("min_price", 5.0))
+                try:
+                    avgvol50 = float(sl["Volume"].tail(50).mean()) if "Volume" in sl.columns else float("nan")
+                except Exception:
+                    avgvol50 = float("nan")
+                vol_floor = float((cfg.get("trading", {}).get("filters", {}) or {}).get("min_avg_vol50", 0) or 0)
                 atr_pct = float(row.get("ATR_PCT", np.nan))
                 price_ok = float(row.get("Close", 0.0)) >= min_price
                 atr_ok = np.isfinite(atr_pct) and atr_pct >= min_atr_pct
+                vol_hard_ok = True
+                if vol_floor > 0:
+                    if (not np.isfinite(avgvol50)) or avgvol50 < vol_floor:
+                        vol_hard_ok = False
                 reward_mult = float(cfg.get("risk", {}).get("reward_multiple", 2.0))
                 stop_tmp, target_tmp = rm_compute_levels(direction, float(row.get("Close", np.nan)), float(row.get("ATR14", np.nan)), float(cfg["risk"]["atr_multiple_stop"]), reward_mult)
                 if stop_tmp is not None and target_tmp is not None and abs(float(row.get("Close", np.nan)) - stop_tmp) > 0:
@@ -663,6 +679,8 @@ def run_backtest(
                     reason = reason_fund; accept = False
                     if reason == "earnings":
                         earnings_block_scan += 1
+                elif not vol_hard_ok:
+                    reason = "avgvol"; accept = False
                 elif not regime_ok:
                     reason = "regime"; accept = False
                 elif direction not in ("long","short"):
@@ -712,6 +730,8 @@ def run_backtest(
                     "atr_percent": float(row.get("ATR_PCT", np.nan)) if "ATR_PCT" in row.index else np.nan,
                     "setup_type": setup_type,
                     "ema20_dist_pct": ema20_dist_pct,
+                    "avgvol50": float(avgvol50) if 'avgvol50' in locals() else np.nan,
+                    "vol_floor": float(vol_floor) if 'vol_floor' in locals() else np.nan,
             })
             if accept:
                 # Time-stop configuration (placeholder for future use)

@@ -60,12 +60,13 @@ def _is_backtest_prefetch_only(cfg: dict) -> bool:
     return _get_backtest_network_mode(cfg) == "prefetch_only"
 
 def _min_avg_vol(cfg: dict) -> int:
-    """Return a unified min avg volume. In backtests, match technical filter to avoid contradictory gates."""
-    fmv = (cfg.get("fundamentals", {}) or {}).get("min_avg_vol")
+    """Return the technical min avg volume (single source of truth).
+
+    Fundamentals-specific min_avg_vol has been removed; rely solely on
+    trading.filters.min_avg_vol50. Fallback to 300k if unset.
+    """
     tfv = (cfg.get("trading", {}).get("filters", {}) or {}).get("min_avg_vol50")
-    if not _is_live_ok(cfg):
-        return int(tfv or fmv or 300000)
-    return int(fmv or tfv or 300000)
+    return int(tfv or 300000)
 
 def _get_json(url: str, params: Optional[dict] = None, timeout: int = 15, retries: int = 2) -> Optional[dict | list]:
     """
@@ -318,7 +319,7 @@ def prefetch_earnings_calendar(symbols: List[str], start_date: dt.date, end_date
 
 def build_fund_ctx(cfg: dict, symbols: List[str], start_date: dt.date, end_date: dt.date) -> Dict[str, Any]:
     fcfg = (cfg.get("fundamentals", {}) or {})
-    if not fcfg.get("earnings_blackout_enabled", False):
+    if not fcfg.get("earnings_blackout", False):
         # Earnings disabled: return minimal ctx (still include request counter for diagnostics)
         return {"earnings_calendar": {}, "blackout_days": 0, "request_counter": dict(REQUEST_COUNTER)}
     blackout = int(fcfg.get("earnings_blackout_days", 0))
@@ -346,7 +347,7 @@ def earnings_in_window(symbol: str, day: dt.date, blackout_days: int, ctx: Dict[
 
 def fundamentals_pass_at_fill(symbol: str, fill_date: dt.date, cfg: dict, ctx: Optional[Dict[str, Any]]) -> Tuple[bool, str]:
     fcfg = (cfg.get("fundamentals", {}) or {})
-    if not fcfg.get("earnings_blackout_enabled", False):
+    if not fcfg.get("earnings_blackout", False):
         return True, "earnings_disabled"
     blackout = int(fcfg.get("earnings_blackout_days", 0))
     if blackout <= 0:
@@ -379,10 +380,9 @@ def screen_symbol(
     fcfg = cfg.get("fundamentals", {}) or {}
     reasons: Dict[str, str] = {}
 
-    # 1) price range + avg volume
+    # 1) price range (volume gating removed; enforced by trading.filters.min_avg_vol50 in engine)
     min_p   = float(fcfg.get("min_price", 0))
     max_p   = float(fcfg.get("max_price", math.inf))
-    min_vol = float(fcfg.get("min_avg_vol", 0))
 
     # Prefer overrides from caller (e.g., backtest) to avoid lookahead and network
     q: Optional[dict]
@@ -401,13 +401,8 @@ def screen_symbol(
 
     if price <= 0:
         return ScreenResult(False, {"price": "invalid"})
-    if not avgv or avgv <= 0:
-        return ScreenResult(False, {"avg_vol": "missing"})
-
     if price < min_p or price > max_p:
         return ScreenResult(False, {"price": f"outside [{min_p},{max_p}]"})
-    if avgv < min_vol:
-        return ScreenResult(False, {"avg_vol": f"{avgv:.0f} < {min_vol:.0f}"})
 
     # 2) earnings blackout
     blackout_days = int(fcfg.get("earnings_blackout_days", 0))
@@ -460,7 +455,10 @@ def screen_symbol(
 
     # passed all
     reasons["price"]   = f"{price}"
-    reasons["avg_vol"] = f"{avgv:.0f}"
+    if avgv > 0:
+        reasons["avg_vol"] = f"{avgv:.0f}"
+    else:
+        reasons["avg_vol"] = "n/a"
     return ScreenResult(True, reasons)
 
 def screen_universe(symbols: List[str], cfg: dict) -> Tuple[List[str], pd.DataFrame]:
@@ -483,25 +481,38 @@ def screen_universe(symbols: List[str], cfg: dict) -> Tuple[List[str], pd.DataFr
     use_news = bool(((cfg.get("fundamentals", {}).get("news", {}) or {}).get("enabled", False)) and live_ok)
     min_avg_vol = _min_avg_vol(cfg)
     min_price = float((cfg.get("fundamentals", {}) or {}).get("min_price", 0))
+    # Renamed from prescreen_price_volume -> prescreen_price (backwards compat: fall back to old key if new absent)
+    fcfg_local = (cfg.get("fundamentals", {}) or {})
+    prescreen_pv = bool(fcfg_local.get("prescreen_price", fcfg_local.get("prescreen_price_volume", True)))
 
     drop_log: List[dict] = []
     kept: List[str] = []
 
-    for sym in symbols:
+    # Optional progress bar when fundamentals screening is explicitly enabled
+    from tqdm import tqdm  # lightweight; already used elsewhere (backtest)
+    it = symbols
+    f_enabled = bool((cfg.get("fundamentals", {}) or {}).get("enabled", False))
+    if f_enabled:
+        try:
+            it = tqdm(symbols, desc="Fundamentals", unit="sym")
+        except Exception:
+            it = symbols
+
+    for sym in it:
         try:
             price = None
             avgvol = None
 
             # Price/avgvol: avoid network in backtests
-            if live_ok:
+            if live_ok and prescreen_pv:
                 q = _alpaca_price_avgvol(sym)
                 _tiny_jitter()
                 if q:
                     price = float(q.get("price")) if q.get("price") is not None else None
                     avgvol = float(q.get("avgVolume")) if q.get("avgVolume") is not None else None
             # Apply min checks (permissive when no local data or not live_ok)
-            price_ok = True if (not live_ok or price is None) else (price >= min_price)
-            vol_ok = True if (not live_ok or avgvol is None) else (avgvol >= min_avg_vol)
+            price_ok = True if (not live_ok or not prescreen_pv or price is None) else (price >= min_price)
+            vol_ok = True if (not live_ok or not prescreen_pv or avgvol is None) else (avgvol >= min_avg_vol)
             if not price_ok:
                 drop_log.append({"symbol": sym, "kept": False, "reason": f"price_below_min({price}<{min_price})"})
                 continue
