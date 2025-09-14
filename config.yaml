@@ -84,12 +84,13 @@ logging:
   explain_rejects: true
 
 fundamentals:
-  enabled: false
-  only_earnings_blackout: true
-  exit_before_earnings: true
+  enabled: true
+  only_earnings_blackout: false
+  exit_before_earnings: false
+  earnings_blackout_enabled: false  # new master toggle for earnings blackout screening (prefetch + fill veto)
   min_price: 5
   max_price: 1000
-  min_avg_vol: 1000000
+  min_avg_vol: 800000
   earnings_blackout_days: 3
   sectors_allow: []
   sectors_deny: []
@@ -107,7 +108,7 @@ fundamentals:
       - "going concern"
   # Backtest-only networking policy and cache settings
   backtest_mode:
-    network: prefetch_only   # off | prefetch_only | live_ok
+    network: live_ok   # off | prefetch_only | live_ok
     cache_dir: cache/fundamentals
     ttl_days: 14
     fail_policy: fail_open   # if network=off and cache miss: fail_open | fail_closed
@@ -197,10 +198,10 @@ trading:
 
   targets:                      # scaling / runner configuration
     enabled: false              # phase1 disable scaling; evaluate raw expectancy
-    primary_R: 2.2              # placeholder (unused while disabled)
-    runner_R: 0.0
-    scale_out_pct: 0.0
-    adx_min_for_runner: 0
+    primary_R: 2.0              # placeholder (unused while disabled)
+    runner_R: 4.0
+    scale_out_pct: 0.5
+    adx_min_for_runner: 20
 
   volume_tiebreak_core4: false  # relaxed: allow core-min without volume confirm (diagnostic)
 

@@ -318,6 +318,9 @@ def prefetch_earnings_calendar(symbols: List[str], start_date: dt.date, end_date
 
 def build_fund_ctx(cfg: dict, symbols: List[str], start_date: dt.date, end_date: dt.date) -> Dict[str, Any]:
     fcfg = (cfg.get("fundamentals", {}) or {})
+    if not fcfg.get("earnings_blackout_enabled", False):
+        # Earnings disabled: return minimal ctx (still include request counter for diagnostics)
+        return {"earnings_calendar": {}, "blackout_days": 0, "request_counter": dict(REQUEST_COUNTER)}
     blackout = int(fcfg.get("earnings_blackout_days", 0))
     cache = init_fundamentals_cache(cfg)
     # pad range by blackout window to cover near-boundary fills
@@ -343,6 +346,8 @@ def earnings_in_window(symbol: str, day: dt.date, blackout_days: int, ctx: Dict[
 
 def fundamentals_pass_at_fill(symbol: str, fill_date: dt.date, cfg: dict, ctx: Optional[Dict[str, Any]]) -> Tuple[bool, str]:
     fcfg = (cfg.get("fundamentals", {}) or {})
+    if not fcfg.get("earnings_blackout_enabled", False):
+        return True, "earnings_disabled"
     blackout = int(fcfg.get("earnings_blackout_days", 0))
     if blackout <= 0:
         return True, "no-blackout"
