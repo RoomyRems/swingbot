@@ -26,6 +26,7 @@ import argparse
 import os
 import re
 import sys
+from typing import Optional
 from typing import Iterable, List, Set
 
 import requests
@@ -162,6 +163,22 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Filter to active & tradable symbols using Alpaca",
     )
+    parser.add_argument(
+        "--use-iwv",
+        action="store_true",
+        help="Merge IWV (Russell 3000 proxy via ETF holdings) into the universe (current snapshot; survivorship bias)",
+    )
+    parser.add_argument(
+        "--iwv-ttl-days",
+        type=int,
+        default=2,
+        help="Cache TTL days for IWV holdings (default 2)",
+    )
+    parser.add_argument(
+        "--iwv-force-refresh",
+        action="store_true",
+        help="Force refresh IWV holdings even if cache fresh",
+    )
     args = parser.parse_args(argv)
 
     urls = [WIKI_PAGES[i] for i in args.include]
@@ -190,14 +207,30 @@ def main(argv: list[str] | None = None) -> int:
         syms = try_alpaca_filter(syms)
         print(f"After Alpaca filter: {len(syms)}")
 
+    # IWV merge (Russell 3000 proxy). Done after Alpaca filter intentionally so ETF holdings aren't rejected
+    # for Alpaca inactivity (some small caps may not be tradable via your account filters). Adjust order if needed.
+    if args.use_iwv:
+        try:
+            from universe.iwv import get_iwv_constituents, merge_watchlists  # type: ignore
+            iwv_list = get_iwv_constituents(ttl_days=args.iwv_ttl_days, force_refresh=args.iwv_force_refresh)
+            if not iwv_list:
+                print("[warn] IWV list empty; skipping merge")
+            else:
+                pre = len(syms)
+                merged = merge_watchlists(syms, iwv_list)
+                print(f"IWV holdings: {len(iwv_list)}; merged delta: {len(merged) - pre}")
+                syms = merged
+        except Exception as e:  # noqa: BLE001
+            print(f"[warn] Failed IWV merge: {e}")
+
     out_path = os.path.abspath(args.out)
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     with open(out_path, "w", encoding="utf-8") as f:
         for s in syms:
             f.write(s + "\n")
     print(f"Wrote {len(syms)} symbols to {out_path}")
-    if "russell3000" in args.include:
-        print("Note: Russell 3000 adds substantial breadth; validate fundamentals/rate limits accordingly.")
+    if "russell3000" in args.include or args.use_iwv:
+        print("Note: Expanded universe (Russell components and/or IWV) may increase API load—monitor rate limits.")
     return 0
 
 
