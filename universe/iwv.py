@@ -48,21 +48,63 @@ def _normalize_us_ticker(t: str) -> Optional[str]:
 # ------------------- CSV Parsing -------------------
 
 def _read_iwv_csv(text: str) -> pd.DataFrame:
-    df = pd.read_csv(io.StringIO(text))
-    asset_col = next((c for c in df.columns if c.strip().lower() == "asset class"), None)
-    if asset_col:
-        df = df[df[asset_col].astype(str).str.contains("Equity", case=False, na=False)]
+    """Robustly parse IWV CSV.
+
+    iShares sometimes prepends metadata rows before the actual header.
+    Empirically, tickers begin after ~10 lines; we scan lines for a row
+    containing one of the canonical ticker header names. Then we recompose
+    a trimmed CSV starting at that header line.
+    """
+    lines = text.splitlines()
+    header_idx = None
+    header_pattern = re.compile(r",?Ticker( Symbol)?", re.IGNORECASE)
+    for i, line in enumerate(lines[:50]):  # search early region only
+        if header_pattern.search(line):
+            header_idx = i
+            break
+    if header_idx is None:
+        # fallback: try raw parse (may raise)
+        df_raw = pd.read_csv(io.StringIO(text), engine="python", on_bad_lines="skip")
+        # proceed with legacy logic
+        candidate = _finalize_iwv_df(df_raw)
+        if candidate is not None:
+            return candidate
+        raise ValueError("Could not locate IWV header or ticker column in raw CSV")
+
+    trimmed = "\n".join(lines[header_idx:])
+    # Try strict parse first
+    try:
+        df = pd.read_csv(io.StringIO(trimmed))
+    except Exception:
+        # Fallback: more permissive engine, skip bad lines
+        df = pd.read_csv(io.StringIO(trimmed), engine="python", on_bad_lines="skip")
+
+    return _finalize_iwv_df_strict(df)
+
+
+def _finalize_iwv_df_strict(df: pd.DataFrame) -> pd.DataFrame:
+    # Accept only if a ticker column is present
     ticker_col = None
     for cand in ["Ticker", "Ticker Symbol", "Ticker symbol", "Symbol"]:
         if cand in df.columns:
             ticker_col = cand
             break
-    if not ticker_col:
-        raise ValueError("Could not find a 'Ticker' column in IWV holdings CSV")
+    if ticker_col is None:
+        raise ValueError("Ticker column not found after header trimming")
+    asset_col = next((c for c in df.columns if c.strip().lower() == "asset class"), None)
+    if asset_col:
+        df = df[df[asset_col].astype(str).str.contains("Equity", case=False, na=False)]
     df = df[[ticker_col]].rename(columns={ticker_col: "Ticker"})
     df["Ticker"] = df["Ticker"].map(_normalize_us_ticker)
     df = df.dropna(subset=["Ticker"]).drop_duplicates(subset=["Ticker"]).reset_index(drop=True)
     return df
+
+
+def _finalize_iwv_df(df: pd.DataFrame) -> Optional[pd.DataFrame]:
+    try:
+        return _finalize_iwv_df_strict(df)
+    except Exception:
+        return None
 
 # ------------------- HTTP w/ retries -------------------
 
