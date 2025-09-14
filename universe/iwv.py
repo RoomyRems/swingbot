@@ -142,8 +142,9 @@ def get_iwv_constituents(
     cache_dir = Path(cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
 
+    # Correct IWV holdings endpoint (product id 239710)
     url = (
-        "https://www.ishares.com/us/products/239707/ishares-russell-3000-etf/"
+        "https://www.ishares.com/us/products/239710/ishares-russell-3000-etf/"
         "1467271812596.ajax?fileType=csv&fileName=IWV_holdings&dataType=fund"
     )
     key = hashlib.md5(url.encode("utf-8")).hexdigest()
