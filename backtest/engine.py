@@ -2235,8 +2235,21 @@ def run_backtest(
         pass
 
     print("\n— Backtest Summary —")
+    # Integrate Alpaca rate limit diagnostics if available
+    try:
+        from broker.alpaca import get_rate_limit_counts as _rlc
+        _rl = _rlc()
+        summary["alpaca_total_calls"] = int(_rl.get("total_calls", 0))
+        summary["alpaca_429_count"] = int(_rl.get("status_429", 0))
+        summary["alpaca_retries"] = int(_rl.get("retries", 0))
+    except Exception:
+        summary.setdefault("alpaca_total_calls", 0)
+        summary.setdefault("alpaca_429_count", 0)
+        summary.setdefault("alpaca_retries", 0)
+
     for k in ("start_equity","end_equity","total_return","CAGR","max_drawdown","daily_sharpe","days","trades","win_rate","avg_win","avg_loss","profit_factor","profit_factor_net","avg_R",
-              "stop_exits","target_exits","time_stop_exits","scale_out_trades","runner_exits","runner_target_wins","pre_earnings_exits","median_bars_held","median_mfe_R_wins","median_mfe_R_losses"):
+              "stop_exits","target_exits","time_stop_exits","scale_out_trades","runner_exits","runner_target_wins","pre_earnings_exits","median_bars_held","median_mfe_R_wins","median_mfe_R_losses",
+              "alpaca_total_calls","alpaca_retries","alpaca_429_count"):
         v = summary[k]
         if k in {"total_return","CAGR","max_drawdown","win_rate"}:
             if isinstance(v, float) and not np.isnan(v):

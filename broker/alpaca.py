@@ -8,6 +8,7 @@ from __future__ import annotations
 import os
 from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
 from functools import lru_cache
+import threading, time
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -54,6 +55,69 @@ if not API_KEY or not API_SECRET:
 else:
     api = REST(key_id=API_KEY, secret_key=API_SECRET, base_url=ENDPOINT, api_version="v2")
 
+    # ---- simple rate limiting & retry -----------------------------------
+    _RL_MAX_PER_MIN = 180  # keep buffer below 200 limit
+    _RL_TOKENS = _RL_MAX_PER_MIN
+    _RL_LAST_REFILL = time.time()
+    _RL_LOCK = threading.Lock()
+    _RL_429_COUNT = 0
+    _RL_TOTAL_CALLS = 0
+    _RL_RETRIES = 0
+
+    def _rate_acquire():
+        global _RL_TOKENS, _RL_LAST_REFILL
+        with _RL_LOCK:
+            now = time.time()
+            elapsed = now - _RL_LAST_REFILL
+            if elapsed >= 60.0:
+                _RL_TOKENS = _RL_MAX_PER_MIN
+                _RL_LAST_REFILL = now
+            if _RL_TOKENS <= 0:
+                # sleep until next refill window
+                to_sleep = max(0.25, 60.0 - elapsed)
+                time.sleep(to_sleep)
+                return _rate_acquire()
+            _RL_TOKENS -= 1
+
+    def _alpaca_call(fn, *a, **kw):
+        """Wrap Alpaca SDK call with client-side rate limiting + retry for 429/timeouts.
+        Tracks counters for diagnostics consumed by backtest summary.
+        """
+        global _RL_429_COUNT, _RL_TOTAL_CALLS, _RL_RETRIES
+        attempts = 0
+        backoff = 0.6
+        while True:
+            attempts += 1
+            _rate_acquire()
+            try:
+                res = fn(*a, **kw)
+                with _RL_LOCK:
+                    _RL_TOTAL_CALLS += 1
+                return res
+            except Exception as e:  # broad catch; filter on message
+                msg = str(e).lower()
+                transient = ("429" in msg) or ("too many" in msg) or ("timeout" in msg) or ("rate" in msg)
+                if transient:
+                    with _RL_LOCK: _RL_429_COUNT += 1
+                if transient and attempts < 4:
+                    _RL_RETRIES += 1
+                    time.sleep(backoff)
+                    backoff *= 1.6
+                    continue
+                # propagate final failure
+                with _RL_LOCK:
+                    _RL_TOTAL_CALLS += 1
+                raise
+
+    def get_rate_limit_counts() -> dict:
+        with _RL_LOCK:
+            return {
+                "total_calls": _RL_TOTAL_CALLS,
+                "retries": _RL_RETRIES,
+                "status_429": _RL_429_COUNT,
+                "max_per_min": _RL_MAX_PER_MIN,
+            }
+
 
 # ---- account helpers -------------------------------------------------
 def get_equity() -> float:
@@ -61,9 +125,9 @@ def get_equity() -> float:
 
 
 def get_latest_price(symbol: str) -> float:
-    """Best-effort last price (trade)."""
+    """Best-effort last price (trade) with retry & throttling."""
     try:
-        lt = api.get_latest_trade(symbol)
+        lt = _alpaca_call(api.get_latest_trade, symbol)
         return float(getattr(lt, "price", getattr(lt, "p", 0.0)) or 0.0)
     except Exception:
         return 0.0
@@ -165,36 +229,34 @@ def place_bracket(
         # Optional safety: for longs, don't let limit be wildly above last; for shorts, not wildly below.
         # You can move this guard into your strategy if you want more control.
 
-    order = api.submit_order(**submit_kwargs)
+    order = _alpaca_call(api.submit_order, **submit_kwargs)
     return order.id
 
 
 # ---- market data -----------------------------------------------------
+@lru_cache(maxsize=4096)
 def get_daily_bars(symbol: str, lookback_days: int = 120) -> pd.DataFrame:
-    """
-    Fetch daily OHLCV from Alpaca.
-    Guarantees >= lookback_days rows (unless Alpaca really has none).
-    """
-    # Build RFC-3339-compatible start date (no time part)
+    """Fetch daily OHLCV from Alpaca (cached)."""
     start_date = (datetime.utcnow() - timedelta(days=lookback_days * 2)).date().isoformat()
-    raw_limit  = lookback_days + 50  # cushion for holidays
-
-    bars = api.get_bars(
-        symbol,
-        TimeFrame.Day,
-        start=start_date,        # "YYYY-MM-DD"
-        limit=raw_limit,
-        feed="iex",              # free data feed
-        adjustment="raw"
-    ).df
-
+    raw_limit  = lookback_days + 50
+    try:
+        bars_obj = _alpaca_call(
+            api.get_bars,
+            symbol,
+            TimeFrame.Day,
+            start=start_date,
+            limit=raw_limit,
+            feed="iex",
+            adjustment="raw"
+        )
+        bars = bars_obj.df
+    except Exception:
+        return pd.DataFrame(columns=["Open","High","Low","Close","Volume"])
     if bars.empty:
-        return bars  # caller handles
-
-    bars = bars.tz_convert(None)  # drop timezone
-    bars = bars[['open', 'high', 'low', 'close', 'volume']]
-    bars.columns = ['Open', 'High', 'Low', 'Close', 'Volume']
-
+        return bars
+    bars = bars.tz_convert(None)
+    bars = bars[['open','high','low','close','volume']]
+    bars.columns = ['Open','High','Low','Close','Volume']
     return bars.tail(lookback_days)
 
 
@@ -206,7 +268,7 @@ def _active_assets_map() -> dict[str, object]:
     We DO NOT filter by asset_class here to avoid over-filtering.
     """
     assets = {}
-    for a in api.list_assets(status="active"):
+    for a in _alpaca_call(api.list_assets, status="active"):
         try:
             sym = a.symbol.upper()
             assets[sym] = a
