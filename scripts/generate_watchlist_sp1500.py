@@ -1,4 +1,4 @@
-"""Generate a unified S&P 1500 watchlist (S&P 500 + 400 + 600) by scraping Wikipedia.
+"""Generate a unified S&P 1500 + optional Russell 3000 watchlist by scraping Wikipedia.
 
 Features:
   - Scrapes official component lists from Wikipedia for each selected index.
@@ -6,13 +6,14 @@ Features:
   - Optional Alpaca filter (active + tradable) if your broker credentials exist.
 
 Usage (PowerShell):
-  python scripts/generate_watchlist_sp1500.py               # full S&P 1500
+    python scripts/generate_watchlist_sp1500.py               # full S&P 1500
+    python scripts/generate_watchlist_sp1500.py --include 500 400 600 russell3000
   python scripts/generate_watchlist_sp1500.py --include 500 # only S&P 500
   python scripts/generate_watchlist_sp1500.py --alpaca-filter
 
 Arguments:
   --out PATH              Output file path (default: project_root/watchlist.txt)
-  --include 500 400 600   Indices to include (default all)
+    --include 500 400 600 russell3000   Indices to include (default S&P 1500 only)
   --alpaca-filter         Apply Alpaca active & tradable symbol filter
 
 Notes:
@@ -38,6 +39,8 @@ WIKI_PAGES = {
     "500": "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
     "400": "https://en.wikipedia.org/wiki/List_of_S%26P_400_companies",
     "600": "https://en.wikipedia.org/wiki/List_of_S%26P_600_companies",
+    # Russell 3000 is indirectly the union of Russell 1000 + 2000; Wikipedia page lists all constituents
+    "russell3000": "https://en.wikipedia.org/wiki/Russell_3000_Index",
 }
 
 _SYMBOL_CLEAN_RE = re.compile(r"[^A-Z0-9.\-]", re.IGNORECASE)
@@ -145,14 +148,14 @@ def default_output_path() -> str:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Generate S&P 1500 watchlist from Wikipedia")
+    parser = argparse.ArgumentParser(description="Generate S&P 1500 (+ Russell 3000 optional) watchlist from Wikipedia")
     parser.add_argument("--out", dest="out", default=default_output_path(), help="Output file path")
     parser.add_argument(
         "--include",
         nargs="*",
-        default=["500", "400", "600"],
-        choices=["500", "400", "600"],
-        help="Indices to include (default: 500 400 600)",
+    default=["500", "400", "600"],
+    choices=["500", "400", "600", "russell3000"],
+    help="Indices to include (default: 500 400 600). Add russell3000 to expand universe.",
     )
     parser.add_argument(
         "--alpaca-filter",
@@ -172,8 +175,17 @@ def main(argv: list[str] | None = None) -> int:
         except Exception as e:  # noqa: BLE001
             print(f"[warn] Failed to parse {url}: {e}")
 
+    # Even though unique_sorted de-dupes, we perform an explicit final duplicate scan for transparency.
     syms = unique_sorted(all_syms)
     print(f"Total unique before filter: {len(syms)}")
+    # Final duplicate safety (in case of future modifications bypassing unique_sorted)
+    # Scan original combined list for duplicates
+    dup_counts = {}
+    for s in all_syms:
+        dup_counts[s] = dup_counts.get(s, 0) + 1
+    dups = [s for s,cnt in dup_counts.items() if cnt > 1]
+    if dups:
+        print(f"Found {len(dups)} symbols appearing in multiple source lists (e.g. first 10): {dups[:10]}")
     if args.alpaca_filter:
         syms = try_alpaca_filter(syms)
         print(f"After Alpaca filter: {len(syms)}")
@@ -184,6 +196,8 @@ def main(argv: list[str] | None = None) -> int:
         for s in syms:
             f.write(s + "\n")
     print(f"Wrote {len(syms)} symbols to {out_path}")
+    if "russell3000" in args.include:
+        print("Note: Russell 3000 adds substantial breadth; validate fundamentals/rate limits accordingly.")
     return 0
 
 
