@@ -216,6 +216,14 @@ class Position:
     time_to_1R_bars: int | None = None
     be_armed_bar: pd.Timestamp | None = None
     trail_active_bar: pd.Timestamp | None = None
+    # Weekly slope (MTF) metadata captured at entry
+    entry_weekly_slope_val: float = float("nan")
+    entry_weekly_slope_used: bool = False
+    entry_weekly_slope_ok: bool = True
+    entry_weekly_mtf_marginal: bool = False
+    entry_weekly_ema_gap_pct: float = float("nan")
+    entry_weekly_slope_mode: str = ""
+    entry_weekly_slope_indicator: str = ""
 
     def market_value(self, close_px: float) -> float:
         sign = 1 if self.side == "long" else -1
@@ -519,7 +527,7 @@ def run_backtest(
             key = (sym, i)
             wctx = _wcache.get(key)
             if wctx is None:
-                wctx = weekly_context(sl)
+                wctx = weekly_context(sl, cfg)
                 _wcache[key] = wctx
 
             # Regime
@@ -707,6 +715,11 @@ def run_backtest(
                 ema20_dist_pct = ((close_val - ema20_val)/ema20_val) if np.isfinite(ema20_val) and ema20_val>0 and np.isfinite(close_val) else np.nan
             except Exception:
                 ema20_dist_pct = np.nan
+            slope_meta = {}
+            try:
+                slope_meta = (eng.get("explain", {}).get("scale", {}).get("slope", {}) or {})
+            except Exception:
+                slope_meta = {}
             evaluations.append({
                 "date": d,
                 "symbol": sym,
@@ -732,6 +745,14 @@ def run_backtest(
                     "ema20_dist_pct": ema20_dist_pct,
                     "avgvol50": float(avgvol50) if 'avgvol50' in locals() else np.nan,
                     "vol_floor": float(vol_floor) if 'vol_floor' in locals() else np.nan,
+                    # slope diagnostics
+                    "weekly_slope_val": slope_meta.get("slope_val", np.nan),
+                    "weekly_slope_used": slope_meta.get("slope_used", False),
+                    "weekly_slope_ok": slope_meta.get("slope_ok", True),
+                    "weekly_mtf_marginal": slope_meta.get("marginal", False),
+                    "weekly_ema_gap_pct": slope_meta.get("ema_gap_pct", np.nan),
+                    "weekly_slope_mode": slope_meta.get("mode", ""),
+                    "weekly_slope_indicator": slope_meta.get("indicator", ""),
             })
             if accept:
                 # Time-stop configuration (placeholder for future use)
@@ -844,6 +865,13 @@ def run_backtest(
                                     "bars_held": pos.bars_held,
                                     "mfe_R": pos.max_favorable_R,
                                     "position_id": pos.position_id,
+                                    "weekly_slope_val": getattr(pos, "entry_weekly_slope_val", np.nan),
+                                    "weekly_slope_used": getattr(pos, "entry_weekly_slope_used", False),
+                                    "weekly_slope_ok": getattr(pos, "entry_weekly_slope_ok", True),
+                                    "weekly_mtf_marginal": getattr(pos, "entry_weekly_mtf_marginal", False),
+                                    "weekly_ema_gap_pct": getattr(pos, "entry_weekly_ema_gap_pct", np.nan),
+                                    "weekly_slope_mode": getattr(pos, "entry_weekly_slope_mode", ""),
+                                    "weekly_slope_indicator": getattr(pos, "entry_weekly_slope_indicator", ""),
                                 })
                                 del open_positions[sym]
                                 continue
@@ -902,6 +930,13 @@ def run_backtest(
                         "commission": commission, "slippage_cost": 0.0, "reason": "gap_fail_safe",
                         "part": ("runner" if pos.scaled else "full"), "bars_held": pos.bars_held, "mfe_R": pos.max_favorable_R,
                         "position_id": pos.position_id,
+                        "weekly_slope_val": getattr(pos, "entry_weekly_slope_val", np.nan),
+                        "weekly_slope_used": getattr(pos, "entry_weekly_slope_used", False),
+                        "weekly_slope_ok": getattr(pos, "entry_weekly_slope_ok", True),
+                        "weekly_mtf_marginal": getattr(pos, "entry_weekly_mtf_marginal", False),
+                        "weekly_ema_gap_pct": getattr(pos, "entry_weekly_ema_gap_pct", np.nan),
+                        "weekly_slope_mode": getattr(pos, "entry_weekly_slope_mode", ""),
+                        "weekly_slope_indicator": getattr(pos, "entry_weekly_slope_indicator", ""),
                     })
                     del open_positions[sym]
                     continue
@@ -1110,6 +1145,13 @@ def run_backtest(
                                 "r_multiple": pnl_primary / (pos.per_share_risk * qty_scale) if pos.per_share_risk > 0 else np.nan,
                                 "commission": commission_primary, "slippage_cost": slip_p * qty_scale, "reason": "scale_out",
                                 "part": "scale_out", "bars_held": pos.bars_held, "mfe_R": pos.max_favorable_R,
+                                "weekly_slope_val": getattr(pos, "entry_weekly_slope_val", np.nan),
+                                "weekly_slope_used": getattr(pos, "entry_weekly_slope_used", False),
+                                "weekly_slope_ok": getattr(pos, "entry_weekly_slope_ok", True),
+                                "weekly_mtf_marginal": getattr(pos, "entry_weekly_mtf_marginal", False),
+                                "weekly_ema_gap_pct": getattr(pos, "entry_weekly_ema_gap_pct", np.nan),
+                                "weekly_slope_mode": getattr(pos, "entry_weekly_slope_mode", ""),
+                                "weekly_slope_indicator": getattr(pos, "entry_weekly_slope_indicator", ""),
                             })
                             pos.qty -= qty_scale; pos.scaled = True
                             try:
@@ -1244,6 +1286,13 @@ def run_backtest(
                     "evidence_cycle_fail": int(bool(locals().get("cyc_fail_now", False))),
                     "evidence_value_fail": int(bool(locals().get("val_fail_now", False))),
                     "position_id": pos.position_id,
+                    "weekly_slope_val": getattr(pos, "entry_weekly_slope_val", np.nan),
+                    "weekly_slope_used": getattr(pos, "entry_weekly_slope_used", False),
+                    "weekly_slope_ok": getattr(pos, "entry_weekly_slope_ok", True),
+                    "weekly_mtf_marginal": getattr(pos, "entry_weekly_mtf_marginal", False),
+                    "weekly_ema_gap_pct": getattr(pos, "entry_weekly_ema_gap_pct", np.nan),
+                    "weekly_slope_mode": getattr(pos, "entry_weekly_slope_mode", ""),
+                    "weekly_slope_indicator": getattr(pos, "entry_weekly_slope_indicator", ""),
                 })
                 del open_positions[sym]
                 continue
@@ -1277,7 +1326,7 @@ def run_backtest(
                     sl_fill = df.iloc[: idx_fill + 1]
                     wctx_fill = _wcache.get((pend.symbol, idx_fill))
                     if wctx_fill is None:
-                        wctx_fill = weekly_context(sl_fill)
+                        wctx_fill = weekly_context(sl_fill, cfg)
                         _wcache[(pend.symbol, idx_fill)] = wctx_fill
                     mtf_ok_fill, _ = _mtf_ok_for_slice(sl_fill, cfg, pend.direction, weekly_ctx=wctx_fill)
                 except Exception:
@@ -1392,16 +1441,29 @@ def run_backtest(
             pos_created.entry_ema20_dist_pct = getattr(pos_created, "ema20_dist_pct", float("nan"))
             pos_created.entry_pivot_dist_pct = getattr(pos_created, "pivot_dist_pct", float("nan"))
             pos_created.entry_atr_pct = getattr(pos_created, "atr_pct_entry", float("nan"))
-            # MTF state at fill
+            # MTF state at fill (capture regardless of exception)
+            wctx_fill = None
             try:
                 idx_fill = df.index.get_loc(day)
                 wctx_fill = _wcache.get((pend.symbol, idx_fill))
                 if wctx_fill is None:
-                    wctx_fill = weekly_context(df.iloc[: idx_fill + 1])
+                    wctx_fill = weekly_context(df.iloc[: idx_fill + 1], cfg)
                     _wcache[(pend.symbol, idx_fill)] = wctx_fill
                 pos_created.entry_mtf_state = _derive_mtf_state_from_ctx(wctx_fill)
             except Exception:
                 pos_created.entry_mtf_state = ""
+            # Capture slope metadata at entry (outside try to run even on failure above)
+            try:
+                slope_meta_entry = (wctx_fill or {}).get("slope_meta", {})
+                pos_created.entry_weekly_slope_val = slope_meta_entry.get("slope_val", float("nan"))
+                pos_created.entry_weekly_slope_used = bool(slope_meta_entry.get("slope_used", False))
+                pos_created.entry_weekly_slope_ok = bool(slope_meta_entry.get("slope_ok", True))
+                pos_created.entry_weekly_mtf_marginal = bool(slope_meta_entry.get("marginal", False))
+                pos_created.entry_weekly_ema_gap_pct = slope_meta_entry.get("ema_gap_pct", float("nan"))
+                pos_created.entry_weekly_slope_mode = slope_meta_entry.get("mode", "")
+                pos_created.entry_weekly_slope_indicator = slope_meta_entry.get("indicator", "")
+            except Exception:
+                pass
             pos_created.qty_cap_reason = cap_reason
             pos_created.order_type = "market"
             entries_audit.append({
@@ -1477,6 +1539,13 @@ def run_backtest(
                     "be_armed_bar": getattr(pos, "be_armed_bar", None),
                     "trail_active_bar": getattr(pos, "trail_active_bar", None),
                     "position_id": pos.position_id,
+                    "weekly_slope_val": getattr(pos, "entry_weekly_slope_val", np.nan),
+                    "weekly_slope_used": getattr(pos, "entry_weekly_slope_used", False),
+                    "weekly_slope_ok": getattr(pos, "entry_weekly_slope_ok", True),
+                    "weekly_mtf_marginal": getattr(pos, "entry_weekly_mtf_marginal", False),
+                    "weekly_ema_gap_pct": getattr(pos, "entry_weekly_ema_gap_pct", np.nan),
+                    "weekly_slope_mode": getattr(pos, "entry_weekly_slope_mode", ""),
+                    "weekly_slope_indicator": getattr(pos, "entry_weekly_slope_indicator", ""),
                 })
                 del open_positions[pend.symbol]
             else:
@@ -1540,7 +1609,7 @@ def run_backtest(
                     sl_fill = df.iloc[: idx_fill + 1]
                     wctx_fill = _wcache.get((pend.symbol, idx_fill))
                     if wctx_fill is None:
-                        wctx_fill = weekly_context(sl_fill)
+                        wctx_fill = weekly_context(sl_fill, cfg)
                         _wcache[(pend.symbol, idx_fill)] = wctx_fill
                     mtf_ok_fill, _ = _mtf_ok_for_slice(sl_fill, cfg, pend.direction, weekly_ctx=wctx_fill)
                 except Exception:
@@ -1570,7 +1639,7 @@ def run_backtest(
                     # ensure weekly ctx for the slice so Scale energy is valid
                     wctx_fill = _wcache.get((pend.symbol, idx_fill))
                     if wctx_fill is None:
-                        wctx_fill = weekly_context(sl_fill)
+                        wctx_fill = weekly_context(sl_fill, cfg)
                         _wcache[(pend.symbol, idx_fill)] = wctx_fill
                     eng_fill = evaluate_five_energies(sl_fill, cfg, weekly_ctx=wctx_fill) or {}
                     core_count_fill = int(eng_fill.get("core_pass_count", int(eng_fill.get("score", 0))))
@@ -1702,7 +1771,7 @@ def run_backtest(
                 idx_fill = df.index.get_loc(day)
                 wctx_fill = _wcache.get((pend.symbol, idx_fill))
                 if wctx_fill is None:
-                    wctx_fill = weekly_context(df.iloc[: idx_fill + 1])
+                    wctx_fill = weekly_context(df.iloc[: idx_fill + 1], cfg)
                     _wcache[(pend.symbol, idx_fill)] = wctx_fill
                 pos_created.entry_mtf_state = _derive_mtf_state_from_ctx(wctx_fill)
             except Exception:
@@ -1773,6 +1842,13 @@ def run_backtest(
                     "be_armed_bar": getattr(pos, "be_armed_bar", None),
                     "trail_active_bar": getattr(pos, "trail_active_bar", None),
                     "position_id": pos.position_id,
+                    "weekly_slope_val": getattr(pos, "entry_weekly_slope_val", np.nan),
+                    "weekly_slope_used": getattr(pos, "entry_weekly_slope_used", False),
+                    "weekly_slope_ok": getattr(pos, "entry_weekly_slope_ok", True),
+                    "weekly_mtf_marginal": getattr(pos, "entry_weekly_mtf_marginal", False),
+                    "weekly_ema_gap_pct": getattr(pos, "entry_weekly_ema_gap_pct", np.nan),
+                    "weekly_slope_mode": getattr(pos, "entry_weekly_slope_mode", ""),
+                    "weekly_slope_indicator": getattr(pos, "entry_weekly_slope_indicator", ""),
                 })
                 del open_positions[pend.symbol]
             else:
@@ -1917,6 +1993,13 @@ def run_backtest(
                     "bars_held": pos.bars_held,
                     "mfe_R": pos.max_favorable_R,
                     "position_id": pos.position_id,
+                    "weekly_slope_val": getattr(pos, "entry_weekly_slope_val", np.nan),
+                    "weekly_slope_used": getattr(pos, "entry_weekly_slope_used", False),
+                    "weekly_slope_ok": getattr(pos, "entry_weekly_slope_ok", True),
+                    "weekly_mtf_marginal": getattr(pos, "entry_weekly_mtf_marginal", False),
+                    "weekly_ema_gap_pct": getattr(pos, "entry_weekly_ema_gap_pct", np.nan),
+                    "weekly_slope_mode": getattr(pos, "entry_weekly_slope_mode", ""),
+                    "weekly_slope_indicator": getattr(pos, "entry_weekly_slope_indicator", ""),
                 })
                 del open_positions[sym]
             equity_today = cash
@@ -1959,6 +2042,13 @@ def run_backtest(
                 "bars_held": pos.bars_held,
                 "mfe_R": pos.max_favorable_R,
                 "position_id": pos.position_id,
+                "weekly_slope_val": getattr(pos, "entry_weekly_slope_val", np.nan),
+                "weekly_slope_used": getattr(pos, "entry_weekly_slope_used", False),
+                "weekly_slope_ok": getattr(pos, "entry_weekly_slope_ok", True),
+                "weekly_mtf_marginal": getattr(pos, "entry_weekly_mtf_marginal", False),
+                "weekly_ema_gap_pct": getattr(pos, "entry_weekly_ema_gap_pct", np.nan),
+                "weekly_slope_mode": getattr(pos, "entry_weekly_slope_mode", ""),
+                "weekly_slope_indicator": getattr(pos, "entry_weekly_slope_indicator", ""),
             })
             residual_force_closes += 1
             del open_positions[sym]

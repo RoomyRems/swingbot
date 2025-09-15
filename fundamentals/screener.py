@@ -464,12 +464,14 @@ def screen_symbol(
 def screen_universe(symbols: List[str], cfg: dict) -> Tuple[List[str], pd.DataFrame]:
     """Backtest-safe universe pre-screen.
 
-    - Fail-open on any API/network error when not in live_ok mode.
-    - Avoid per-symbol network calls unless live_ok.
-    - Use one volume floor that matches technical filter in backtests.
-    - Skip earnings blackout here (engine enforces at fill).
-    - Skip news in backtests.
-    Returns (kept_symbols, report_df) and writes an audit CSV to logs/.
+        - Fail-open on any API/network error when not in live_ok mode.
+        - Avoid per-symbol network calls unless live_ok.
+        - Volume gating has been fully removed from fundamentals; liquidity is
+            enforced ONLY inside the trading engine via trading.filters.min_avg_vol50.
+        - Apply an optional price floor (if prescreen_price enabled).
+        - Skip earnings blackout here (engine enforces at fill time via prefetched ctx).
+        - Skip news in backtests (unless explicitly enabled + live_ok).
+        Returns (kept_symbols, report_df) and writes an audit CSV to logs/.
     """
     import random
     def _tiny_jitter():
@@ -479,11 +481,17 @@ def screen_universe(symbols: List[str], cfg: dict) -> Tuple[List[str], pd.DataFr
     prefetch_only = _is_backtest_prefetch_only(cfg)
     fail_open = not live_ok
     use_news = bool(((cfg.get("fundamentals", {}).get("news", {}) or {}).get("enabled", False)) and live_ok)
-    min_avg_vol = _min_avg_vol(cfg)
     min_price = float((cfg.get("fundamentals", {}) or {}).get("min_price", 0))
     # Renamed from prescreen_price_volume -> prescreen_price (backwards compat: fall back to old key if new absent)
     fcfg_local = (cfg.get("fundamentals", {}) or {})
     prescreen_pv = bool(fcfg_local.get("prescreen_price", fcfg_local.get("prescreen_price_volume", True)))
+
+    # Deprecation warning if legacy fundamentals.min_avg_vol still present
+    if "min_avg_vol" in fcfg_local:
+        try:
+            print("[Fundamentals] WARNING: 'fundamentals.min_avg_vol' is deprecated & ignored; use trading.filters.min_avg_vol50.")
+        except Exception:
+            pass
 
     drop_log: List[dict] = []
     kept: List[str] = []
@@ -510,14 +518,10 @@ def screen_universe(symbols: List[str], cfg: dict) -> Tuple[List[str], pd.DataFr
                 if q:
                     price = float(q.get("price")) if q.get("price") is not None else None
                     avgvol = float(q.get("avgVolume")) if q.get("avgVolume") is not None else None
-            # Apply min checks (permissive when no local data or not live_ok)
+            # Apply min price check (volume deliberately ignored here)
             price_ok = True if (not live_ok or not prescreen_pv or price is None) else (price >= min_price)
-            vol_ok = True if (not live_ok or not prescreen_pv or avgvol is None) else (avgvol >= min_avg_vol)
             if not price_ok:
                 drop_log.append({"symbol": sym, "kept": False, "reason": f"price_below_min({price}<{min_price})"})
-                continue
-            if not vol_ok:
-                drop_log.append({"symbol": sym, "kept": False, "reason": f"avgvol_below_min({avgvol}<{min_avg_vol})"})
                 continue
 
             # News only in live_ok and enabled
@@ -561,6 +565,6 @@ def screen_universe(symbols: List[str], cfg: dict) -> Tuple[List[str], pd.DataFr
         print(f"[Fundamentals] Wrote screen log → {out}")
     except Exception:
         pass
-    print(f"[Fundamentals] Kept {len(kept)} / {len(symbols)} symbols (mode={_get_backtest_network_mode(cfg)}, min_avg_vol={min_avg_vol}, min_price={min_price}, news={'ON' if use_news else 'OFF'})")
+    print(f"[Fundamentals] Kept {len(kept)} / {len(symbols)} symbols (mode={_get_backtest_network_mode(cfg)}, liquidity=engine_only, min_price={min_price}, news={'ON' if use_news else 'OFF'})")
     report = pd.DataFrame(drop_log, columns=["symbol","kept","reason"])  # compatibility
     return kept, report

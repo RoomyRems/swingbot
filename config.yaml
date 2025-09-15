@@ -85,8 +85,8 @@ logging:
 
 fundamentals:
   enabled: false
-  earnings_blackout: false          # unified toggle for earnings blackout screening (prefetch + fill veto)
-  exit_before_earnings: false       # optional: exit positions before upcoming earnings event
+  earnings_blackout: true          # unified toggle for earnings blackout screening (prefetch + fill veto)
+  exit_before_earnings: true       # optional: exit positions before upcoming earnings event
   prescreen_price: true      # when false, skip price fetch in fundamentals prescreen (falls back to fail-open keep)
   min_price: 5
   max_price: 1000
@@ -126,24 +126,16 @@ trend_energy:
     require_hh_hl: true
 signals:
   trend:
-    # points logic: trend is true if score >= min_points
     min_points: 3            # 3 of 5
-    # alignment
     require_ema20_gt_ema50: true
-    # slope checks (lookback in bars)
     slope_lookback: 3
-    min_slope_ema50_bp: 0.0  # > 0 bps over lookback (relative to price)
+    min_slope_ema50_bp: 0.0
     allow_ema20_slope_substitute: true
-    # separation vs volatility
-    sep_min_atr_mult: 0.25   # separation% >= 0.25 * ATR%
-    # price location (value zone bias)
+    sep_min_atr_mult: 0.25
     require_close_above_ema50: true
-    # ADX assist (soft)
     adx_soft_min: 16
     adx_required_if_sep_below_mult: 0.50
-    # debounce: 2-of-3
     confirm_n_of_m: [2, 3]
-    # optional structure assist (Donchian up/down adds 1 soft point)
   structure_donchian: 20
 
 trading:
@@ -182,7 +174,7 @@ trading:
   filters:                      # additional trade-level gating
     min_atr_pct: 0.011          # relaxed to admit slightly lower volatility names
     max_extension_pct: 0.06     # reject stretched entries
-    min_avg_vol50: 800000       # liquidity floor (50d avg volume)
+    min_avg_vol50: 0       # liquidity floor (50d avg volume)
     pullback_tolerance_pct: 0.035  # loosened to capture more pullbacks
     value_zone_max_ext_pct: 0.025   # Burns: acceptable extension from EMA20 for valid pullback entry
     value_zone_reject_tail_min: 0.40 # relaxed from 0.55 (long)
@@ -207,15 +199,26 @@ trading:
   mtf:                          # higher timeframe confirmation
     enabled: true
     timeframe: "W"
-    trend_filter: "macd"       # Burns: use momentum on higher timeframe
+    trend_filter: "macd"
     ema_fast: 20
     ema_slow: 50
     macd_fast: 12
     macd_slow: 26
     macd_signal: 9
-    counts_as_energy: false     # in Burns, Scale is core inside evaluator; no extra bonus
-  filter_at_fill: true        # enforce MTF alignment at fill time only (scoring unchanged)
-  reject_on_mismatch: false   # do not hard-veto; Scale is already in the core
+    counts_as_energy: false
+    filter_at_fill: true
+    reject_on_mismatch: false
+    slope:                     # weekly slope confirmation/gating
+      enabled: true
+      indicator: "ema20"       # ema20 | macd_line
+      lookback_weeks: 3
+      mode: "confirm"          # confirm | gate
+      min_norm_slope_per_week: 0.0
+      deadband: 0.0002
+      macd_deadband: 0.05
+      ema_gap_min_pct: 0.004
+      use_partial_week: false
+      log_fields: true
 
 ### ---------- For backtesting ---------- ###
 backtest:

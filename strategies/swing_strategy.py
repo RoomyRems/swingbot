@@ -5,6 +5,7 @@ import talib
 
 from models.signal import TradeSignal
 from risk.manager import compute_levels, size_position
+from utils.indicators import linreg_slope, pct_norm_slope
 
 
 # ---------- 0) lightweight logging helper ----------
@@ -703,18 +704,19 @@ def evaluate_five_energies(df: pd.DataFrame, cfg: dict | None = None, weekly_ctx
             fib_used = True
             # Fib only reinforces SR; do not flip SR from False → True alone
 
-    # 5 SCALE / MTF MOMENTUM (weekly MACD alignment per Burns "use momentum on higher timeframe")
+    # 5 SCALE / MTF MOMENTUM (+ optional slope confirmation)
     scale_ok = True
     mtf_cfg = (cfg.get("trading", {}).get("mtf") or {})
+    slope_meta = {}
     if bool(mtf_cfg.get("enabled", True)):
         try:
+            # Acquire weekly MACD from provided context (now enriched with slope if requested)
             if weekly_ctx is not None:
                 wmacd = float(weekly_ctx.get("wmacd", np.nan)); wmacds = float(weekly_ctx.get("wmacds", np.nan)); wmacdh = float(weekly_ctx.get("wmacdh", np.nan))
             else:
                 wk = _resample_weekly_ohlcv(df)
                 wk_ind = add_indicators(wk)
                 wrow = wk_ind.iloc[-1]
-                # Use last completed weekly bar (avoid partial-week bias)
                 if isinstance(df.index, pd.DatetimeIndex):
                     is_fri = (df.index[-1].weekday() == 4)
                     if (not is_fri) and (len(wk_ind) >= 2):
@@ -726,8 +728,69 @@ def evaluate_five_energies(df: pd.DataFrame, cfg: dict | None = None, weekly_ctx
                 scale_ok = np.isfinite(wmacd) and np.isfinite(wmacds) and (wmacd < 0) and (wmacd < wmacds) and (wmacdh < 0)
             else:
                 scale_ok = False
+
+            # --- Slope confirmation/gate ---
+            slope_cfg = (mtf_cfg.get("slope", {}) or {})
+            if slope_cfg.get("enabled", False) and direction in {"long","short"}:
+                mode = slope_cfg.get("mode", "confirm")
+                indicator = slope_cfg.get("indicator", "ema20")
+                deadband = float(slope_cfg.get("deadband", 0.0))
+                min_norm = float(slope_cfg.get("min_norm_slope_per_week", 0.0))
+                macd_db = float(slope_cfg.get("macd_deadband", 0.05))
+                ema_gap_min = float(slope_cfg.get("ema_gap_min_pct", 0.004))
+                # Pull slope metrics from weekly_ctx (preferred) else compute minimal from df (already above)
+                slope_raw = weekly_ctx.get("weekly_slope_raw") if weekly_ctx else np.nan
+                slope_pct = weekly_ctx.get("weekly_slope_pct") if weekly_ctx else np.nan
+                ema_gap_pct = weekly_ctx.get("weekly_ema_gap_pct") if weekly_ctx else np.nan
+                if indicator == "ema20":
+                    sl_val = float(slope_pct) if slope_pct is not None else float("nan")
+                    aligned = (sl_val > max(deadband, min_norm)) if direction == "long" else (sl_val < -max(deadband, min_norm))
+                    slope_val = sl_val
+                else:  # macd_line slope
+                    sl_val = float(slope_raw) if slope_raw is not None else float("nan")
+                    aligned = (sl_val > deadband) if direction == "long" else (sl_val < -deadband)
+                    slope_val = sl_val
+                macd_near_zero = np.isfinite(wmacd) and (abs(wmacd) <= macd_db)
+                # Determine EMA gap from context if present else recompute quick
+                if indicator == "ema20" and (ema_gap_pct is None or not np.isfinite(ema_gap_pct)):
+                    try:
+                        ema20_last = weekly_ctx.get("weekly_ema20_last", np.nan) if weekly_ctx else np.nan
+                        ema50_last = weekly_ctx.get("weekly_ema50_last", np.nan) if weekly_ctx else np.nan
+                        if np.isfinite(ema20_last) and np.isfinite(ema50_last) and ema50_last != 0:
+                            ema_gap_pct = (ema20_last/ema50_last - 1.0)
+                    except Exception:
+                        ema_gap_pct = float("nan")
+                # Marginal definition
+                # gap_small only if finite gap; NaN gap means we could not compute separation so we do NOT automatically mark marginal
+                gap_small = (abs(ema_gap_pct) <= ema_gap_min) if (ema_gap_pct is not None and np.isfinite(ema_gap_pct)) else False
+                marginal = macd_near_zero or gap_small
+                if mode == "gate":
+                    slope_used = True
+                    slope_ok = bool(aligned)
+                else:  # confirm
+                    slope_used = bool(marginal)
+                    slope_ok = True if not marginal else bool(aligned)
+                # Apply gate logic to scale_ok if required
+                if (mode == "gate" and not slope_ok) or (mode == "confirm" and slope_used and not slope_ok):
+                    scale_ok = False
+                slope_meta = {
+                    "slope_used": slope_used,
+                    "slope_ok": slope_ok,
+                    "slope_val": slope_val,
+                    "marginal": marginal,
+                    "ema_gap_pct": ema_gap_pct,
+                    "macd_near_zero": macd_near_zero,
+                    "mode": mode,
+                    "indicator": indicator,
+                }
+                # persist for engine so it can log on fills
+                try:
+                    if weekly_ctx is not None:
+                        weekly_ctx.setdefault("slope_meta", slope_meta)
+                except Exception:
+                    pass
         except Exception:
-            scale_ok = False  # fail-closed if weekly unavailable
+            scale_ok = False
 
     # Volume confirmation (optional, advisory) – require N of {RVOL, AD slope, OBV slope}
     vol_cfg = (cfg.get("volume", {}) or {})
@@ -846,7 +909,7 @@ def evaluate_five_energies(df: pd.DataFrame, cfg: dict | None = None, weekly_ctx
             "momentum": {"macd": macd, "macds": macds, "macdh": macdh, "expand_lb": hist_expand_lb},
             "cycle": {"oversold": oversold, "overbought": overbought, "found": cycle_ok, "stoch_mode": ("5_3_2" if ("SlowK_5_3_2" in df.columns and "SlowD_5_3_2" in df.columns) else "14_3_3")},
             "sr": {"value_zone": in_value_zone, "reject": reject_ok, "ext_pct": ext_pct, "fib_used": fib_used},
-            "scale": {"ok": scale_ok, "mode": "weekly_macd"},
+            "scale": {"ok": scale_ok, "mode": "weekly_macd", **({"slope": slope_meta} if slope_meta else {})},
             "volume": {"ok": volume_ok},
         }
     }
@@ -910,24 +973,68 @@ def _mtf_alignment_ok(daily_direction: str, weekly_trend: str, mtf_cfg: dict) ->
 
 
 # ---------- small perf helper for engine ----------
-def weekly_context(df_slice: pd.DataFrame) -> dict:
-    """Return a tiny dict with current weekly MACD values from the provided daily slice.
-    Engine can cache per-symbol per-day to avoid repeated resamples.
-    Keys: wmacd, wmacds, wmacdh. Empty when not available.
+def weekly_context(df_slice: pd.DataFrame, cfg: dict | None = None) -> dict:
+    """Return weekly higher timeframe context.
+
+    Provides:
+      - Weekly MACD trio (wmacd, wmacds, wmacdh)
+      - Optional slope metrics per trading.mtf.slope config (computed once)
     """
+    out: dict = {}
     try:
         wk = _resample_weekly_ohlcv(df_slice)
         wk_ind = add_indicators(wk)
         if wk_ind.empty:
-            return {}
+            return out
         r = wk_ind.iloc[-1]
-        return {
+        out.update({
             "wmacd": float(r.get("MACD", np.nan)),
             "wmacds": float(r.get("MACDs", np.nan)),
             "wmacdh": float(r.get("MACDh", np.nan)),
-        }
+        })
+        # ---- slope augmentation ----
+        scfg = (((cfg or {}).get("trading", {}) or {}).get("mtf", {}) or {}).get("slope", {}) or {}
+        if bool(scfg.get("enabled", False)):
+            indicator = scfg.get("indicator", "ema20")
+            lookback = int(scfg.get("lookback_weeks", 3))
+            use_partial = bool(scfg.get("use_partial_week", False))
+            # Exclude partial week (last) if not using partial and week incomplete relative to last daily date
+            wk_used = wk_ind.copy()
+            if not use_partial and isinstance(df_slice.index, pd.DatetimeIndex):
+                # If last daily bar is not Friday, we consider last weekly bar partial; drop it
+                if len(wk_used) >= 2 and df_slice.index[-1].weekday() != 4:
+                    wk_used = wk_used.iloc[:-1]
+            if len(wk_used) >= lookback >= 2:
+                if indicator == "ema20" and "EMA20" in wk_used.columns and "EMA50" in wk_used.columns:
+                    series = wk_used["EMA20"].dropna().iloc[-lookback:]
+                    raw = linreg_slope(series)
+                    pct = pct_norm_slope(series)
+                    ema20_last = float(series.iloc[-1]) if len(series) else np.nan
+                    ema50_last = float(wk_used["EMA50"].dropna().iloc[-1]) if len(wk_used["EMA50"].dropna()) else np.nan
+                    gap_pct = (ema20_last/ema50_last - 1.0) if (np.isfinite(ema20_last) and np.isfinite(ema50_last) and ema50_last!=0) else np.nan
+                    out.update({
+                        "weekly_slope_raw": float(raw),
+                        "weekly_slope_pct": float(pct),
+                        "weekly_indicator": "ema20",
+                        "weekly_ema_gap_pct": float(gap_pct),
+                        "weekly_ema20_last": float(ema20_last),
+                        "weekly_ema50_last": float(ema50_last),
+                    })
+                elif indicator == "macd_line" and "MACD" in wk_used.columns and "MACDs" in wk_used.columns:
+                    series = wk_used["MACD"].dropna().iloc[-lookback:]
+                    raw = linreg_slope(series)
+                    out.update({
+                        "weekly_slope_raw": float(raw),
+                        "weekly_slope_pct": float("nan"),
+                        "weekly_indicator": "macd_line",
+                        "weekly_ema_gap_pct": float("nan"),
+                        # Provide last EMA values anyway for downstream completeness if present
+                        "weekly_ema20_last": float(wk_used["EMA20"].dropna().iloc[-1]) if "EMA20" in wk_used.columns and len(wk_used["EMA20"].dropna()) else float("nan"),
+                        "weekly_ema50_last": float(wk_used["EMA50"].dropna().iloc[-1]) if "EMA50" in wk_used.columns and len(wk_used["EMA50"].dropna()) else float("nan"),
+                    })
     except Exception:
-        return {}
+        return out
+    return out
 
 
 # ---------- market regime filters (with details for logging) ----------
