@@ -31,6 +31,34 @@ from strategies.swing_strategy import (
     _nearest_pivot_levels,
 )
 
+# --- Lightweight pattern helpers for hybrid promotion ---
+def _candle_patterns(df: pd.DataFrame, day: pd.Timestamp) -> dict:
+    pat = {"engulf": False, "inside_break": False}
+    try:
+        idx = df.index.get_loc(day)
+        if idx < 1:
+            return pat
+        prev = df.iloc[idx-1]
+        cur = df.iloc[idx]
+        o1, h1, l1, c1 = float(prev.Open), float(prev.High), float(prev.Low), float(prev.Close)
+        o2, h2, l2, c2 = float(cur.Open), float(cur.High), float(cur.Low), float(cur.Close)
+        # Bullish engulf (long): current body engulfs previous body and closes up
+        if (c2 > o2) and (c1 < o1) and (o2 <= c1) and (c2 >= o1):
+            pat["engulf"] = True
+        # Bearish engulf (short)
+        if (c2 < o2) and (c1 > o1) and (o2 >= c1) and (c2 <= o1):
+            pat["engulf"] = True
+        # Inside day break: prior inside bar then break directionally today
+        if idx >= 2:
+            prev2 = df.iloc[idx-2]
+            if (h1 <= float(prev2.High)) and (l1 >= float(prev2.Low)):
+                # inside bar yesterday; today break
+                if h2 > h1 or l2 < l1:
+                    pat["inside_break"] = True
+    except Exception:
+        return pat
+    return pat
+
 # ---------- Helpers ----------
 
 def _trading_calendar(dfs: Dict[str, pd.DataFrame]) -> List[pd.Timestamp]:
@@ -154,6 +182,12 @@ class PendingLimit:
     score: int
     setup_type: str = ""
     ema20_dist_pct: float = float("nan")
+    # Hybrid ladder metadata (optional)
+    ladder_idx: int | None = None            # 0-based index in ladder
+    ladder_size_pct: float | None = None     # allocation slice for this tier
+    activation_date: pd.Timestamp | None = None  # earliest date this tier becomes active (for delayed tiers)
+    signal_close: float | None = None        # original signal close (for extension checks)
+    fixed_qty: int | None = None             # optional explicit quantity override (used for Friday scout remainder)
 
 @dataclass
 class PendingMarket:
@@ -791,6 +825,12 @@ def run_backtest(
     daily_metrics: List[dict] = []
     limit_signals_count = 0
     limit_expired_count = 0
+    market_signals_count = 0
+    # Hybrid ladder diagnostics
+    ladder_fills_count = 0
+    ladder_promotions_count = 0
+    friday_scout_partials = 0
+    monday_gap_deferrals = 0
     # Fundamentals gating counters
     earnings_block_market = 0
     earnings_block_limit_skip = 0
@@ -1112,12 +1152,52 @@ def run_backtest(
                     pass
             if pos.side == "long":
                 if l <= pos.stop:
-                    fill_px = _gap_exit_price("long", o, pos.stop); exit_reason = "stop"
+                    # Weekend gap deferral: if Monday after Friday entry and adverse gap < tolerance R, suppress stop
+                    wg_cfg = (cfg.get("trading", {}) or {}).get("weekend_gap_protect", {}) or {}
+                    if bool(wg_cfg.get("enabled", False)) and pos.per_share_risk > 0:
+                        try:
+                            mon_tol = float(wg_cfg.get("monday_gap_R_tolerance", 0.0))
+                        except Exception:
+                            mon_tol = 0.0
+                        if mon_tol > 0:
+                            # Check if today is Monday and entry was previous Friday
+                            if day.weekday() == 0:  # Monday
+                                prev_bday = day - pd.tseries.offsets.BDay(1)
+                                if isinstance(prev_bday, pd.Timestamp) and pos.entry_date.weekday() == 4:  # Friday
+                                    adverse_gap_R = (pos.entry_price - o) / pos.per_share_risk if o < pos.entry_price else 0.0
+                                    if adverse_gap_R < mon_tol:
+                                        # suppress this stop for today only
+                                        try:
+                                            monday_gap_deferrals += 1
+                                        except Exception:
+                                            pass
+                                    else:
+                                        fill_px = _gap_exit_price("long", o, pos.stop); exit_reason = "stop"
+                            else:
+                                fill_px = _gap_exit_price("long", o, pos.stop); exit_reason = "stop"
+                    else:
+                        fill_px = _gap_exit_price("long", o, pos.stop); exit_reason = "stop"
                 elif h >= pos.target:
                     target_hit = True
             else:
                 if h >= pos.stop:
-                    fill_px = _gap_exit_price("short", o, pos.stop); exit_reason = "stop"
+                    wg_cfg = (cfg.get("trading", {}) or {}).get("weekend_gap_protect", {}) or {}
+                    if bool(wg_cfg.get("enabled", False)) and pos.per_share_risk > 0:
+                        try:
+                            mon_tol = float(wg_cfg.get("monday_gap_R_tolerance", 0.0))
+                        except Exception:
+                            mon_tol = 0.0
+                        if mon_tol > 0 and day.weekday() == 0 and pos.entry_date.weekday() == 4:
+                            adverse_gap_R = (o - pos.entry_price) / pos.per_share_risk if o > pos.entry_price else 0.0
+                            if adverse_gap_R < mon_tol:
+                                try:
+                                    monday_gap_deferrals += 1
+                                except Exception:
+                                    pass
+                            else:
+                                fill_px = _gap_exit_price("short", o, pos.stop); exit_reason = "stop"
+                        else:
+                            fill_px = _gap_exit_price("short", o, pos.stop); exit_reason = "stop"
                 elif l <= pos.target:
                     target_hit = True
 
@@ -1334,11 +1414,41 @@ def run_backtest(
                 if not mtf_ok_fill:
                     pending_markets.remove(pend)
                     continue
+            # Core-at-fill revalidation for market entries (parity with limit path)
+            try:
+                core_fill_cfg = (cfg.get("trading", {}).get("core_at_fill") or {})
+                core_check_enabled = bool(core_fill_cfg.get("enabled", True))
+            except Exception:
+                core_fill_cfg = {}; core_check_enabled = True
+            if core_check_enabled:
+                try:
+                    idx_fill = df.index.get_loc(day)
+                    sl_fill = df.iloc[: idx_fill + 1]
+                    # ensure weekly ctx so Scale energy is valid
+                    wctx_fill = _wcache.get((pend.symbol, idx_fill))
+                    if wctx_fill is None:
+                        wctx_fill = weekly_context(sl_fill, cfg)
+                        _wcache[(pend.symbol, idx_fill)] = wctx_fill
+                    eng_fill = evaluate_five_energies(sl_fill, cfg, weekly_ctx=wctx_fill) or {}
+                    core_count_fill = int(eng_fill.get("core_pass_count", int(eng_fill.get("score", 0))))
+                    core_min_fill = int(core_fill_cfg.get(
+                        "min_core_energies",
+                        (cfg.get("trading", {}) or {}).get("min_core_energies", (cfg.get("trading", {}) or {}).get("min_score", 4))
+                    ))
+                    if bool(core_fill_cfg.get("require_same_direction", True)):
+                        dir_ok = (str(eng_fill.get("direction", "")) == pend.direction)
+                    else:
+                        dir_ok = True
+                    if (not dir_ok) or (core_count_fill < core_min_fill):
+                        pending_markets.remove(pend)
+                        continue
+                except Exception:
+                    # Fail-open on unexpected errors to avoid blocking fills due to evaluator issues
+                    pass
             # Fill-time fundamentals earnings blackout (no network; uses prefetched context)
             try:
                 f_ok, _f_reason = fundamentals_pass_at_fill(pend.symbol, pd.to_datetime(day).date(), cfg, fund_ctx)
             except Exception:
-                # fail-open if anything unexpected
                 f_ok = True; _f_reason = "fail_open_error"
             if not f_ok:
                 # cancel this market entry; do not reschedule
@@ -1408,13 +1518,22 @@ def run_backtest(
             qty_mgr = rm_size_position(cfg_day, entry_px, stop)
             qty_bp = _qty_bp_cap(entry_px, cash, bp_multiple)
             qty = min(qty_mgr, qty_bp)
-            cap_reason = "full_size"
-            if qty_mgr < base_qty:
-                cap_reason = "risk_cap"
-            elif qty < qty_mgr:
-                cap_reason = "bp_cap"
+            # Apply ladder tranche sizing if present
+            if getattr(pend, "ladder_size_pct", None) is not None and qty > 0:
+                ladder_frac = max(0.0, min(1.0, float(pend.ladder_size_pct)))
+                tier_qty = int(math.floor(qty * ladder_frac))
+                if ladder_frac > 0 and tier_qty == 0 and qty > 0:
+                    tier_qty = 1
+                qty = tier_qty
+            # Fixed quantity override (e.g., Monday remainder from Friday scout)
+            if getattr(pend, "fixed_qty", None) is not None:
+                try:
+                    fq = int(pend.fixed_qty)
+                    if fq > 0:
+                        qty = fq
+                except Exception:
+                    pass
             if qty <= 0:
-                pending_markets.remove(pend)
                 continue
             new_total = (_current_total_risk() * max(equity, 1e-9) + psr * qty) / max(equity, 1e-9)
             if new_total > max_risk_pct:
@@ -1441,8 +1560,13 @@ def run_backtest(
             pos_created.entry_ema20_dist_pct = getattr(pos_created, "ema20_dist_pct", float("nan"))
             pos_created.entry_pivot_dist_pct = getattr(pos_created, "pivot_dist_pct", float("nan"))
             pos_created.entry_atr_pct = getattr(pos_created, "atr_pct_entry", float("nan"))
-            # MTF state at fill (capture regardless of exception)
-            wctx_fill = None
+            # Hybrid metrics: ladder fill tracking
+            try:
+                if getattr(pend, "ladder_idx", None) is not None:
+                    ladder_fills_count += 1
+            except Exception:
+                pass
+            # MTF state at fill
             try:
                 idx_fill = df.index.get_loc(day)
                 wctx_fill = _wcache.get((pend.symbol, idx_fill))
@@ -1497,7 +1621,18 @@ def run_backtest(
                     fill_px = pos.target if o >= pos.target else o
                     exit_reason = "target_same_day"
             if exit_reason:
-                slip2 = (slip_bps / 10000.0) * fill_px
+                # Same-day stop tolerance (optional): require minimum adverse R to honor stop_same_day
+                protect_cfg = (cfg.get("trading", {}) or {}).get("same_day_exit_protect", {}) or {}
+                if exit_reason == "stop_same_day" and bool(protect_cfg.get("enabled", False)) and pos.per_share_risk > 0:
+                    try:
+                        min_adverse_R = float(protect_cfg.get("min_adverse_R", 0.0))
+                    except Exception:
+                        min_adverse_R = 0.0
+                    adverse_R = ((pos.entry_price - float(fill_px)) / pos.per_share_risk) if pos.side == "long" else ((float(fill_px) - pos.entry_price) / pos.per_share_risk)
+                    if adverse_R < min_adverse_R:
+                        exit_reason = None; fill_px = None
+                if exit_reason:
+                    slip2 = (slip_bps / 10000.0) * fill_px
                 eff = fill_px - slip2 if pos.side == "long" else fill_px + slip2
                 commission = commission_ps * pos.qty
                 cash += (pos.qty * eff) if pos.side == "long" else (-pos.qty * eff)
@@ -1547,310 +1682,7 @@ def run_backtest(
                     "weekly_slope_mode": getattr(pos, "entry_weekly_slope_mode", ""),
                     "weekly_slope_indicator": getattr(pos, "entry_weekly_slope_indicator", ""),
                 })
-                del open_positions[pend.symbol]
-            else:
-                # Apply adaptive target adjustment after fill if enabled
-                if adapt_enabled and pos.per_share_risk > 0:
-                    # approximate ATR% at entry using pend.atr / entry price
-                    atr_pct = pend.atr / pos.entry_price if pos.entry_price > 0 else 0.0
-                    if atr_pct <= adapt_low_atr_pct:
-                        shrink_mult = adapt_primary_mult
-                        # shrink only if current target distance exceeds multiple
-                        dist_R = (abs(pos.target - pos.entry_price) / pos.per_share_risk) if pos.per_share_risk > 0 else 0.0
-                        if dist_R > 0:
-                            new_dist_R = dist_R * shrink_mult
-                            if pos.side == "long":
-                                pos.target = pos.entry_price + new_dist_R * pos.per_share_risk
-                            else:
-                                pos.target = pos.entry_price - new_dist_R * pos.per_share_risk
-                            pos._adaptive_shrunk = True
-                        else:
-                            pos._adaptive_shrunk = False
-                    else:
-                        pos._adaptive_shrunk = False
-                else:
-                    pos._adaptive_shrunk = False
-            week_new_count[wk] += 1
-            pending_markets.remove(pend)
-
-        # 2) pending limit fills
-        for pend in list(pending_limits):
-            if equity <= equity_halt_floor:
-                pending_limits.clear()
-                break
-            df = data.get(pend.symbol)
-            if df is None or day not in df.index:
-                continue
-            # Skip if symbol already has an open position (avoid duplicate entries)
-            if pend.symbol in open_positions:
-                pending_limits.remove(pend)
-                continue
-            if day < pend.signal_date or day > pend.expires:
-                if day > pend.expires:
-                    pending_limits.remove(pend)
-                    limit_expired_count += 1
-                continue
-            o = float(df.at[day, "Open"])
-            h = float(df.at[day, "High"])
-            l = float(df.at[day, "Low"])
-            hit = (l <= pend.limit_px) if pend.direction == "long" else (h >= pend.limit_px)
-            if not hit:
-                if day == pend.expires:
-                    pending_limits.remove(pend)
-                    limit_expired_count += 1
-                continue
-            # Fill-time MTF alignment gate: only applied when the limit is actually hit today.
-            # If mismatched, skip filling today but keep the pending order until expiry.
-            mtf_rt_cfg = (cfg.get("trading", {}).get("mtf") or {})
-            filter_at_fill = bool(mtf_rt_cfg.get("filter_at_fill", (cfg.get("trading", {}) or {}).get("filter_at_fill", False)))
-            if filter_at_fill:
-                try:
-                    idx_fill = df.index.get_loc(day)
-                    sl_fill = df.iloc[: idx_fill + 1]
-                    wctx_fill = _wcache.get((pend.symbol, idx_fill))
-                    if wctx_fill is None:
-                        wctx_fill = weekly_context(sl_fill, cfg)
-                        _wcache[(pend.symbol, idx_fill)] = wctx_fill
-                    mtf_ok_fill, _ = _mtf_ok_for_slice(sl_fill, cfg, pend.direction, weekly_ctx=wctx_fill)
-                except Exception:
-                    mtf_ok_fill = True
-                if not mtf_ok_fill:
-                    # skip fill today; keep pending for future bars within horizon
-                    continue
-            # Fill-time fundamentals earnings blackout (no network; uses prefetched context)
-            try:
-                f_ok, _f_reason = fundamentals_pass_at_fill(pend.symbol, pd.to_datetime(day).date(), cfg, fund_ctx)
-            except Exception:
-                f_ok = True; _f_reason = "fail_open_error"
-            if not f_ok:
-                # blocked today; keep pending for future bars within horizon
-                earnings_block_limit_skip += 1
-                continue
-            # Fill-time core revalidation (require N-of-5 core energies at fill); default enabled
-            try:
-                core_fill_cfg = (cfg.get("trading", {}).get("core_at_fill") or {})
-                core_check_enabled = bool(core_fill_cfg.get("enabled", True))
-            except Exception:
-                core_fill_cfg = {}; core_check_enabled = True
-            if core_check_enabled:
-                try:
-                    idx_fill = df.index.get_loc(day)
-                    sl_fill = df.iloc[: idx_fill + 1]
-                    # ensure weekly ctx for the slice so Scale energy is valid
-                    wctx_fill = _wcache.get((pend.symbol, idx_fill))
-                    if wctx_fill is None:
-                        wctx_fill = weekly_context(sl_fill, cfg)
-                        _wcache[(pend.symbol, idx_fill)] = wctx_fill
-                    eng_fill = evaluate_five_energies(sl_fill, cfg, weekly_ctx=wctx_fill) or {}
-                    core_count_fill = int(eng_fill.get("core_pass_count", int(eng_fill.get("score", 0))))
-                    core_min_fill = int(core_fill_cfg.get(
-                        "min_core_energies",
-                        (cfg.get("trading", {}) or {}).get("min_core_energies", (cfg.get("trading", {}) or {}).get("min_score", 4))
-                    ))
-                    if bool(core_fill_cfg.get("require_same_direction", True)):
-                        dir_ok = (str(eng_fill.get("direction", "")) == pend.direction)
-                    else:
-                        dir_ok = True
-                    if (not dir_ok) or (core_count_fill < core_min_fill):
-                        # skip fill today; keep pending for future bars within horizon
-                        continue
-                except Exception:
-                    # Fail-open on unexpected errors to avoid blocking fills due to evaluator issues
-                    pass
-            if len(open_positions) >= max_open or (_current_total_risk() >= max_risk_pct):
-                continue
-            wk = _week_key(day)
-            if max_new_week > 0 and week_new_count[wk] >= max_new_week:
-                continue
-            cfg_day = copy.deepcopy(cfg)
-            cfg_day["risk"]["use_broker_equity"] = False
-            cfg_day["risk"]["account_equity"] = float(equity)
-            raw_entry = min(o, pend.limit_px) if pend.direction == "long" else max(o, pend.limit_px)
-            slip = (slip_bps / 10000.0) * raw_entry
-            entry_px = raw_entry + slip if pend.direction == "long" else raw_entry - slip
-            # Compute stop/target: pivot-based in Burns mode, else ATR-based
-            if burns_mode:
-                try:
-                    scfg = (cfg.get("signals", {}) or {}).get("sr_pivots", {}) or {}
-                    lookback = int(scfg.get("lookback", 60))
-                    left = int(scfg.get("left", 3))
-                    right = int(scfg.get("right", 3))
-                    # Use history up to the prior bar (today's bar not complete at hit time)
-                    try:
-                        idx_fill = df.index.get_loc(day)
-                        df_past = df.iloc[:max(1, idx_fill)]
-                    except Exception:
-                        df_past = df
-                    support, resistance = _nearest_pivot_levels(df_past, lookback, left, right, price=entry_px)
-                    pad_atr_mult = float(cfg.get("risk", {}).get("pad_atr_for_pivot_stop", 0.25))
-                    min_stop_pct = float(cfg.get("risk", {}).get("min_stop_pct", 0.0))
-                    pad = 0.0
-                    if np.isfinite(pend.atr) and pend.atr > 0:
-                        pad = max(pad, pad_atr_mult * pend.atr)
-                    if entry_px > 0 and min_stop_pct > 0:
-                        pad = max(pad, min_stop_pct * entry_px)
-                    reward_mult = float(cfg.get("risk", {}).get("reward_multiple", 2.0))
-                    stop = target = None
-                    if pend.direction == "long" and support is not None and support < entry_px:
-                        stop = round(max(0.01, support - pad), 2)
-                        per_r = entry_px - stop
-                        if per_r > 0:
-                            target = round(entry_px + reward_mult * per_r, 2)
-                    elif pend.direction == "short" and resistance is not None and resistance > entry_px:
-                        stop = round(resistance + pad, 2)
-                        per_r = stop - entry_px
-                        if per_r > 0:
-                            target = round(entry_px - reward_mult * per_r, 2)
-                    if stop is None or target is None:
-                        stop, target = rm_compute_levels(pend.direction, entry_px, pend.atr, float(cfg["risk"]["atr_multiple_stop"]), float(cfg["risk"]["reward_multiple"]))
-                except Exception:
-                    stop, target = rm_compute_levels(pend.direction, entry_px, pend.atr, float(cfg["risk"]["atr_multiple_stop"]), float(cfg["risk"]["reward_multiple"]))
-            else:
-                stop, target = rm_compute_levels(pend.direction, entry_px, pend.atr, float(cfg["risk"]["atr_multiple_stop"]), float(cfg["risk"]["reward_multiple"]))
-            if stop is None or target is None:
-                continue
-            stop, target = _enforce_floor(pend.direction, entry_px, stop, target)
-            if target <= 0:
-                continue
-            qty_mgr = rm_size_position(cfg_day, entry_px, stop)
-            # Cap by available cash buying power only
-            qty_bp = _qty_bp_cap(entry_px, cash, bp_multiple)
-            qty = min(qty_mgr, qty_bp)
-            if qty <= 0:
-                continue
-            psr = abs(entry_px - stop)
-            new_total = (_current_total_risk() * max(equity, 1e-9) + psr * qty) / max(equity, 1e-9)
-            if new_total > max_risk_pct:
-                continue
-            # Derive cap reason (risk vs BP)
-            try:
-                risk_dollars = float(cfg_day.get("risk", {}).get("risk_per_trade_pct", 0.0)) * float(equity)
-                base_qty = int(math.floor(risk_dollars / max(psr, 1e-12))) if risk_dollars > 0 else 0
-            except Exception:
-                base_qty = 0
-            cap_reason = "full_size"
-            if qty_mgr < base_qty:
-                cap_reason = "risk_cap"
-            elif qty < qty_mgr:
-                cap_reason = "bp_cap"
-            commission = commission_ps * qty
-            cash += (-qty * entry_px) if pend.direction == "long" else (qty * entry_px)
-            cash -= commission
-            position_id_counter += 1
-            open_positions[pend.symbol] = Position(pend.symbol, pend.direction, day, entry_px, qty, stop, target, psr, pend.score, False, position_id=position_id_counter)
-            entries_audit.append({
-                "position_id": position_id_counter,
-                "symbol": pend.symbol,
-                "entry_date": day,
-                "entry_price": entry_px,
-                "qty": qty,
-                "entry_commission": commission,
-                "entry_cash_flow": ((-qty * entry_px) if pend.direction == "long" else (qty * entry_px)) - commission,
-                "order_type": "limit",
-            })
-            week_new_count[wk] += 1
-            pending_limits.remove(pend)
-            pos_created = open_positions[pend.symbol]
-            pos_created.atr_pct_entry = float(pend.atr / entry_px) if entry_px > 0 else np.nan
-            pos_created.target_R_at_entry = (abs(pos_created.target - pos_created.entry_price) / pos_created.per_share_risk) if pos_created.per_share_risk > 0 else np.nan
-            # Limit retrace assumed pullback setup
-            pos_created.setup_type = getattr(pend, "setup_type", "pullback")
-            pos_created.qty_cap_reason = cap_reason
-            # Entry diagnostics
-            pos_created.entry_setup_type = pos_created.setup_type
-            try:
-                pos_created.entry_adx14 = float(df.at[day, "ADX14"]) if "ADX14" in df.columns else float("nan")
-            except Exception:
-                pos_created.entry_adx14 = float("nan")
-            pos_created.entry_rvol20 = _compute_rvol20(df, day)
-            pos_created.entry_ema20_dist_pct = getattr(pos_created, "ema20_dist_pct", float("nan"))
-            pos_created.entry_pivot_dist_pct = getattr(pos_created, "pivot_dist_pct", float("nan"))
-            pos_created.entry_atr_pct = getattr(pos_created, "atr_pct_entry", float("nan"))
-            # MTF state at fill
-            try:
-                idx_fill = df.index.get_loc(day)
-                wctx_fill = _wcache.get((pend.symbol, idx_fill))
-                if wctx_fill is None:
-                    wctx_fill = weekly_context(df.iloc[: idx_fill + 1], cfg)
-                    _wcache[(pend.symbol, idx_fill)] = wctx_fill
-                pos_created.entry_mtf_state = _derive_mtf_state_from_ctx(wctx_fill)
-            except Exception:
-                pos_created.entry_mtf_state = ""
-            # days to fill for limit (0 if same day)
-            try:
-                pos_created.days_to_fill = float((day - pend.signal_date).days)
-            except Exception:
-                pos_created.days_to_fill = float("nan")
-            pos_created.order_type = "limit"
-            pos = open_positions[pend.symbol]
-            exit_reason = None
-            fill_px = None
-            if pos.side == "long":
-                if l <= pos.stop:
-                    fill_px = _gap_exit_price("long", o, pos.stop)
-                    exit_reason = "stop_same_day"
-                elif h >= pos.target:
-                    fill_px = pos.target if o <= pos.target else o
-                    exit_reason = "target_same_day"
-            else:
-                if h >= pos.stop:
-                    fill_px = _gap_exit_price("short", o, pos.stop)
-                    exit_reason = "stop_same_day"
-                elif l <= pos.target:
-                    fill_px = pos.target if o >= pos.target else o
-                    exit_reason = "target_same_day"
-            if exit_reason:
-                slip2 = (slip_bps / 10000.0) * fill_px
-                eff = fill_px - slip2 if pos.side == "long" else fill_px + slip2
-                commission = commission_ps * pos.qty
-                cash += (pos.qty * eff) if pos.side == "long" else (-pos.qty * eff)
-                cash -= commission
-                pnl = (eff - pos.entry_price) * pos.qty if pos.side == "long" else (pos.entry_price - eff) * pos.qty
-                trades.append({
-                    "symbol": pend.symbol,
-                    "side": pos.side,
-                    "entry_date": pos.entry_date,
-                    "entry_price": pos.entry_price,
-                    "exit_date": day,
-                    "exit_price": eff,
-                    "qty": pos.qty,
-                    "pnl": pnl,
-                    "r_multiple": pnl / (pos.per_share_risk * pos.qty) if pos.per_share_risk > 0 else np.nan,
-                    "commission": commission,
-                    "slippage_cost": slip2 * pos.qty,
-                    "reason": exit_reason,
-                    "part": "full",
-                    "bars_held": pos.bars_held,
-                    "mfe_R": pos.max_favorable_R,
-                    "atr_pct_entry": float(pend.atr / pos.entry_price) if pos.entry_price > 0 else np.nan,
-                    "target_R_at_entry": (abs(pos.target - pos.entry_price) / pos.per_share_risk) if pos.per_share_risk > 0 else np.nan,
-                    "adaptive_shrunk": False,
-                    # Entry diag copy
-                    "entry_setup_type": getattr(pos, "entry_setup_type", pos.setup_type),
-                    "entry_adx14": getattr(pos, "entry_adx14", np.nan),
-                    "entry_rvol20": getattr(pos, "entry_rvol20", np.nan),
-                    "entry_ema20_dist_pct": getattr(pos, "entry_ema20_dist_pct", np.nan),
-                    "entry_pivot_dist_pct": getattr(pos, "entry_pivot_dist_pct", np.nan),
-                    "entry_atr_pct": getattr(pos, "entry_atr_pct", np.nan),
-                    "entry_mtf_state": getattr(pos, "entry_mtf_state", ""),
-                    "qty_cap_reason": getattr(pos, "qty_cap_reason", "full_size"),
-                    "order_type": getattr(pos, "order_type", "limit"),
-                    "days_to_fill": getattr(pos, "days_to_fill", np.nan),
-                    # Lifecycle
-                    "time_to_BE_bars": getattr(pos, "time_to_BE_bars", None),
-                    "time_to_1R_bars": getattr(pos, "time_to_1R_bars", None),
-                    "be_armed_bar": getattr(pos, "be_armed_bar", None),
-                    "trail_active_bar": getattr(pos, "trail_active_bar", None),
-                    "position_id": pos.position_id,
-                    "weekly_slope_val": getattr(pos, "entry_weekly_slope_val", np.nan),
-                    "weekly_slope_used": getattr(pos, "entry_weekly_slope_used", False),
-                    "weekly_slope_ok": getattr(pos, "entry_weekly_slope_ok", True),
-                    "weekly_mtf_marginal": getattr(pos, "entry_weekly_mtf_marginal", False),
-                    "weekly_ema_gap_pct": getattr(pos, "entry_weekly_ema_gap_pct", np.nan),
-                    "weekly_slope_mode": getattr(pos, "entry_weekly_slope_mode", ""),
-                    "weekly_slope_indicator": getattr(pos, "entry_weekly_slope_indicator", ""),
-                })
-                del open_positions[pend.symbol]
+                del open_positions[sym]
             else:
                 # Apply adaptive target adjustment for limit fills if enabled
                 if adapt_enabled and pos.per_share_risk > 0:
@@ -1869,8 +1701,6 @@ def run_backtest(
                             pos._adaptive_shrunk = False
                     else:
                         pos._adaptive_shrunk = False
-                else:
-                    pos._adaptive_shrunk = False
 
         # 3) new signals (queued for future fills)
         candidates_today = sorted(
@@ -1885,6 +1715,95 @@ def run_backtest(
             if len(open_positions) >= max_open or (_current_total_risk() >= max_risk_pct):
                 break
             df = data[sig["symbol"]]
+            # Hybrid ladder entry (pullback ladder + breakout fallback) injection point
+            hybrid_cfg = (cfg.get("trading", {}) or {}).get("hybrid_entry", {}) or {}
+            hybrid_enabled = bool(hybrid_cfg.get("enabled", False))
+            weekend_cfg = (cfg.get("trading", {}) or {}).get("weekend_gap_protect", {}) or {}
+            # Only apply laddering on pullback setups when entry model is limit_retrace like behavior
+            if hybrid_enabled and sig.get("setup_type") == "pullback":
+                # Derive ladder levels relative to EMA20 (same anchor as limit_retrace retrace_to EMA20)
+                ladder_levels = list(hybrid_cfg.get("ladder_levels_atr", []))
+                ladder_sizes = list(hybrid_cfg.get("ladder_sizes_pct", []))
+                if ladder_levels and ladder_sizes and len(ladder_levels) == len(ladder_sizes):
+                    total_pct = sum(ladder_sizes)
+                    if total_pct > 0:
+                        ladder_sizes = [x / total_pct for x in ladder_sizes]
+                    ema_anchor = sig["ema20"] if np.isfinite(sig.get("ema20", np.nan)) else sig["close"]
+                    horizon_days = int(hybrid_cfg.get("max_ladder_days", 3))
+                    expires = sig["date"] + pd.tseries.offsets.BDay(horizon_days)
+                    for idx_ll, frac_atr in enumerate(ladder_levels):
+                        if not np.isfinite(sig.get("atr", np.nan)):
+                            continue
+                        if sig["direction"] == "long":
+                            limit_px = ema_anchor - float(frac_atr) * sig["atr"]
+                        else:
+                            limit_px = ema_anchor + float(frac_atr) * sig["atr"]
+                        # Activation: allow immediate activation for first tier, delayed (signal_date+idx) for subsequent to stagger if desired
+                        activation_delay_days = 0  # simple: all active immediately; could extend to idx_ll if needed
+                        activation_date = sig["date"] + pd.tseries.offsets.BDay(activation_delay_days)
+                        # Friday scout sizing: if Friday and first ladder tier triggers, reduce size and schedule remainder for Monday as fixed qty order
+                        friday_scout_pct = 0.0
+                        if weekend_cfg.get("enabled", False):
+                            try:
+                                friday_scout_pct = float(weekend_cfg.get("friday_scout_pct", 0.0))
+                            except Exception:
+                                friday_scout_pct = 0.0
+                        is_friday = sig["date"].weekday() == 4
+                        fixed_qty_override = None
+                        pending_limits.append(
+                            PendingLimit(
+                                sig["symbol"],
+                                sig["direction"],
+                                sig["date"],
+                                expires,
+                                float(limit_px),
+                                float(sig["atr"]),
+                                int(sig.get("score_eff", sig["score"])),
+                                setup_type=sig.get("setup_type", ""),
+                                ema20_dist_pct=float(sig.get("ema20_dist_pct", np.nan)),
+                                ladder_idx=idx_ll,
+                                ladder_size_pct=float(ladder_sizes[idx_ll]),
+                                activation_date=activation_date,
+                                signal_close=float(sig.get("close", np.nan)),
+                                fixed_qty=fixed_qty_override,
+                            )
+                        )
+                        limit_signals_count += 1
+                        # If Friday scout active and this is first tier: create a second PendingLimit for Monday with remaining size
+                        if is_friday and idx_ll == 0 and friday_scout_pct > 0 and friday_scout_pct < 1:
+                            try:
+                                monday = sig["date"] + pd.tseries.offsets.BDay(1)
+                            except Exception:
+                                monday = sig["date"]
+                            rem_frac = ladder_sizes[idx_ll] * (1 - friday_scout_pct)
+                            scout_frac = ladder_sizes[idx_ll] * friday_scout_pct
+                            # Adjust original first tier size pct to scout fraction (modify last appended object)
+                            try:
+                                pending_limits[-1].ladder_size_pct = scout_frac
+                            except Exception:
+                                pass
+                            pending_limits.append(
+                                PendingLimit(
+                                    sig["symbol"],
+                                    sig["direction"],
+                                    sig["date"],
+                                    expires,
+                                    float(limit_px),
+                                    float(sig["atr"]),
+                                    int(sig.get("score_eff", sig["score"])),
+                                    setup_type=sig.get("setup_type", ""),
+                                    ema20_dist_pct=float(sig.get("ema20_dist_pct", np.nan)),
+                                    ladder_idx=idx_ll,  # same tier remainder
+                                    ladder_size_pct=rem_frac,
+                                    activation_date=monday,
+                                    signal_close=float(sig.get("close", np.nan)),
+                                    fixed_qty=None,
+                                )
+                            )
+                            limit_signals_count += 1
+                            friday_scout_partials += 1
+                    # skip default entry model handling for this signal
+                    continue
             if entry_type == "market":
                 idx = df.index.get_indexer([sig["date"]])[0]
                 if idx == -1 or idx + 1 >= len(df.index):
@@ -1904,6 +1823,14 @@ def run_backtest(
                         ema20_dist_pct=float(sig.get("ema20_dist_pct", np.nan)),
                     )
                 )
+                market_signals_count += 1
+                # Hybrid metrics: promotion occurred
+                try:
+                    if getattr(pend, "ladder_idx", None) is not None:
+                        ladder_promotions_count += 1
+                except Exception:
+                    pass
+                pending_limits.remove(pend)
             elif entry_type == "limit_retrace":
                 ema = sig["ema20"] if retrace_ref == "EMA20" else sig["close"]
                 limit_px = (ema - atr_frac * sig["atr"]) if sig["direction"] == "long" else (ema + atr_frac * sig["atr"])
@@ -1987,8 +1914,7 @@ def run_backtest(
                     "pnl": pnl,
                     "r_multiple": pnl / (pos.per_share_risk * pos.qty) if pos.per_share_risk > 0 else np.nan,
                     "commission": commission,
-                    "slippage_cost": slip * pos.qty,
-                    "reason": "force_end",
+                    "slippage_cost": slip * pos.qty, "reason": "force_end",
                     "part": ("runner" if pos.scaled else "full"),
                     "bars_held": pos.bars_held,
                     "mfe_R": pos.max_favorable_R,
@@ -2002,9 +1928,7 @@ def run_backtest(
                     "weekly_slope_indicator": getattr(pos, "entry_weekly_slope_indicator", ""),
                 })
                 del open_positions[sym]
-            equity_today = cash
-            equity_curve[-1] = (day, equity_today)
-            equity = float(equity_today)
+                continue
 
     # --- Post-loop safeguard: force close any residual open positions lacking data on final calendar day ---
     residual_force_closes = 0
@@ -2326,6 +2250,11 @@ def run_backtest(
     "limit_expired": int(limit_expired_count),
     "avg_days_to_fill": float(avg_days_to_fill),
     "market_fills": int(market_fills),
+    "market_signals": int(market_signals_count),
+    "ladder_fills": int(ladder_fills_count),
+    "ladder_promotions": int(ladder_promotions_count),
+    "friday_scout_partials": int(friday_scout_partials),
+    "monday_gap_deferrals": int(monday_gap_deferrals),
     # rates
     "same_day_exit_rate": float(same_day_exit_rate),
     "one_bar_exit_rate": float(one_bar_exit_rate),
@@ -2468,6 +2397,11 @@ def run_backtest(
         print(f"  limit_expired        : {summary['limit_expired']}")
         print(f"  avg_days_to_fill     : {summary['avg_days_to_fill']:.2f}" if np.isfinite(summary['avg_days_to_fill']) else "  avg_days_to_fill     : N/A")
         print(f"  market_fills         : {summary['market_fills']}")
+        print(f"  market_signals       : {summary['market_signals']}")
+        print(f"  ladder_fills         : {summary.get('ladder_fills', 0)}")
+        print(f"  ladder_promotions    : {summary.get('ladder_promotions', 0)}")
+        print(f"  friday_scout_partials: {summary.get('friday_scout_partials', 0)}")
+        print(f"  monday_gap_deferrals : {summary.get('monday_gap_deferrals', 0)}")
         if (earnings_block_market + earnings_block_limit_skip + earnings_block_scan) > 0:
             print("  fundamentals blocks  :")
             if earnings_block_scan > 0:

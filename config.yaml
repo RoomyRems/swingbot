@@ -107,7 +107,7 @@ fundamentals:
       - "going concern"
   # Backtest-only networking policy and cache settings
   backtest_mode:
-    network: live_ok   # off | prefetch_only | live_ok
+    network: prefetch_only   # off | prefetch_only | live_ok
     cache_dir: cache/fundamentals
     ttl_days: 14
     fail_policy: fail_open   # if network=off and cache miss: fail_open | fail_closed
@@ -213,12 +213,39 @@ trading:
       indicator: "ema20"       # ema20 | macd_line
       lookback_weeks: 3
       mode: "confirm"          # confirm | gate
-      min_norm_slope_per_week: 0.0
+      min_norm_slope_per_week: 0.00  # %/week normalized slope threshold
       deadband: 0.0002
       macd_deadband: 0.05
       ema_gap_min_pct: 0.004
       use_partial_week: false
       log_fields: true
+
+  # Protect against trivial same-day stop-outs on market/limit fills
+  same_day_exit_protect:
+    enabled: true
+    min_adverse_R: 0.40   # require >= 0.4R adverse move on fill day to honor stop_same_day
+
+  # Hybrid Burns pullback ladder + breakout fallback (disabled by default)
+  hybrid_entry:
+    enabled: true              # master toggle
+    mode: "pullback_ladder"       # future extension point
+    ladder_levels_atr: [0.10, 0.20, 0.30]   # fractions of ATR below (long) / above (short) EMA20 for limit tiers
+    ladder_sizes_pct: [0.30, 0.40, 0.30]    # position size allocation per tier (sum 1.0)
+    max_ladder_days: 3          # horizon for ladder orders before promotion logic considered
+    promote_after_days: 2       # if no fill after N bars, allow breakout promotion
+    promote_to: "market_breakout"  # or "skip" (do nothing)
+    breakout_confirm_pattern: false   # require pattern (engulf / inside_break) on promotion
+    breakout_pattern_modes: ["engulf", "inside_break"]
+    breakout_extension_max_pct: 0.05  # cap distance above signal close (long) for breakout promotion
+    require_momentum_on_promotion: true  # momentum energy must still be valid to promote
+    min_core_energies_promotion: 4
+
+  # Weekend gap protections & Friday scout sizing
+  weekend_gap_protect:
+    enabled: true
+    friday_scout_pct: 0.40      # if first ladder tier triggers on Friday, optionally size only this % of its tier (rest Monday)
+    monday_gap_R_tolerance: 0.50  # suppress stop on Monday open if adverse gap < this R (re-arm next day)
+    apply_to: ["ladder_first_fill"]   # future: could extend to all Friday fills
 
 ### ---------- For backtesting ---------- ###
 backtest:
@@ -227,7 +254,7 @@ backtest:
   commission_per_share: 0.00
   slippage_bps: 2.0
   allow_short: false             # optional: start long-only; re-enable later
-  max_open_positions: 1000       # effectively unlimited for this universe
+  max_open_positions: 10000       # effectively unlimited for this universe
   max_total_risk_pct: 0.08
   max_new_trades_per_week: 0     # 0 = unlimited
   touch_priority: "stop_first"
