@@ -1703,6 +1703,135 @@ def run_backtest(
                         pos._adaptive_shrunk = False
 
         # 3) new signals (queued for future fills)
+        # 2) process pending limit orders (standard + hybrid ladder)
+        for pend in list(pending_limits):
+            # Expiry first
+            if day > pend.expires:
+                pending_limits.remove(pend)
+                limit_expired_count += 1
+                continue
+            # Activation gating (e.g., Monday remainder from Friday scout)
+            if getattr(pend, "activation_date", None) and day < pend.activation_date:  # type: ignore
+                continue
+            df_p = data.get(pend.symbol)
+            if df_p is None or day not in df_p.index:
+                continue
+            # Skip if we already opened this symbol (single position policy)
+            if pend.symbol in open_positions:
+                continue
+            o = float(df_p.at[day, "Open"]); h = float(df_p.at[day, "High"]); l = float(df_p.at[day, "Low"])
+            # Touch test (daily bars)
+            touched = False
+            if pend.direction == "long":
+                if l <= pend.limit_px <= h:
+                    touched = True
+            else:
+                if h >= pend.limit_px >= l:
+                    touched = True
+            if not touched:
+                continue
+            # Fill path
+            entry_px = pend.limit_px
+            slip = (slip_bps / 10000.0) * entry_px if slip_bps > 0 else 0.0
+            entry_px_eff = entry_px + slip if pend.direction == "long" else entry_px - slip
+            # Compute stop/target (pivot preference in Burns)
+            if burns_mode:
+                try:
+                    scfg = (cfg.get("signals", {}) or {}).get("sr_pivots", {}) or {}
+                    lookback = int(scfg.get("lookback", 60)); left = int(scfg.get("left", 3)); right = int(scfg.get("right", 3))
+                    idx_fill = df_p.index.get_loc(day)
+                    hist = df_p.iloc[: max(1, idx_fill)]
+                    support, resistance = _nearest_pivot_levels(hist, lookback, left, right, price=entry_px)
+                    pad_atr_mult = float(cfg.get("risk", {}).get("pad_atr_for_pivot_stop", 0.25))
+                    min_stop_pct = float(cfg.get("risk", {}).get("min_stop_pct", 0.0))
+                    pad = 0.0
+                    if pend.atr > 0:
+                        pad = max(pad, pad_atr_mult * pend.atr)
+                    if entry_px > 0 and min_stop_pct > 0:
+                        pad = max(pad, min_stop_pct * entry_px)
+                    reward_mult = float(cfg.get("risk", {}).get("reward_multiple", 2.0))
+                    stop = target = None
+                    if pend.direction == "long" and support is not None and support < entry_px:
+                        stop = round(max(0.01, support - pad), 2); per_r = entry_px - stop
+                        if per_r > 0:
+                            target = round(entry_px + reward_mult * per_r, 2)
+                    elif pend.direction == "short" and resistance is not None and resistance > entry_px:
+                        stop = round(resistance + pad, 2); per_r = stop - entry_px
+                        if per_r > 0:
+                            target = round(entry_px - reward_mult * per_r, 2)
+                    if stop is None or target is None:
+                        stop, target = rm_compute_levels(pend.direction, entry_px, pend.atr, float(cfg["risk"]["atr_multiple_stop"]), float(cfg["risk"]["reward_multiple"]))
+                except Exception:
+                    stop, target = rm_compute_levels(pend.direction, entry_px, pend.atr, float(cfg["risk"]["atr_multiple_stop"]), float(cfg["risk"]["reward_multiple"]))
+            else:
+                stop, target = rm_compute_levels(pend.direction, entry_px, pend.atr, float(cfg["risk"]["atr_multiple_stop"]), float(cfg["risk"]["reward_multiple"]))
+            if stop is None or target is None or target <= 0:
+                pending_limits.remove(pend)
+                continue
+            stop, target = _enforce_floor(pend.direction, entry_px, stop, target)
+            psr = abs(entry_px - stop)
+            if psr <= 0:
+                pending_limits.remove(pend)
+                continue
+            qty = rm_size_position(cfg, entry_px, stop)
+            # Apply ladder tranche sizing and/or fixed quantity override
+            if getattr(pend, "ladder_size_pct", None) is not None and qty > 0:
+                try:
+                    frac = float(pend.ladder_size_pct)
+                    frac = max(0.0, min(1.0, frac))
+                    adj = int(math.floor(qty * frac))
+                    if frac > 0 and adj == 0 and qty > 0:
+                        adj = 1
+                    qty = adj
+                except Exception:
+                    pass
+            if getattr(pend, "fixed_qty", None) is not None:
+                try:
+                    fq = int(pend.fixed_qty)
+                    if fq > 0:
+                        qty = fq
+                except Exception:
+                    pass
+            if qty <= 0:
+                pending_limits.remove(pend)
+                continue
+            # Portfolio risk & caps
+            new_total = (_current_total_risk() * max(equity, 1e-9) + psr * qty) / max(equity, 1e-9)
+            if new_total > max_risk_pct or len(open_positions) >= max_open:
+                pending_limits.remove(pend)
+                continue
+            commission = commission_ps * qty
+            cash += (-qty * entry_px_eff) if pend.direction == "long" else (qty * entry_px_eff)
+            cash -= commission
+            position_id_counter += 1
+            open_positions[pend.symbol] = Position(pend.symbol, pend.direction, day, entry_px_eff, qty, stop, target, psr, pend.score, position_id=position_id_counter)
+            pos_created = open_positions[pend.symbol]
+            pos_created.order_type = "limit"
+            pos_created.setup_type = pend.setup_type
+            pos_created.entry_setup_type = pend.setup_type
+            pos_created.days_to_fill = (day - pend.signal_date).days if isinstance(pend.signal_date, pd.Timestamp) else float("nan")
+            pos_created.atr_pct_entry = pend.atr / entry_px_eff if entry_px_eff > 0 else np.nan
+            pos_created.entry_ema20_dist_pct = pend.ema20_dist_pct
+            # Hybrid metric increment
+            try:
+                if getattr(pend, "ladder_idx", None) is not None:
+                    ladder_fills_count += 1
+            except Exception:
+                pass
+            entries_audit.append({
+                "position_id": pos_created.position_id,
+                "symbol": pend.symbol,
+                "entry_date": day,
+                "entry_price": entry_px_eff,
+                "qty": qty,
+                "entry_commission": commission,
+                "entry_cash_flow": ((-qty * entry_px_eff) if pend.direction == "long" else (qty * entry_px_eff)) - commission,
+                "order_type": "limit",
+            })
+            pending_limits.remove(pend)
+
+        # (Promotion of stale ladder tiers to market breakout could be added here later)
+
         candidates_today = sorted(
             candidates_by_day.get(day, []),
             key=lambda s: (-s.get("score_eff", s["score"]), -s.get("adx", 0.0), -s.get("atr", 0.0), -s.get("close", 0.0)),
@@ -1824,13 +1953,6 @@ def run_backtest(
                     )
                 )
                 market_signals_count += 1
-                # Hybrid metrics: promotion occurred
-                try:
-                    if getattr(pend, "ladder_idx", None) is not None:
-                        ladder_promotions_count += 1
-                except Exception:
-                    pass
-                pending_limits.remove(pend)
             elif entry_type == "limit_retrace":
                 ema = sig["ema20"] if retrace_ref == "EMA20" else sig["close"]
                 limit_px = (ema - atr_frac * sig["atr"]) if sig["direction"] == "long" else (ema + atr_frac * sig["atr"])
