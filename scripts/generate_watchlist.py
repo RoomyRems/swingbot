@@ -217,9 +217,8 @@ def generate(universes: List[str], alpaca_filter: bool, include_iwv: bool, iwv_t
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Generate configurable multi-index watchlist")
+    parser = argparse.ArgumentParser(description="Generate configurable multi-index watchlist (always overwrites watchlist.txt)")
     parser.add_argument("--universes", nargs="*", help="Universes to include (override config)")
-    parser.add_argument("--out", default=default_output_path(), help="Output file path")
     parser.add_argument("--alpaca-filter", action="store_true", help="Apply Alpaca active/tradable filter")
     parser.add_argument("--include-iwv", action="store_true", help="Merge IWV holdings (Russell proxy)")
     parser.add_argument("--iwv-ttl-days", type=int, default=None, help="IWV cache TTL days (override config)")
@@ -235,7 +234,7 @@ def main(argv: list[str] | None = None) -> int:
     iwv_force_refresh = args.iwv_force_refresh or bool(wcfg.get("iwv_force_refresh", False))
 
     syms = generate(universes, alpaca_filter, include_iwv, iwv_ttl_days, iwv_force_refresh)
-    out_path = os.path.abspath(args.out)
+    out_path = default_output_path()  # always canonical watchlist.txt
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     with open(out_path, "w", encoding="utf-8") as f:
         for s in syms:

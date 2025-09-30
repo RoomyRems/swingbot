@@ -113,7 +113,7 @@ Universes:
 - `russell3000` – Full Russell 3000 constituents (direct scrape)
 - `all` – Expands to every supported list above
 
-Command line overrides config:
+Command line overrides config (always writes to canonical `watchlist.txt` in project root; previous file is overwritten):
 ```
 python scripts/generate_watchlist.py                    # uses config.yaml universes
 python scripts/generate_watchlist.py --universes sp500  # only S&P 500
@@ -121,7 +121,7 @@ python scripts/generate_watchlist.py --universes sp1000 russell3000 --alpaca-fil
 python scripts/generate_watchlist.py --universes all --include-iwv
 ```
 
-Output is written to `watchlist.txt` (or a custom path via `--out`). Duplicates across indices are removed and (optionally) filtered via Alpaca for active + tradable symbols.
+The script now intentionally ignores any custom output path and always overwrites `watchlist.txt` to avoid proliferation of stale watchlist files. Duplicates across indices are removed and (optionally) filtered via Alpaca for active + tradable symbols.
 
 If you enable `include_iwv`, current IWV ETF holdings are merged (with cache TTL) to approximate broader Russell exposure; note survivorship bias & API rate considerations.
 
