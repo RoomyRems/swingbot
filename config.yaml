@@ -74,7 +74,7 @@ volume:
 
 regime:
   enabled: true
-  adx_min: 16
+  adx_min: 18            # raised from 16 to avoid weak regime entries
   atr_pct_min: 0.010
   use_chop: true
   chop_window: 14
@@ -173,13 +173,14 @@ trading:
 
   filters:                      # additional trade-level gating
     min_atr_pct: 0.011          # relaxed to admit slightly lower volatility names
-    max_extension_pct: 0.06     # reject stretched entries
+    max_extension_pct: 0.055    # modest tighten
     min_avg_vol50: 0       # liquidity floor (50d avg volume)
-    pullback_tolerance_pct: 0.035  # loosened to capture more pullbacks
+    pullback_tolerance_pct: 0.030  # slightly tighter pullback proximity
     value_zone_max_ext_pct: 0.025   # Burns: acceptable extension from EMA20 for valid pullback entry
-    value_zone_reject_tail_min: 0.40 # relaxed from 0.55 (long)
-    value_zone_reject_tail_min_short: 0.40 # relaxed from 0.55 (short)
-    value_zone_touch_atr_max: 0.60    # max ATR multiple below EMA20 (or above for shorts) allowed for pullback low/high
+    value_zone_reject_tail_min: 0.50 # tighten rejection tail requirement (long)
+    value_zone_reject_tail_min_short: 0.50 # tighten rejection tail requirement (short)
+    value_zone_touch_atr_max: 0.45    # avoid deep fading pulls
+    pullback_adx_min: 20             # new: floor for pullback setups only
     cycle_oversold: 25               # SlowK threshold oversold (long)
     cycle_overbought: 75             # SlowK threshold overbought (short)
     cycle_cross_lookback: 3          # bars within which a valid stochastic cross must have occurred
@@ -194,7 +195,20 @@ trading:
     scale_out_pct: 0.5
     adx_min_for_runner: 20
 
-  volume_tiebreak_core4: false  # relaxed: allow core-min without volume confirm (diagnostic)
+  volume_tiebreak_core4: true  # relaxed: allow core-min without volume confirm (diagnostic)
+
+  # Reject extended, weak breakouts (combined gate)
+  breakout_extension_gate:
+    enabled: true
+    hard_ema20_dist_pct: 0.065       # reject above 6.5%
+    soft_ema20_dist_pct: 0.045       # soft band above 4.5%
+    weak_adx14: 20                   # if ADX < 20 tighten
+    weak_ext_pct: 0.040              # max extension when ADX weak
+    min_atr_pct: 0.022               # require sufficient ATR% for gating context
+    require_volume_in_soft_band: true
+    require_cluster_in_soft_band: true
+    risk_scale_soft_band: 0.6        # scale risk in soft band
+    fill_day_recheck: true
 
   mtf:                          # higher timeframe confirmation
     enabled: true
@@ -213,7 +227,7 @@ trading:
       indicator: "ema20"       # ema20 | macd_line
       lookback_weeks: 3
       mode: "confirm"          # confirm | gate
-      min_norm_slope_per_week: 0.00  # %/week normalized slope threshold
+      min_norm_slope_per_week: 0.0045  # modest threshold inside suggested band
       deadband: 0.0002
       macd_deadband: 0.05
       ema_gap_min_pct: 0.004
@@ -225,31 +239,15 @@ trading:
     enabled: true
     min_adverse_R: 0.40   # require >= 0.4R adverse move on fill day to honor stop_same_day
 
-  # Hybrid Burns pullback ladder + breakout fallback (disabled by default)
-  hybrid_entry:
-    enabled: true              # master toggle
-    mode: "pullback_ladder"       # future extension point
-    ladder_levels_atr: [0.10, 0.20, 0.30]   # fractions of ATR below (long) / above (short) EMA20 for limit tiers
-    ladder_sizes_pct: [0.30, 0.40, 0.30]    # position size allocation per tier (sum 1.0)
-    max_ladder_days: 3          # horizon for ladder orders before promotion logic considered
-    promote_after_days: 2       # if no fill after N bars, allow breakout promotion
-    promote_to: "market_breakout"  # or "skip" (do nothing)
-    breakout_confirm_pattern: false   # require pattern (engulf / inside_break) on promotion
-    breakout_pattern_modes: ["engulf", "inside_break"]
-    breakout_extension_max_pct: 0.05  # cap distance above signal close (long) for breakout promotion
-    require_momentum_on_promotion: true  # momentum energy must still be valid to promote
-    min_core_energies_promotion: 4
-
-  # Weekend gap protections & Friday scout sizing
-  weekend_gap_protect:
-    enabled: true
-    friday_scout_pct: 0.40      # if first ladder tier triggers on Friday, optionally size only this % of its tier (rest Monday)
-    monday_gap_R_tolerance: 0.50  # suppress stop on Monday open if adverse gap < this R (re-arm next day)
-    apply_to: ["ladder_first_fill"]   # future: could extend to all Friday fills
-
 ### ---------- For backtesting ---------- ###
 backtest:
   start_days_ago: 600
+  # Optional explicit date range (overrides start_days_ago when both provided)
+  # Accepts ISO 'YYYY-MM-DD' or 'M/D/YYYY'. If only one given behaves as:
+  #   start_date only -> end_date = today
+  #   end_date only   -> start_date = end_date - start_days_ago
+  start_date: 2024-01-01
+  end_date: 2024-12-31
   initial_equity: 50000
   commission_per_share: 0.00
   slippage_bps: 2.0
@@ -282,7 +280,7 @@ backtest:
     adverse_atr_mult: 0.0
   gap_fail_safe:             # mitigate large overnight gaps
     enabled: true
-    gap_R_multiple: 1.8      # tightened to reduce catastrophic losses
+    gap_R_multiple: 1.3      # tighter: trigger protective exit sooner
   loss_guard:                # early MAE hard cap
     enabled: true
     mae_R_threshold: 1.2
@@ -296,19 +294,19 @@ backtest:
     momentum_fail: true      # MACD vs signal/zero fail
     cycle_fail: true         # SlowK vs SlowD fail
     value_zone_fail: true    # price lost EMA50 bias
-    # --- softening toggles (Gentle recipe) ---
+    # --- softening toggles ---
     min_hold_bars: 2
     consecutive_fails_default: 1
-    momentum_consecutive: null
-    cycle_consecutive: 2
-    value_zone_consecutive: null
+    momentum_consecutive: 2
+    cycle_consecutive: 3
+    value_zone_consecutive: 2
 
     weights:
-      momentum: 0.5
-      cycle: 0.5
+      momentum: 0.6
+      cycle: 0.6
       value_zone: 1.0
-    threshold_single: 1.0
-    threshold_two_bar: 1.5
+    threshold_single: 1.2
+    threshold_two_bar: 1.8
 
     value_zone_fail_buffer_pct: 0.0015
     cycle_fail_gap_min: 1.5
@@ -341,7 +339,7 @@ backtest:
 
   # Backtest entry model (independent of live order_type)
   entry_model:
-    type: "limit_retrace"        # switch to pullback limit model
+    type: "market"        # switch to market order model
     retrace_to: "EMA20"
     atr_fraction: 0.15
     horizon_days: 3

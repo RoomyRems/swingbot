@@ -92,6 +92,43 @@ python main.py
 python scripts/run_backtest.py
 ```
 
+### Specifying an Explicit Backtest Date Range
+
+You can now supply a fixed start/end date instead of relying on `start_days_ago`.
+
+Precedence (highest first):
+1. CLI `--start-date` / `--end-date`
+2. `backtest.start_date` / `backtest.end_date` in `config.yaml`
+3. `backtest.start_days_ago` fallback (end = today)
+
+Accepted formats: `YYYY-MM-DD` or `M/D/YYYY` (e.g. `2024-01-01` or `1/1/2024`).
+
+Rules:
+* If only start provided → end = today
+* If only end provided → start = end - `start_days_ago`
+* If start > end → error
+* A warning prints if the inferred window < 30 days (unless both dates explicitly set)
+
+Examples:
+```
+python scripts/run_backtest.py --start-date 2024-01-01 --end-date 2024-12-21
+python scripts/run_backtest.py --start-date 1/1/2024 --end-date 12/21/2024
+python scripts/run_backtest.py --end-date 2024-06-30   # start inferred from start_days_ago
+```
+
+In `config.yaml`:
+```yaml
+backtest:
+  start_days_ago: 600
+  start_date: 2024-01-01   # overrides start_days_ago when set
+  end_date: 2024-12-21
+```
+
+Runtime output will echo the resolved range:
+```
+[Backtest] Date range: 2024-01-01 -> 2024-12-21 (355 days)
+```
+
 ## Environment & Credentials
 The project reads API credentials from environment variables (loaded automatically via `python-dotenv` if a `.env` file is present in the project root).
 
