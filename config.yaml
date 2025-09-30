@@ -343,3 +343,12 @@ backtest:
     retrace_to: "EMA20"
     atr_fraction: 0.15
     horizon_days: 3
+
+# Watchlist generation configuration
+watchlist:
+  universes: ["sp1500"]  # options: sp500, sp1000, sp1500, russell3000, all
+  # When 'all' is present, script expands to every supported index.
+  alpaca_filter: false     # apply broker active/tradable filter if credentials available
+  include_iwv: false       # merge IWV ETF holdings (Russell 3000 proxy) subject to caching flags below
+  iwv_ttl_days: 2
+  iwv_force_refresh: false

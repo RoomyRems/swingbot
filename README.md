@@ -92,6 +92,39 @@ python main.py
 python scripts/run_backtest.py
 ```
 
+### Generating / Updating the Watchlist
+
+The legacy `generate_watchlist_sp1500.py` script has been replaced by a unified generator supporting multiple index families (S&P and Russell).
+
+Config section (excerpt):
+```yaml
+watchlist:
+  universes: ["sp1500"]   # options: sp500, sp1000, sp1500, russell3000, all
+  alpaca_filter: false      # apply active & tradable filter (requires credentials)
+  include_iwv: false        # optionally merge IWV ETF holdings (Russell 3000 proxy)
+  iwv_ttl_days: 2
+  iwv_force_refresh: false
+```
+
+Universes:
+- `sp500` – S&P 500
+- `sp1000` – S&P 400 Mid + S&P 600 Small
+- `sp1500` – S&P 500 + 400 + 600 (default)
+- `russell3000` – Full Russell 3000 constituents (direct scrape)
+- `all` – Expands to every supported list above
+
+Command line overrides config:
+```
+python scripts/generate_watchlist.py                    # uses config.yaml universes
+python scripts/generate_watchlist.py --universes sp500  # only S&P 500
+python scripts/generate_watchlist.py --universes sp1000 russell3000 --alpaca-filter
+python scripts/generate_watchlist.py --universes all --include-iwv
+```
+
+Output is written to `watchlist.txt` (or a custom path via `--out`). Duplicates across indices are removed and (optionally) filtered via Alpaca for active + tradable symbols.
+
+If you enable `include_iwv`, current IWV ETF holdings are merged (with cache TTL) to approximate broader Russell exposure; note survivorship bias & API rate considerations.
+
 ### Specifying an Explicit Backtest Date Range
 
 You can now supply a fixed start/end date instead of relying on `start_days_ago`.
