@@ -123,6 +123,11 @@ def _http_get_with_retries(url: str, headers: dict, retries: int = 3, backoff: f
 
 # ------------------- Public API -------------------
 
+IWV_HOLDINGS_URL = (
+    "https://www.ishares.com/us/products/239714/ishares-russell-3000-etf/"
+    "1467271812596.ajax?fileType=csv&fileName=IWV_holdings&dataType=fund"
+)
+
 def get_iwv_constituents(
     cache_dir: str | Path = "cache/iwv",
     ttl_days: int = 2,
@@ -142,11 +147,8 @@ def get_iwv_constituents(
     cache_dir = Path(cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
 
-    # Correct IWV holdings endpoint (product id 239710)
-    url = (
-        "https://www.ishares.com/us/products/239710/ishares-russell-3000-etf/"
-        "1467271812596.ajax?fileType=csv&fileName=IWV_holdings&dataType=fund"
-    )
+    # IWV holdings endpoint (product id 239714 per latest request)
+    url = IWV_HOLDINGS_URL
     key = hashlib.md5(url.encode("utf-8")).hexdigest()
     cache_file = cache_dir / f"iwv_holdings_{key}.csv"
 
