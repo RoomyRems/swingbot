@@ -5,7 +5,7 @@ Reads desired universes from config.yaml (watchlist.universes) and produces a de
   - sp500 (S&P 500)
   - sp1000 (S&P 1000 = 400 mid + 600 small)
   - sp1500 (default = 500 + 400 + 600)
-  - russell3000 (direct scrape) + optional IWV ETF holdings merge
+    - russell3000 (always sourced from IWV ETF holdings; no Wikipedia scrape)
   - all (expands to every supported set)
 
 Config knobs (config.yaml):
@@ -46,7 +46,7 @@ WIKI_PAGES = {
     "sp500": "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
     "sp400": "https://en.wikipedia.org/wiki/List_of_S%26P_400_companies",
     "sp600": "https://en.wikipedia.org/wiki/List_of_S%26P_600_companies",
-    "russell3000": "https://en.wikipedia.org/wiki/Russell_3000_Index",
+    # russell3000 intentionally omitted from scrape map; we use IWV holdings instead
 }
 
 _SYMBOL_CLEAN_RE = re.compile(r"[^A-Z0-9.\-]", re.IGNORECASE)
@@ -180,8 +180,21 @@ def generate(universes: List[str], alpaca_filter: bool, include_iwv: bool, iwv_t
     expanded = _expand_universes(universes)
     print(f"Expanded universes: {expanded}")
     all_syms: List[str] = []
-    russell_fallback_used = False
+    russell_iwv_used = False
     for key in expanded:
+        if key == "russell3000":
+            try:
+                from universe.iwv import get_iwv_constituents  # type: ignore
+                iwv_syms = get_iwv_constituents(ttl_days=iwv_ttl_days, force_refresh=iwv_force_refresh)
+                if iwv_syms:
+                    print(f"Using IWV holdings for russell3000: {len(iwv_syms)} symbols")
+                    all_syms.extend(iwv_syms)
+                    russell_iwv_used = True
+                else:
+                    print("[warn] IWV holdings empty; russell3000 contributes 0 symbols")
+            except Exception as e:  # noqa: BLE001
+                print(f"[warn] Failed IWV retrieval for russell3000: {e}")
+            continue
         url = WIKI_PAGES.get(key)
         if not url:
             print(f"[warn] No URL for {key}; skipping")
@@ -192,23 +205,7 @@ def generate(universes: List[str], alpaca_filter: bool, include_iwv: bool, iwv_t
             print(f"  -> {len(syms)} symbols")
             all_syms.extend(syms)
         except Exception as e:  # noqa: BLE001
-            if key == "russell3000":
-                # Fallback: attempt IWV holdings as proxy
-                print(f"[warn] Russell 3000 scrape failed ({e}); attempting IWV fallback proxy...")
-                try:
-                    from universe.iwv import get_iwv_constituents  # type: ignore
-                    iwv_syms = get_iwv_constituents(ttl_days=iwv_ttl_days, force_refresh=iwv_force_refresh)
-                    if iwv_syms:
-                        print(f"  -> IWV fallback provided {len(iwv_syms)} symbols")
-                        all_syms.extend(iwv_syms)
-                        russell_fallback_used = True
-                        continue
-                    else:
-                        print("[warn] IWV fallback returned 0 symbols; skipping russell3000")
-                except Exception as fe:  # noqa: BLE001
-                    print(f"[warn] IWV fallback failed: {fe}")
-            else:
-                print(f"[warn] Failed to fetch {key}: {e}")
+            print(f"[warn] Failed to fetch {key}: {e}")
     syms = unique_sorted(all_syms)
     print(f"Total unique before filter: {len(syms)}")
 
@@ -216,8 +213,8 @@ def generate(universes: List[str], alpaca_filter: bool, include_iwv: bool, iwv_t
         syms = try_alpaca_filter(syms)
         print(f"After Alpaca filter: {len(syms)}")
 
-    # Avoid double-adding IWV if it already served as russell3000 fallback
-    if include_iwv and not russell_fallback_used:
+    # Avoid double-adding IWV if already used for russell3000
+    if include_iwv and not russell_iwv_used:
         try:
             from universe.iwv import get_iwv_constituents, merge_watchlists  # type: ignore
             iwv_list = get_iwv_constituents(ttl_days=iwv_ttl_days, force_refresh=iwv_force_refresh)

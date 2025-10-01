@@ -346,9 +346,12 @@ backtest:
 
 # Watchlist generation configuration
 watchlist:
-  universes: ["sp1500"]  # options: sp500, sp1000, sp1500, russell3000, all
+  universes: ["all"]  # options: sp500, sp1000, sp1500, russell3000, all
   # When 'all' is present, script expands to every supported index.
-  alpaca_filter: false     # apply broker active/tradable filter if credentials available
-  include_iwv: false       # merge IWV ETF holdings (Russell 3000 proxy) subject to caching flags below
+  # NOTE: 'russell3000' symbols are ALWAYS sourced from IWV ETF holdings (snapshot) – we do not scrape.
+  #       This introduces survivorship bias vs historical Russell membership. For historical studies,
+  #       consider sourcing point-in-time index data externally.
+  alpaca_filter: true     # apply broker active/tradable filter if credentials available
+  include_iwv: false       # if true AND russell3000 not in universes, also merge IWV holdings (broad market proxy)
   iwv_ttl_days: 2
   iwv_force_refresh: false

@@ -100,30 +100,33 @@ Config section (excerpt):
 ```yaml
 watchlist:
   universes: ["sp1500"]   # options: sp500, sp1000, sp1500, russell3000, all
+  # NOTE: russell3000 is ALWAYS sourced from current IWV ETF holdings (snapshot). No web scrape.
+  #       This introduces survivorship bias relative to historical Russell 3000 membership.
+  #       For point-in-time research, obtain licensed historical index data.
   alpaca_filter: false      # apply active & tradable filter (requires credentials)
-  include_iwv: false        # optionally merge IWV ETF holdings (Russell 3000 proxy)
-  iwv_ttl_days: 2
-  iwv_force_refresh: false
+  include_iwv: false        # if true AND russell3000 not in universes, merge IWV holdings (broad market proxy)
+  iwv_ttl_days: 2           # cache TTL for IWV holdings csv
+  iwv_force_refresh: false  # force re-download ignoring cache
 ```
 
 Universes:
-- `sp500` – S&P 500
-- `sp1000` – S&P 400 Mid + S&P 600 Small
-- `sp1500` – S&P 500 + 400 + 600 (default)
-- `russell3000` – Full Russell 3000 constituents (direct scrape)
-- `all` – Expands to every supported list above
+* `sp500` – S&P 500
+* `sp1000` – S&P 400 Mid + S&P 600 Small
+* `sp1500` – S&P 500 + 400 + 600 (default)
+* `russell3000` – Approximation via current IWV ETF holdings (no scrape; snapshot; survivorship bias)
+* `all` – Expands to every supported list above (includes russell3000 => IWV holdings)
 
 Command line overrides config (always writes to canonical `watchlist.txt` in project root; previous file is overwritten):
 ```
 python scripts/generate_watchlist.py                    # uses config.yaml universes
 python scripts/generate_watchlist.py --universes sp500  # only S&P 500
 python scripts/generate_watchlist.py --universes sp1000 russell3000 --alpaca-filter
-python scripts/generate_watchlist.py --universes all --include-iwv
+python scripts/generate_watchlist.py --universes all --include-iwv   # include_iwv adds nothing extra if russell3000 present
 ```
 
 The script now intentionally ignores any custom output path and always overwrites `watchlist.txt` to avoid proliferation of stale watchlist files. Duplicates across indices are removed and (optionally) filtered via Alpaca for active + tradable symbols.
 
-If you enable `include_iwv`, current IWV ETF holdings are merged (with cache TTL) to approximate broader Russell exposure; note survivorship bias & API rate considerations.
+If you enable `include_iwv` AND you did NOT request `russell3000`, the current IWV ETF holdings are merged (cache-aware) to broaden universe. If `russell3000` is included, IWV is already used and won't be double-merged. Survivorship bias applies because holdings reflect the present composition only.
 
 ### Specifying an Explicit Backtest Date Range
 
