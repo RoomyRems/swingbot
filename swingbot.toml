@@ -1,0 +1,27 @@
+# Deliberately small configuration surface. Indicator definitions are frozen in
+# code and documented in docs/STRATEGY_SPEC.md so research runs remain comparable.
+
+symbols = [
+  "SPY", "QQQ", "IWM", "DIA",
+  "XLK", "XLF", "XLV", "XLI", "XLE", "XLP", "XLY", "XLU",
+]
+
+[data]
+# SIP is consolidated US market data. It may require an Alpaca data subscription.
+# Use "iex" only when necessary; every snapshot records the selected feed.
+feed = "sip"
+adjustment = "all"
+
+[risk]
+initial_equity = 100000.0
+risk_per_trade = 0.005
+max_total_risk = 0.03
+max_positions = 5
+max_position_fraction = 0.20
+reward_r = 2.0
+
+[execution]
+# A next-session DAY limit order may pay at most 0.25R above the signal close.
+max_entry_gap_r = 0.25
+slippage_bps = 5.0
+commission_per_share = 0.0
