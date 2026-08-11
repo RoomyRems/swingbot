@@ -117,9 +117,11 @@ class PaperSafetyTests(unittest.TestCase):
         modules["alpaca.trading.requests"].GetOrdersRequest = FakeGetOrdersRequest
         broker = object.__new__(AlpacaPaperBroker)
         broker._client = FakeClient()
-        with patch.dict(sys.modules, modules):
-            with self.assertRaisesRegex(RuntimeError, "no visible protective stop"):
-                broker.state()
+        with (
+            patch.dict(sys.modules, modules),
+            self.assertRaisesRegex(RuntimeError, "no visible protective stop"),
+        ):
+            broker.state()
 
     def test_submission_builds_a_day_paper_bracket(self):
         config = app_config("SPY")

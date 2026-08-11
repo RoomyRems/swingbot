@@ -6,7 +6,6 @@ from pathlib import Path
 
 from swingbot.config import config_fingerprint, load_config
 
-
 VALID = """
 symbols = ["SPY", "QQQ"]
 
