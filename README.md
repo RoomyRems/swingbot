@@ -24,30 +24,38 @@ flowchart TD
 | Data | Explicit start/end dates, `adjustment="all"`, recorded feed, immutable CSV files, SHA-256 verification |
 | Universe | Fixed liquid US ETFs by default; no present-day constituent lookup |
 | Signal timing | Signal uses bar *t* at its close; an order may fill only in the next session |
-| Limit fills | Uses only the next session's open/low; its close cannot approve or reject the fill |
+| Stop-limit fills | Requires the next session to trigger above the hook bar; its close cannot approve or reject the fill |
 | Ambiguous daily bars | If stop and target are both touched, the stop wins |
 | Strategy parity | Backtest and paper planning call the same `generate_signal` and `size_order` functions |
 | Risk | Per-trade, total open-risk, position-count, notional, cash/buying-power, and duplicate-symbol caps |
 | Credentials | `.env` remains local and ignored; paper mode is hard-coded in the Alpaca client |
 
-## Current research hypothesis
+## Current book-derived hypothesis
 
-Public Top Dog Trading material describes five independent energies—trend,
-momentum, cycle, support/resistance, and scale—and describes the 50 SMA, 15 EMA,
-slow stochastic, and multiple timeframes. It does not publicly define every rule
-needed for a daily ETF algorithm. The exact machine rules and the assumptions are
-separated in [the strategy specification](docs/STRATEGY_SPEC.md).
+`burns-book-v1` is an objective daily/weekly, long-only translation of Barry
+Burns's *Trend Trading For Dummies*. The exact rules and their page-level basis
+are in [the strategy specification](docs/STRATEGY_SPEC.md); the broader audit,
+including intentionally deferred material, is in
+[the book implementation map](docs/BOOK_IMPLEMENTATION_MAP.md).
 
-This first baseline requires all five conditions:
+The setup scores five energies and needs at least four. Scale is always required;
+Trend and Cycle are also required in this translation because they establish the
+long direction and entry trigger. Therefore, either Momentum or Support may be
+the one missing energy:
 
-1. Price is above a rising 50-day SMA.
-2. Daily MACD is above zero.
-3. 5-2-3 slow stochastic hooks upward after a pullback.
-4. Price tests the 15-day EMA area and closes back above it.
-5. The last completed weekly MACD histogram is rising.
+1. Trend: close above a rising 50-SMA on the first or second retrace.
+2. Momentum: daily MACD line above zero at the active cycle low.
+3. Cycle: 5-2-3 stochastic %K hooks up below the midpoint with price/%K
+   mini-divergence.
+4. Support: the cycle low tests a causal 15-EMA, 50-SMA, or prior cycle level.
+5. Scale: the last completed weekly MACD **line** is angled upward.
 
-MACD, daily/weekly bars, the ETF universe, the exact EMA tolerance, and the fixed
-2R exit are research hypotheses—not representations of proprietary course rules.
+Entry is a next-session DAY buy stop-limit one tick above the closed hook bar;
+the initial hard stop is one tick below the active cycle low. Position size is
+capped by risk, capital, portfolio capacity, and 0.1% of 90-session average
+volume. The fixed full-position 2R target is a transparent engineering baseline,
+not Burns's exit method. His partial-at-cycle-high and cycle-low trailing process
+is documented but deferred until order replacement and recovery are fail-closed.
 
 ## Install
 
@@ -100,8 +108,9 @@ swingbot backtest \
 ```
 
 The report contains `summary.json`, `trades.csv`, `equity.csv`, `signals.csv`,
-`orders.csv`, `yearly.csv`, and `by_symbol.csv`. The summary records configuration
-and snapshot fingerprints and compares the result with buy-and-hold SPY.
+`orders.csv`, `yearly.csv`, and `by_symbol.csv`. The summary records strategy,
+configuration, and snapshot fingerprints and compares the result with
+buy-and-hold SPY.
 
 Explain one decision without running a new backtest:
 
@@ -130,8 +139,8 @@ swingbot paper \
   --plan-out reports/paper-2026-08-07.json
 ```
 
-That command is a dry run. To submit DAY limit-bracket orders to the Alpaca paper
-account, both flags are required:
+That command is a dry run. To submit DAY stop-limit bracket orders to the Alpaca
+paper account, both flags are required:
 
 ```bash
 swingbot paper \
@@ -156,29 +165,15 @@ reports whether the market is currently open.
 ## Validate locally
 
 ```bash
-PYTHONPATH=src python -m unittest discover -v
+PYTHONPATH=src python -m unittest discover -s tests -v
 python -m ruff check src tests
 python -m compileall -q src tests
 ```
 
-The suite specifically checks prefix invariance, next-bar lookahead, conservative
-same-bar execution, configuration duplication, snapshot tampering, risk caps, and
-the hard-coded paper client.
-
-## What I still need from your notes
-
-The code is usable as a research baseline now. To call it *your intended Barry
-Burns interpretation*, please add concise notes covering:
-
-- the exact momentum indicator and its parameters;
-- the cycle settings and what constitutes a valid hook;
-- how the first/second retrace or wave count should be defined;
-- which support/resistance levels qualify and how close price must be;
-- the higher-timeframe confirmation rule;
-- entry, initial stop, partial exit, runner, and cancellation rules.
-
-Do not send course files you are not allowed to share. Your own summary, examples,
-and screenshots you have permission to use are enough.
+The suite specifically checks indicator and signal prefix invariance, book-rule
+vetoes, retrace counting, next-bar trigger/limit behavior, conservative same-bar
+execution, configuration duplication, snapshot tampering, liquidity/risk caps,
+and the hard-coded paper client.
 
 Read [the research protocol](docs/RESEARCH_PROTOCOL.md) before interpreting any
 result. Paper fills are simulations and do not establish live performance. This is

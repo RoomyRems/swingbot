@@ -17,17 +17,18 @@ find the prettiest equity curve.
 
 - A close at *t* may create an order for *t+1* only.
 - No field from *t+1* can alter the signal from *t*.
-- DAY limits expire after one session.
-- Buy-limit fills are capped at the limit.
+- DAY stop-limit entries expire after one session.
+- A buy entry cannot fill until price reaches its stop trigger, and fills are
+  capped at the limit.
 - Stops include configured adverse slippage; limits receive no favorable fantasy fill.
 - A stop wins every ambiguous stop/target daily bar.
 - Commission and slippage assumptions must be reported, even when set to zero.
 
 ## Evaluation sequence
 
-1. Freeze `research-v1` and the data snapshot.
+1. Freeze `burns-book-v1`, its strategy fingerprint, and the data snapshot.
 2. Use an early development interval only to find coding errors and understand trade frequency.
-3. Do not optimize the eleven configuration values against return.
+3. Do not optimize configuration or frozen strategy constants against return.
 4. Evaluate later calendar periods separately and keep the last interval untouched until the rules are frozen.
 5. Compare against SPY buy-and-hold and a simple trend baseline.
 6. Break results down by symbol, year, volatility regime, and entry gap.

@@ -90,9 +90,7 @@ class AlpacaPaperBroker:
             raise RuntimeError("Alpaca returned invalid account equity or buying power")
 
         all_orders = _flatten_orders(parents)
-        blocked_symbols = {
-            str(getattr(position, "symbol", "")).upper() for position in positions
-        }
+        blocked_symbols = {str(getattr(position, "symbol", "")).upper() for position in positions}
         blocked_symbols.update(
             str(getattr(order, "symbol", "")).upper()
             for order in parents
@@ -181,7 +179,7 @@ class AlpacaPaperBroker:
 
         from alpaca.trading.enums import OrderClass, OrderSide, TimeInForce
         from alpaca.trading.requests import (
-            LimitOrderRequest,
+            StopLimitOrderRequest,
             StopLossRequest,
             TakeProfitRequest,
         )
@@ -220,10 +218,11 @@ class AlpacaPaperBroker:
         submitted: list[dict[str, str]] = []
         for plan in plans_list:
             signal = plan.signal
-            request = LimitOrderRequest(
+            request = StopLimitOrderRequest(
                 symbol=signal.symbol,
                 qty=plan.quantity,
                 side=OrderSide.BUY,
+                stop_price=signal.entry_stop,
                 limit_price=signal.entry_limit,
                 time_in_force=TimeInForce.DAY,
                 order_class=OrderClass.BRACKET,

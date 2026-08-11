@@ -36,3 +36,7 @@ requires both `--submit` and the literal `--confirm PAPER`. Existing positions a
 orders are reconciled before new plans are submitted, and reconciliation errors
 stop the run. Submission is disabled during the regular-session safety window and
 whenever Alpaca's market clock reports that the market is open.
+
+`burns-book-v1` submits a DAY buy stop-limit bracket: the entry trigger is one
+tick above the completed hook bar, the entry limit caps gap/slippage exposure,
+and the attached stop-market leg protects the active cycle low.

@@ -21,7 +21,8 @@ max_position_fraction = 0.20
 reward_r = 2.0
 
 [execution]
-# A next-session DAY limit order may pay at most 0.25R above the signal close.
+# The next-session buy stop is one tick above the hook bar. Its stop-limit
+# ceiling may be at most 0.25 trigger-risk units above that trigger.
 max_entry_gap_r = 0.25
 slippage_bps = 5.0
 commission_per_share = 0.0

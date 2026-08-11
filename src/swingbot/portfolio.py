@@ -7,6 +7,8 @@ from datetime import date
 from .config import AppConfig
 from .models import PlannedOrder, Signal
 
+MAX_ADV_FRACTION = 0.001
+
 
 @dataclass(frozen=True)
 class Capacity:
@@ -40,6 +42,7 @@ def size_order(
     )
     notional_cap = capacity.equity * config.risk.max_position_fraction
     cash_per_share = signal.entry_limit + config.execution.commission_per_share
+    liquidity_cap = math.floor(signal.average_daily_volume * MAX_ADV_FRACTION)
 
     quantity = math.floor(
         min(
@@ -47,6 +50,7 @@ def size_order(
             portfolio_risk_left / effective_risk_per_share,
             notional_cap / cash_per_share,
             capacity.buying_power / cash_per_share,
+            liquidity_cap,
         )
     )
     if quantity < 1:

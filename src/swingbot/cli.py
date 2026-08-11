@@ -15,7 +15,13 @@ from .backtest import run_backtest, write_report
 from .config import load_config
 from .data import AlpacaDataSource, SnapshotStore, fetch_snapshot
 from .paper import AlpacaPaperBroker, build_paper_plan, write_paper_plan
-from .strategy import evaluate_energies, generate_signal, prepare_indicators
+from .strategy import (
+    STRATEGY_VERSION,
+    evaluate_energies,
+    generate_signal,
+    prepare_indicators,
+    strategy_fingerprint,
+)
 
 
 def _date(value: str) -> date:
@@ -69,9 +75,7 @@ def _validate_submission_date(as_of: date, now: datetime | None = None) -> None:
     if (now.date() - as_of).days > 4:
         raise ValueError("paper submission refuses an as-of date more than four days old")
     if now.weekday() < 5 and time(9, 30) <= now.time() < time(16, 15):
-        raise ValueError(
-            "paper submission is disabled from 9:30 AM through 4:15 PM New York time"
-        )
+        raise ValueError("paper submission is disabled from 9:30 AM through 4:15 PM New York time")
     if as_of == now.date() and now.time() < time(16, 15):
         raise ValueError("today's daily bar is not considered complete until 4:15 PM New York time")
 
@@ -121,6 +125,7 @@ def _paper(args: argparse.Namespace) -> int:
             "symbol": plan.signal.symbol,
             "signal_date": plan.signal.signal_date.isoformat(),
             "quantity": plan.quantity,
+            "entry_stop": plan.signal.entry_stop,
             "entry_limit": plan.signal.entry_limit,
             "stop_price": plan.signal.stop_price,
             "target_price": plan.signal.target_price,
@@ -164,15 +169,20 @@ def _explain(args: argparse.Namespace) -> int:
     payload = {
         "symbol": symbol,
         "as_of": args.as_of.isoformat(),
+        "strategy_version": STRATEGY_VERSION,
+        "strategy_fingerprint": strategy_fingerprint(),
         "score": sum(item.passed for item in energies.values()),
         "energies": {name: asdict(item) for name, item in energies.items()},
         "signal": None
         if signal is None
         else {
+            "entry_stop": signal.entry_stop,
             "entry_limit": signal.entry_limit,
             "stop_price": signal.stop_price,
             "target_price": signal.target_price,
+            "average_daily_volume": signal.average_daily_volume,
             "quality": signal.quality,
+            "context": signal.context,
         },
     }
     print(json.dumps(payload, indent=2, sort_keys=True))

@@ -21,7 +21,12 @@ from .models import (
     Trade,
 )
 from .portfolio import Capacity, size_order
-from .strategy import generate_signal, prepare_indicators
+from .strategy import (
+    STRATEGY_VERSION,
+    generate_signal,
+    prepare_indicators,
+    strategy_fingerprint,
+)
 
 
 def _slippage_fraction(config: AppConfig) -> float:
@@ -84,13 +89,22 @@ def _entry_fill(
     bar: pd.Series,
     slip: float,
 ) -> tuple[float, bool] | None:
+    entry_stop = order.signal.entry_stop
     entry_limit = order.signal.entry_limit
-    if float(bar["open"]) <= entry_limit:
-        slipped = min(float(bar["high"]), float(bar["open"]) * (1.0 + slip))
-        return min(entry_limit, slipped), True
-    if float(bar["low"]) <= entry_limit:
-        return entry_limit, False
-    return None
+    open_price = float(bar["open"])
+    high_price = float(bar["high"])
+    low_price = float(bar["low"])
+    if high_price < entry_stop:
+        return None
+    if open_price >= entry_stop:
+        if open_price <= entry_limit:
+            return min(entry_limit, open_price * (1.0 + slip)), True
+        if low_price <= entry_limit:
+            # The stop triggers at the gap open and its limit can fill later.
+            return entry_limit, False
+        return None
+    # The stop triggers intraday and becomes a limit order capped at entry_limit.
+    return min(entry_limit, entry_stop * (1.0 + slip)), False
 
 
 def _new_position_exit(
@@ -150,12 +164,18 @@ def _signal_row(signal: Signal, status: str, reason: str = "") -> dict[str, obje
         "score": signal.score,
         "quality": signal.quality,
         "reference_price": signal.reference_price,
+        "entry_stop": signal.entry_stop,
         "entry_limit": signal.entry_limit,
         "stop_price": signal.stop_price,
         "target_price": signal.target_price,
+        "average_daily_volume": signal.average_daily_volume,
     }
     for name, evidence in signal.energies.items():
+        row[f"{name}_passed"] = evidence.passed
         row[f"{name}_value"] = evidence.value
+        row[f"{name}_rule"] = evidence.rule
+    for name, value in signal.context.items():
+        row[f"context_{name}"] = value
     return row
 
 
@@ -284,6 +304,8 @@ def run_backtest(
                     "status": "filled",
                     "quantity": quantity,
                     "fill_price": fill_price,
+                    "entry_stop": order.signal.entry_stop,
+                    "entry_limit": order.signal.entry_limit,
                 }
             )
 
@@ -368,9 +390,7 @@ def run_backtest(
         cash += proceeds
         trades.append(trade)
     pending.clear()
-    equity_rows[-1].update(
-        {"equity": cash, "cash": cash, "positions": 0, "pending_orders": 0}
-    )
+    equity_rows[-1].update({"equity": cash, "cash": cash, "positions": 0, "pending_orders": 0})
 
     summary = _summarize(
         equity_rows,
@@ -415,13 +435,19 @@ def _summarize(
 
     profits = [trade.pnl for trade in trades if trade.pnl > 0]
     losses = [trade.pnl for trade in trades if trade.pnl < 0]
+    breakeven_trades = sum(trade.pnl == 0 for trade in trades)
+    gross_profit = sum(profits)
+    gross_loss = sum(losses)
     profit_factor = None
     if losses:
-        profit_factor = sum(profits) / abs(sum(losses))
+        profit_factor = gross_profit / abs(gross_loss)
     win_rate = sum(trade.pnl > 0 for trade in trades) / len(trades) if trades else None
-    expectancy_r = (
-        float(np.mean([trade.r_multiple for trade in trades])) if trades else None
-    )
+    average_winner = float(np.mean(profits)) if profits else None
+    average_loser = float(np.mean(losses)) if losses else None
+    payoff_ratio = None
+    if average_winner is not None and average_loser is not None:
+        payoff_ratio = average_winner / abs(average_loser)
+    expectancy_r = float(np.mean([trade.r_multiple for trade in trades])) if trades else None
 
     benchmark_return = None
     if benchmark_symbol in frames:
@@ -439,11 +465,22 @@ def _summarize(
         "max_drawdown": float(drawdown.min()),
         "daily_sharpe": sharpe,
         "trades": len(trades),
+        "winning_trades": len(profits),
+        "losing_trades": len(losses),
+        "breakeven_trades": breakeven_trades,
         "win_rate": win_rate,
+        "gross_profit": float(gross_profit),
+        "gross_loss": float(gross_loss),
+        "average_winner": average_winner,
+        "average_loser": average_loser,
+        "payoff_ratio": payoff_ratio,
         "profit_factor": profit_factor,
         "expectancy_r": expectancy_r,
+        "fees": float(sum(trade.fees for trade in trades)),
         "benchmark_symbol": benchmark_symbol,
         "benchmark_return": benchmark_return,
+        "strategy_version": STRATEGY_VERSION,
+        "strategy_fingerprint": strategy_fingerprint(),
         "config_fingerprint": config_fingerprint(config),
     }
 
@@ -469,15 +506,11 @@ def write_report(
     pd.DataFrame([asdict(trade) for trade in result.trades]).to_csv(
         output / "trades.csv", index=False, lineterminator="\n"
     )
-    pd.DataFrame(result.equity_rows).to_csv(
-        output / "equity.csv", index=False, lineterminator="\n"
-    )
+    pd.DataFrame(result.equity_rows).to_csv(output / "equity.csv", index=False, lineterminator="\n")
     pd.DataFrame(result.signal_rows).to_csv(
         output / "signals.csv", index=False, lineterminator="\n"
     )
-    pd.DataFrame(result.order_rows).to_csv(
-        output / "orders.csv", index=False, lineterminator="\n"
-    )
+    pd.DataFrame(result.order_rows).to_csv(output / "orders.csv", index=False, lineterminator="\n")
     pd.DataFrame(_yearly_rows(result)).to_csv(
         output / "yearly.csv", index=False, lineterminator="\n"
     )

@@ -61,6 +61,8 @@ class BacktestBiasTests(unittest.TestCase):
         self.assertEqual(high_close.trades[0].entry_price, 100.0)
         self.assertEqual(low_close.trades[0].reason, ExitReason.STOP)
         self.assertEqual(high_close.trades[0].reason, ExitReason.STOP)
+        self.assertEqual(low_close.summary["strategy_version"], "burns-book-v1")
+        self.assertEqual(len(low_close.summary["strategy_fingerprint"]), 64)
 
     def test_ambiguous_same_day_stop_and_target_uses_stop(self):
         frame = _three_day_frame(100.0, second_high=130.0, second_low=89.0)
@@ -93,6 +95,42 @@ class BacktestBiasTests(unittest.TestCase):
             )
         self.assertEqual(result.order_rows[0]["status"], "not_filled")
         self.assertEqual(result.trades, [])
+
+    def test_price_below_limit_does_not_fill_before_buy_stop_triggers(self):
+        frame = _three_day_frame(
+            98.0,
+            second_open=98.0,
+            second_high=99.0,
+            second_low=95.0,
+        )
+        with patch.object(backtest_module, "generate_signal", side_effect=self._fake_generate):
+            result = run_backtest(
+                {"TEST": frame},
+                app_config("TEST"),
+                date(2024, 1, 2),
+                date(2024, 1, 4),
+                benchmark_symbol="TEST",
+            )
+        self.assertEqual(result.order_rows[0]["status"], "not_filled")
+        self.assertEqual(result.trades, [])
+
+    def test_gap_above_limit_can_fill_only_after_retracing_to_limit(self):
+        frame = _three_day_frame(
+            101.0,
+            second_open=110.0,
+            second_high=112.0,
+            second_low=100.5,
+        )
+        with patch.object(backtest_module, "generate_signal", side_effect=self._fake_generate):
+            result = run_backtest(
+                {"TEST": frame},
+                app_config("TEST"),
+                date(2024, 1, 2),
+                date(2024, 1, 4),
+                benchmark_symbol="TEST",
+            )
+        self.assertEqual(result.order_rows[0]["status"], "filled")
+        self.assertEqual(result.order_rows[0]["fill_price"], 101.0)
 
 
 if __name__ == "__main__":

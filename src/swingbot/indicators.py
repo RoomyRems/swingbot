@@ -73,12 +73,21 @@ def slow_stochastic(
     k_smoothing: int = 2,
     d_smoothing: int = 3,
 ) -> tuple[pd.Series, pd.Series]:
+    """Return Burns's 5-2-3 stochastic when called with the defaults.
+
+    The first smoothing is a simple average. Burns explicitly defines %D as
+    a three-period exponential moving average of the smoothed %K.
+    """
     lowest = low.rolling(lookback, min_periods=lookback).min()
     highest = high.rolling(lookback, min_periods=lookback).max()
     width = (highest - lowest).where((highest - lowest) != 0)
     raw_k = 100.0 * (close - lowest) / width
     slow_k = raw_k.rolling(k_smoothing, min_periods=k_smoothing).mean()
-    slow_d = slow_k.rolling(d_smoothing, min_periods=d_smoothing).mean()
+    slow_d = slow_k.ewm(
+        span=d_smoothing,
+        adjust=False,
+        min_periods=d_smoothing,
+    ).mean()
     return slow_k, slow_d
 
 
@@ -101,6 +110,7 @@ def add_indicators(frame: pd.DataFrame) -> pd.DataFrame:
     result["ema15"] = ema(result["close"], 15)
     result["sma50"] = result["close"].rolling(50, min_periods=50).mean()
     result["atr14"] = atr(result, 14)
+    result["adv90"] = result["volume"].rolling(90, min_periods=90).mean()
 
     result["stoch_k"], result["stoch_d"] = slow_stochastic(
         result["high"], result["low"], result["close"]
@@ -116,6 +126,7 @@ def add_indicators(frame: pd.DataFrame) -> pd.DataFrame:
             "weekly_macd": weekly_macd,
             "weekly_macd_signal": weekly_signal,
             "weekly_macd_hist": weekly_hist,
+            "weekly_macd_delta": weekly_macd.diff(),
             "weekly_macd_hist_delta": weekly_hist.diff(),
         }
     )

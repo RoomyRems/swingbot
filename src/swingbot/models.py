@@ -25,11 +25,14 @@ class Signal:
     signal_date: date
     reference_price: float
     stop_price: float
+    entry_stop: float
     entry_limit: float
     target_price: float
+    average_daily_volume: float
     score: int
     quality: float
     energies: Mapping[str, EnergyEvidence]
+    context: Mapping[str, object]
 
     @property
     def risk_per_share(self) -> float:

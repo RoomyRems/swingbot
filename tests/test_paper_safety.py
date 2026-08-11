@@ -153,8 +153,8 @@ class PaperSafetyTests(unittest.TestCase):
         enums.OrderSide = types.SimpleNamespace(BUY="buy")
         enums.TimeInForce = types.SimpleNamespace(DAY="day")
         requests = types.ModuleType("alpaca.trading.requests")
-        requests.LimitOrderRequest = Request
         requests.StopLossRequest = Request
+        requests.StopLimitOrderRequest = Request
         requests.TakeProfitRequest = Request
 
         broker = object.__new__(AlpacaPaperBroker)
@@ -179,6 +179,7 @@ class PaperSafetyTests(unittest.TestCase):
         self.assertEqual(submitted[0]["order_id"], "paper-order-id")
         self.assertEqual(captured["order_class"], "bracket")
         self.assertEqual(captured["time_in_force"], "day")
+        self.assertEqual(captured["stop_price"], signal.entry_stop)
         self.assertEqual(captured["limit_price"], signal.entry_limit)
         self.assertEqual(captured["stop_loss"].values["stop_price"], signal.stop_price)
 

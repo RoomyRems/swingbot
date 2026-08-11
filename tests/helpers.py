@@ -62,9 +62,12 @@ def complete_signal(symbol: str, signal_date: date) -> Signal:
         signal_date=signal_date,
         reference_price=100.0,
         stop_price=90.0,
+        entry_stop=100.0,
         entry_limit=101.0,
         target_price=120.0,
+        average_daily_volume=1_000_000.0,
         score=5,
         quality=1.0,
         energies=energies,
+        context={"retrace_number": 1},
     )

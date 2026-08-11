@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from dataclasses import replace
 from datetime import date
 
 from swingbot.portfolio import Capacity, size_order
@@ -45,6 +46,22 @@ class PortfolioTests(unittest.TestCase):
         )
         self.assertIsNone(no_risk)
         self.assertIsNone(no_slot)
+
+    def test_position_never_exceeds_one_tenth_percent_of_adv(self):
+        config = app_config("SPY")
+        signal = replace(
+            complete_signal("SPY", date(2024, 1, 2)),
+            average_daily_volume=10_000.0,
+        )
+        order = size_order(
+            signal,
+            date(2024, 1, 3),
+            config,
+            Capacity(1_000_000.0, 1_000_000.0, 0.0, 0),
+        )
+        self.assertIsNotNone(order)
+        assert order is not None
+        self.assertEqual(order.quantity, 10)
 
 
 if __name__ == "__main__":
