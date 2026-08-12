@@ -1,6 +1,8 @@
 # The first real-data run validates the authenticated pipeline and establishes
 # unoptimized trade frequency and per-energy gate rates. It is not an
 # out-of-sample performance claim.
+# The burns-book-v2 rerun holds the universe, dates, configuration, provider,
+# and costs fixed; only the Cycle classification changes from burns-book-v1.
 schema_version = 1
 name = "pilot-etf-2018-2025"
 config = "swingbot.toml"
