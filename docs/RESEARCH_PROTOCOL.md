@@ -11,6 +11,9 @@ find the prettiest equity curve.
 - Prefer consolidated SIP data; record IEX whenever subscription limits require it.
 - Never overwrite a snapshot. Create a new directory and fingerprint instead.
 - Backtests read snapshots only; they never make network calls.
+- Do not publish provider-licensed raw bars from a public repository. Hosted
+  runs may publish the hash manifest and derived reports while keeping the raw
+  snapshot inside the ephemeral runner.
 - Use a fixed ETF universe first. Historical stock tests require licensed or otherwise reliable point-in-time constituents before making claims.
 
 ## Execution contract

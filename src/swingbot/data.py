@@ -38,6 +38,32 @@ def snapshot_fingerprint(manifest: dict[str, object]) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def snapshot_data_fingerprint(manifest: dict[str, object]) -> str:
+    """Identify bar content independently of when or where a snapshot was created."""
+    files = manifest.get("files", {})
+    stable_files: dict[str, dict[str, object]] = {}
+    if isinstance(files, dict):
+        for symbol, details in files.items():
+            if isinstance(details, dict):
+                stable_files[str(symbol)] = {
+                    key: details.get(key) for key in ("rows", "first_date", "last_date", "sha256")
+                }
+    payload = {
+        key: manifest.get(key)
+        for key in (
+            "requested_start",
+            "requested_end",
+            "warmup_start",
+            "provider",
+            "feed",
+            "adjustment",
+            "symbols",
+        )
+    }
+    payload["files"] = stable_files
+    return snapshot_fingerprint(payload)
+
+
 class SnapshotStore:
     """Immutable CSV snapshots with per-file hashes and explicit provenance."""
 
@@ -72,6 +98,7 @@ class SnapshotStore:
             }
 
         manifest: dict[str, object] = {"schema_version": 1, **asdict(metadata), "files": files}
+        manifest["data_fingerprint"] = snapshot_data_fingerprint(manifest)
         manifest["snapshot_fingerprint"] = snapshot_fingerprint(manifest)
         (destination / cls.MANIFEST).write_text(
             json.dumps(manifest, indent=2, sort_keys=True) + "\n",
@@ -98,6 +125,12 @@ class SnapshotStore:
         files = manifest.get("files")
         if not isinstance(files, dict) or not files:
             raise ValueError("snapshot manifest has no files")
+        expected_data_fingerprint = manifest.get("data_fingerprint")
+        if (
+            expected_data_fingerprint is not None
+            and expected_data_fingerprint != snapshot_data_fingerprint(manifest)
+        ):
+            raise ValueError("snapshot data fingerprint does not match")
 
         frames: dict[str, pd.DataFrame] = {}
         for symbol, details in files.items():
@@ -107,6 +140,8 @@ class SnapshotStore:
             if relative_path.is_absolute() or ".." in relative_path.parts:
                 raise ValueError(f"unsafe snapshot path for {symbol}")
             path = source / relative_path
+            if path.is_symlink() or not path.resolve().is_relative_to(source.resolve()):
+                raise ValueError(f"unsafe snapshot path for {symbol}")
             if _sha256(path) != details.get("sha256"):
                 raise ValueError(f"snapshot hash mismatch for {symbol}")
             frame = pd.read_csv(path, parse_dates=["date"], index_col="date")

@@ -10,6 +10,7 @@ htmlcov/
 build/
 dist/
 *.egg-info/
+pip-*/
 
 # Credentials and local overrides
 .env
@@ -19,6 +20,7 @@ dist/
 # Downloaded market data and generated research output
 data/snapshots/
 reports/
+hosted-research-output/
 *.log
 
 # Editors and operating systems

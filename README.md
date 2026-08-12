@@ -112,6 +112,22 @@ The report contains `summary.json`, `trades.csv`, `equity.csv`, `signals.csv`,
 configuration, and snapshot fingerprints and compares the result with
 buy-and-hold SPY.
 
+### Authenticated GitHub research runs
+
+The protected workflow in `.github/workflows/research-backtest.yml` executes a
+strict, committed file under `research/requests/`. It exposes
+`ALPACA_API_KEY` and `ALPACA_API_SECRET` only to the fetch/backtest step, uses
+read-only repository permissions, pins every action to a full commit SHA, and
+accepts at most 25 symbols over ten calendar years. Missing secrets, an unsafe
+path, a current-day end date, or any snapshot/config mismatch stops the run.
+
+Because this repository is public, the workflow does **not** publish licensed
+raw bars. Its 30-day artifact contains the raw-file hash manifest, a stable data
+fingerprint, run/config/strategy fingerprints, and derived reports. The snapshot
+itself exists only on the ephemeral GitHub runner. After this workflow is merged
+to the default branch, the repository owner can select a committed request with
+**Run workflow**.
+
 Explain one decision without running a new backtest:
 
 ```bash

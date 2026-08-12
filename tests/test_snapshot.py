@@ -42,6 +42,29 @@ class SnapshotTests(unittest.TestCase):
             with self.assertRaises(FileExistsError):
                 SnapshotStore.create(snapshot, {"SPY": make_bars(rows=5)}, _metadata())
 
+    def test_data_fingerprint_is_stable_across_creation_times(self):
+        first_metadata = _metadata()
+        second_metadata = SnapshotMetadata(
+            requested_start=first_metadata.requested_start,
+            requested_end=first_metadata.requested_end,
+            warmup_start=first_metadata.warmup_start,
+            provider=first_metadata.provider,
+            feed=first_metadata.feed,
+            adjustment=first_metadata.adjustment,
+            symbols=first_metadata.symbols,
+            created_at_utc="2026-01-01T00:00:00+00:00",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bars = make_bars(rows=20)
+            SnapshotStore.create(root / "first", {"SPY": bars}, first_metadata)
+            SnapshotStore.create(root / "second", {"SPY": bars}, second_metadata)
+            _, first = SnapshotStore.load(root / "first")
+            _, second = SnapshotStore.load(root / "second")
+
+        self.assertEqual(first["data_fingerprint"], second["data_fingerprint"])
+        self.assertNotEqual(first["snapshot_fingerprint"], second["snapshot_fingerprint"])
+
 
 if __name__ == "__main__":
     unittest.main()

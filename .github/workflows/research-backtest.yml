@@ -1,0 +1,76 @@
+name: Research backtest
+
+on:
+  push:
+    branches: ["agent/research-v2"]
+    paths:
+      - ".github/workflows/research-backtest.yml"
+      - "research/requests/pilot-etf-2018-2025.toml"
+  workflow_dispatch:
+    inputs:
+      request:
+        description: "Committed request file under research/requests"
+        required: true
+        default: "research/requests/pilot-etf-2018-2025.toml"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: research-backtest-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  backtest:
+    name: Frozen snapshot and backtest
+    if: >-
+      github.repository == 'RoomyRems/swingbot' &&
+      github.actor == 'RoomyRems' &&
+      (github.event_name == 'workflow_dispatch' ||
+      github.ref == 'refs/heads/agent/research-v2')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out the triggering revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12"
+      - name: Install research dependencies
+        run: python -m pip install -e '.[paper]'
+      - name: Run the authenticated frozen request
+        env:
+          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_API_SECRET: ${{ secrets.ALPACA_API_SECRET }}
+          RESEARCH_REQUEST: ${{ inputs.request || 'research/requests/pilot-etf-2018-2025.toml' }}
+        shell: bash
+        run: |
+          if [[ -z "$ALPACA_API_KEY" || -z "$ALPACA_API_SECRET" ]]; then
+            echo "::error::The two required Alpaca repository secrets are not available."
+            exit 1
+          fi
+          case "$RESEARCH_REQUEST" in
+            research/requests/*.toml) ;;
+            *)
+              echo "::error::The request must be a committed TOML file under research/requests."
+              exit 1
+              ;;
+          esac
+          umask 077
+          python -m swingbot research \
+            --request "$RESEARCH_REQUEST" \
+            --output hosted-research-output
+      - name: Upload derived reports and fingerprints
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: swingbot-research-${{ github.run_id }}
+          path: |
+            hosted-research-output/run.json
+            hosted-research-output/snapshot/manifest.json
+            hosted-research-output/report
+          if-no-files-found: error
+          retention-days: 30

@@ -15,6 +15,7 @@ from .backtest import run_backtest, write_report
 from .config import load_config
 from .data import AlpacaDataSource, SnapshotStore, fetch_snapshot
 from .paper import AlpacaPaperBroker, build_paper_plan, write_paper_plan
+from .research import execute_research_request
 from .strategy import (
     STRATEGY_VERSION,
     evaluate_energies,
@@ -58,6 +59,7 @@ def _backtest(args: argparse.Namespace) -> int:
     result = run_backtest(frames, config, args.start, args.end, benchmark_symbol=args.benchmark)
     provenance = {
         "snapshot_fingerprint": manifest.get("snapshot_fingerprint"),
+        "data_fingerprint": manifest.get("data_fingerprint"),
         "provider": manifest.get("provider"),
         "feed": manifest.get("feed"),
         "adjustment": manifest.get("adjustment"),
@@ -65,6 +67,14 @@ def _backtest(args: argparse.Namespace) -> int:
     output = write_report(result, args.output, provenance=provenance)
     print(json.dumps(result.summary, indent=2, sort_keys=True))
     print(f"wrote report: {output}")
+    return 0
+
+
+def _research(args: argparse.Namespace) -> int:
+    output = execute_research_request(args.request, args.output)
+    summary = json.loads((output / "report" / "summary.json").read_text(encoding="utf-8"))
+    print(json.dumps(summary, indent=2, sort_keys=True))
+    print(f"wrote authenticated research run: {output}")
     return 0
 
 
@@ -211,6 +221,13 @@ def build_parser() -> argparse.ArgumentParser:
     backtest_parser.add_argument("--output", type=Path, required=True)
     backtest_parser.add_argument("--benchmark", default="SPY")
     backtest_parser.set_defaults(handler=_backtest)
+
+    research_parser = subparsers.add_parser(
+        "research", help="fetch a frozen snapshot and run one strict research request"
+    )
+    research_parser.add_argument("--request", type=Path, required=True)
+    research_parser.add_argument("--output", type=Path, required=True)
+    research_parser.set_defaults(handler=_research)
 
     paper_parser = subparsers.add_parser(
         "paper", help="plan or explicitly submit Alpaca paper orders"
