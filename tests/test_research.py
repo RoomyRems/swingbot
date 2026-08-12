@@ -45,6 +45,7 @@ def _write_request(root: Path, **replacements: str) -> Path:
         "start": '"2021-01-04"',
         "end": '"2022-12-30"',
         "benchmark": '"SPY"',
+        "exit_policy": '"static-2r"',
         **replacements,
     }
     path = root / "research" / "requests" / "pilot.toml"
@@ -95,11 +96,19 @@ class ResearchRequestTests(unittest.TestCase):
                     today=date(2026, 8, 11),
                 )
 
+    def test_request_rejects_an_unknown_exit_policy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _write_config(root)
+            path = _write_request(root, exit_policy='"invented-exit"')
+            with self.assertRaisesRegex(ValueError, "invented-exit"):
+                load_research_request(path, repository_root=root, today=date(2026, 8, 11))
+
     def test_execution_verifies_snapshot_and_writes_provenance(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             _write_config(root)
-            request_path = _write_request(root)
+            request_path = _write_request(root, exit_policy='"burns-cycle-v1"')
             output = root / "output"
 
             def fake_fetch(destination, symbols, start, end, data_config):
@@ -126,6 +135,10 @@ class ResearchRequestTests(unittest.TestCase):
 
             run = json.loads((result / "run.json").read_text(encoding="utf-8"))
             summary = json.loads((result / "report" / "summary.json").read_text(encoding="utf-8"))
+            baseline = json.loads(
+                (result / "baseline-report" / "summary.json").read_text(encoding="utf-8")
+            )
+            comparison = json.loads((result / "comparison.json").read_text(encoding="utf-8"))
             self.assertEqual(run["name"], "pilot-test")
             self.assertEqual(len(run["research_request_fingerprint"]), 64)
             self.assertEqual(
@@ -140,6 +153,11 @@ class ResearchRequestTests(unittest.TestCase):
                 run["data_fingerprint"],
                 summary["provenance"]["data_fingerprint"],
             )
+            self.assertEqual(run["exit_policy"], "burns-cycle-v1")
+            self.assertEqual(run["baseline_report"], "baseline-report")
+            self.assertEqual(summary["exit_policy"], "burns-cycle-v1")
+            self.assertEqual(baseline["exit_policy"], "static-2r")
+            self.assertTrue(comparison["same_strategy_fingerprint"])
 
 
 if __name__ == "__main__":

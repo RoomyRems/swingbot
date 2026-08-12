@@ -90,6 +90,8 @@ class StrategyTests(unittest.TestCase):
         self.assertEqual(set(signal.energies), {"trend", "momentum", "cycle", "support", "scale"})
         self.assertEqual(signal.context["retrace_number"], 1)
         self.assertTrue(signal.context["mini_divergence"])
+        self.assertIn("cycle_low_relative_volume_90", signal.context)
+        self.assertIn("signal_relative_volume_90", signal.context)
         self.assertEqual(signal.context["support_source"], "15-EMA")
         self.assertLess(signal.stop_price, signal.reference_price)
         self.assertLess(signal.reference_price, signal.entry_stop)

@@ -17,7 +17,7 @@ evaluation. `strategy_fingerprint()` records the frozen rule values.
 - Daily setup chart
 - Last completed weekly chart for Scale
 - Signal only after the daily bar closes
-- One next-session DAY stop-limit bracket
+- One next-session DAY stop-limit entry; paper submission uses a static bracket
 - Backtest and paper planning use the same signal and sizing functions
 
 The book presents the method symmetrically for long and short trades and across
@@ -108,17 +108,56 @@ measurable without changing the bars or the other four energies.
 
 ## Exit translation
 
-The current full-position 2R target is deliberately **not** attributed to Burns.
-It remains a simple, broker-supported paper bracket so every filled position has
-both a hard protective stop and a deterministic target without a continuously
-running order manager.
+Exit behavior has its own version and fingerprint so it can change without
+pretending the entry rules changed.
 
-Burns's book exit is richer: take a partial exit at the next cycle high, then
-trail the runner below successive cycle lows; near the fifth wave, tighten to a
-one-bar stop (Ch. 23, PDF 321-327). That workflow is recorded for the next
-version but must not replace the bracket until backtest event ordering, partial
-fills, broker reconciliation, restart recovery, and stop replacement are all
+`static-2r` closes the full position at 2R or the initial hard stop. The target
+is deliberately **not** attributed to Burns. It remains the paper-trading policy
+so every position has broker-held protection even when SwingBot is offline.
+
+`burns-cycle-v1` is research-only and implements Chapter 23 (PDF 321-327):
+
+1. The initial hard stop remains active one tick below the entry cycle low.
+2. A cycle-high exit signal occurs only after a completed bar where smoothed %K
+   changes from rising to falling while %D is above 50.
+3. Half of the original shares are sold at the following session's open with
+   configured adverse slippage. The backtest never awards the already-known
+   historical cycle-high price.
+4. No trailing stop is used before that partial exit.
+5. Afterward, a closed `%D < 50` cycle-low hook may raise, but never lower, the
+   runner stop to one tick below that completed interval's price low.
+6. A second-retrace entry whose next cycle high breaks the previous cycle high
+   with both open and close is classified as the fifth impulse. After its partial
+   exit, the runner uses a one-bar stop one tick below each previous closed bar.
+7. An opening gap through the stop takes precedence over a simultaneous partial.
+   Otherwise the scheduled opening partial precedes any later intraday stop.
+   Every partial, fee, stop update, and final exit is written separately.
+
+Burns says “part” rather than prescribing a universal fraction; 50% is frozen
+from his 400-share/200-share example (PDF 322-323). The closed %K hook makes the
+otherwise visual instruction causal. His money-management example emphasizes an
+all-five-energy mini-divergence setup, whereas this experiment applies the same
+exit manager to every filled `burns-book-v2` entry and attributes divergence in
+the signal record. That distinction must be considered when interpreting results.
+
+The dynamic manager does not replace the paper bracket until partial-fill
+reconciliation, cancel/replace, restart recovery, and persistent stop state are
 implemented fail-closed.
+
+## Volume boundary
+
+The book's objective daily-volume rule is liquidity: use at least 90 sessions of
+average volume and keep a position below 0.1% of it (PDF 255). Chapter 7's
+directional method compares broad-market up-volume with down-volume and is
+presented chiefly for day trading. “Volume spikes” appears only in a list of
+third-party scanner features (PDF 279), not as a defined support/resistance
+algorithm.
+
+The current report therefore records continuous 90-session relative volume at
+the entry cycle low and signal bar without filtering trades. A future
+volume-at-price or spike-zone rule would be a separately named hypothesis with
+predeclared lookback, threshold, price-zone, and expiration semantics; it will
+not be attributed to Burns without a source that specifies them.
 
 ## Intentionally excluded from the signal
 

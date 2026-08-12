@@ -34,17 +34,25 @@ find the prettiest equity curve.
 2. Run `burns-book-v2` on the identical snapshot and costs. Attribute the change
    with its reconstructed v1 strict count and Cycle funnel before considering
    returns.
-3. Use the early development interval only to find coding errors and understand
+3. Compare `burns-cycle-v1` with `static-2r` from the same authenticated snapshot;
+   do not infer exit effects from separately fetched data.
+4. Treat 15% CAGR as the minimum project-continuation hurdle and 20% as the
+   stronger target requested by the owner. Report both with drawdown, exposure,
+   turnover, and benchmark CAGR. A hurdle pass is not proof of an edge.
+5. Use the early development interval only to find coding errors and understand
    trade frequency.
-4. Do not optimize configuration or frozen strategy constants against return.
-5. Evaluate later calendar periods separately and keep the last interval
+6. Do not optimize configuration or frozen strategy constants against return.
+7. Evaluate later calendar periods separately and keep the last interval
    untouched until the rules are frozen.
-6. Compare against SPY buy-and-hold and a simple trend baseline.
-7. Break results down by symbol, year, volatility regime, and entry gap.
-8. Inspect every extreme winner/loss and a random trade sample against the raw
+8. Compare against SPY buy-and-hold and a simple trend baseline.
+9. Break results down by symbol, year, volatility regime, and entry gap.
+10. Inspect every extreme winner/loss and a random trade sample against the raw
    bars.
-9. Repeat with higher slippage and, when available, a second data vendor.
-10. Paper trade long enough to compare planned, submitted, filled, rejected,
+11. Treat cycle-low and signal-bar relative volume as attribution only. Do not
+    turn a favorable bin into a filter on this same sample. Volume-at-price zones
+    require a separately sourced, preregistered rule.
+12. Repeat with higher slippage and, when available, a second data vendor.
+13. Paper trade long enough to compare planned, submitted, filled, rejected,
     and canceled orders.
 
 ## Evidence expected before considering further automation

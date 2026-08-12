@@ -72,5 +72,7 @@ jobs:
             hosted-research-output/run.json
             hosted-research-output/snapshot/manifest.json
             hosted-research-output/report
+            hosted-research-output/baseline-report
+            hosted-research-output/comparison.json
           if-no-files-found: error
           retention-days: 30

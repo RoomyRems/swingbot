@@ -11,10 +11,19 @@ import numpy as np
 import pandas as pd
 
 from .config import AppConfig, config_fingerprint
+from .exits import (
+    DEFAULT_BURNS_EXIT_RULES,
+    ExitPolicy,
+    exit_policy_fingerprint,
+    long_cycle_high_turn,
+    long_cycle_low_turn,
+    stop_below,
+)
 from .indicators import normalize_bars
 from .models import (
     BacktestResult,
     EnergyEvidence,
+    ExitFill,
     ExitReason,
     PlannedOrder,
     Position,
@@ -192,18 +201,27 @@ def _existing_exit(
     position: Position,
     bar: pd.Series,
     slip: float,
+    exit_policy: ExitPolicy,
 ) -> tuple[float, ExitReason] | None:
     if float(bar["open"]) <= position.stop_price:
-        return max(float(bar["low"]), float(bar["open"]) * (1.0 - slip)), ExitReason.STOP
-    if float(bar["open"]) >= position.target_price:
+        return (
+            max(float(bar["low"]), float(bar["open"]) * (1.0 - slip)),
+            position.stop_reason,
+        )
+    if exit_policy is ExitPolicy.STATIC_2R and float(bar["open"]) >= position.target_price:
         return position.target_price, ExitReason.TARGET
 
     stop_touched = float(bar["low"]) <= position.stop_price
-    target_touched = float(bar["high"]) >= position.target_price
+    target_touched = (
+        exit_policy is ExitPolicy.STATIC_2R and float(bar["high"]) >= position.target_price
+    )
     if stop_touched:
         # Daily OHLC cannot reveal whether a same-day stop or target came first.
         # The conservative convention always assigns the stop.
-        return max(float(bar["low"]), position.stop_price * (1.0 - slip)), ExitReason.STOP
+        return (
+            max(float(bar["low"]), position.stop_price * (1.0 - slip)),
+            position.stop_reason,
+        )
     if target_touched:
         return position.target_price, ExitReason.TARGET
     return None
@@ -237,47 +255,121 @@ def _new_position_exit(
     bar: pd.Series,
     filled_at_open: bool,
     slip: float,
+    exit_policy: ExitPolicy,
 ) -> tuple[float, ExitReason] | None:
     if filled_at_open and float(bar["open"]) <= position.stop_price:
-        return max(float(bar["low"]), float(bar["open"]) * (1.0 - slip)), ExitReason.STOP
+        return max(float(bar["low"]), float(bar["open"]) * (1.0 - slip)), position.stop_reason
     if float(bar["low"]) <= position.stop_price:
-        return max(float(bar["low"]), position.stop_price * (1.0 - slip)), ExitReason.STOP
-    if filled_at_open and float(bar["high"]) >= position.target_price:
+        return (
+            max(float(bar["low"]), position.stop_price * (1.0 - slip)),
+            position.stop_reason,
+        )
+    if (
+        exit_policy is ExitPolicy.STATIC_2R
+        and filled_at_open
+        and float(bar["high"]) >= position.target_price
+    ):
         return position.target_price, ExitReason.TARGET
     # If a limit filled intraday, the day's high may have occurred before entry.
     # We therefore never award a same-bar target to an intraday fill.
     return None
 
 
-def _close_position(
+def _record_exit(
     position: Position,
     exit_date: date,
     exit_price: float,
     reason: ExitReason,
     commission_per_share: float,
-) -> tuple[Trade, float]:
-    exit_fee = position.quantity * commission_per_share
-    proceeds = position.quantity * exit_price - exit_fee
-    fees = position.entry_commission + exit_fee
-    pnl = position.quantity * (exit_price - position.entry_price) - fees
-    initial_risk = position.quantity * position.initial_risk_per_share
+) -> float:
+    quantity = position.quantity
+    return _record_partial_exit(
+        position,
+        exit_date,
+        exit_price,
+        quantity,
+        reason,
+        commission_per_share,
+    )
+
+
+def _record_partial_exit(
+    position: Position,
+    exit_date: date,
+    exit_price: float,
+    quantity: int,
+    reason: ExitReason,
+    commission_per_share: float,
+) -> float:
+    if quantity < 1 or quantity > position.quantity:
+        raise ValueError("exit quantity must be within the remaining position")
+    exit_fee = quantity * commission_per_share
+    proceeds = quantity * exit_price - exit_fee
+    position.exit_fills.append(
+        ExitFill(
+            position_id=position.position_id,
+            symbol=position.symbol,
+            exit_date=exit_date,
+            quantity=quantity,
+            price=exit_price,
+            reason=reason,
+            fees=exit_fee,
+        )
+    )
+    position.quantity -= quantity
+    return proceeds
+
+
+def _finalize_trade(position: Position) -> Trade:
+    if position.quantity != 0:
+        raise ValueError("cannot finalize a position with shares remaining")
+    exited_quantity = sum(fill.quantity for fill in position.exit_fills)
+    if exited_quantity != position.initial_quantity:
+        raise ValueError("exit fills do not reconcile to the initial position")
+    exit_value = sum(fill.quantity * fill.price for fill in position.exit_fills)
+    exit_fees = sum(fill.fees for fill in position.exit_fills)
+    weighted_exit = exit_value / position.initial_quantity
+    fees = position.entry_commission + exit_fees
+    pnl = exit_value - position.initial_quantity * position.entry_price - fees
+    initial_risk = position.initial_quantity * position.initial_risk_per_share
     r_multiple = pnl / initial_risk if initial_risk > 0 else float("nan")
-    trade = Trade(
+    partial_dates = [
+        fill.exit_date
+        for fill in position.exit_fills
+        if fill.reason is ExitReason.CYCLE_HIGH_PARTIAL
+    ]
+    return Trade(
+        position_id=position.position_id,
         symbol=position.symbol,
         signal_date=position.signal_date,
         entry_date=position.entry_date,
-        exit_date=exit_date,
-        quantity=position.quantity,
+        exit_date=position.exit_fills[-1].exit_date,
+        quantity=position.initial_quantity,
         entry_price=position.entry_price,
-        exit_price=exit_price,
-        stop_price=position.stop_price,
+        exit_price=weighted_exit,
+        stop_price=position.initial_stop_price,
         target_price=position.target_price,
-        reason=reason,
+        reason=position.exit_fills[-1].reason,
         pnl=pnl,
         r_multiple=r_multiple,
         fees=fees,
+        exit_legs=len(position.exit_fills),
+        first_exit_date=min(partial_dates) if partial_dates else None,
+        initial_stop_price=position.initial_stop_price,
+        final_stop_price=position.stop_price,
     )
-    return trade, proceeds
+
+
+def _exit_row(fill: ExitFill) -> dict[str, object]:
+    return {
+        "position_id": fill.position_id,
+        "symbol": fill.symbol,
+        "exit_date": fill.exit_date.isoformat(),
+        "quantity": fill.quantity,
+        "price": fill.price,
+        "reason": fill.reason.value,
+        "fees": fill.fees,
+    }
 
 
 def _signal_row(signal: Signal, status: str, reason: str = "") -> dict[str, object]:
@@ -330,6 +422,152 @@ def _execution_diagnostics(
     }
 
 
+def _exit_diagnostics(
+    trades: list[Trade],
+    exit_rows: list[dict[str, object]],
+    management_rows: list[dict[str, object]],
+) -> dict[str, object]:
+    fill_reasons: dict[str, int] = {}
+    for row in exit_rows:
+        reason = str(row["reason"])
+        fill_reasons[reason] = fill_reasons.get(reason, 0) + 1
+    final_reasons: dict[str, int] = {}
+    for trade in trades:
+        reason = trade.reason.value
+        final_reasons[reason] = final_reasons.get(reason, 0) + 1
+    management_events: dict[str, int] = {}
+    for row in management_rows:
+        event = str(row["event"])
+        management_events[event] = management_events.get(event, 0) + 1
+    partial_positions = sum(trade.exit_legs > 1 for trade in trades)
+    return {
+        "exit_fill_reason_counts": fill_reasons,
+        "final_exit_reason_counts": final_reasons,
+        "management_event_counts": management_events,
+        "partial_exit_positions": partial_positions,
+        "partial_exit_rate": partial_positions / len(trades) if trades else None,
+        "average_exit_legs": (
+            float(np.mean([trade.exit_legs for trade in trades])) if trades else None
+        ),
+    }
+
+
+def _partial_fill_price(bar: pd.Series, slip: float) -> float:
+    return max(float(bar["low"]), float(bar["open"]) * (1.0 - slip))
+
+
+def _process_scheduled_partial(
+    position: Position,
+    bar: pd.Series,
+    current_date: date,
+    slip: float,
+    commission: float,
+) -> float | None:
+    if position.partial_exit_on != current_date or position.first_exit_taken:
+        return None
+    quantity = max(
+        1,
+        math.floor(position.initial_quantity * DEFAULT_BURNS_EXIT_RULES.partial_fraction),
+    )
+    quantity = min(quantity, position.quantity)
+    proceeds = _record_partial_exit(
+        position,
+        current_date,
+        _partial_fill_price(bar, slip),
+        quantity,
+        ExitReason.CYCLE_HIGH_PARTIAL,
+        commission,
+    )
+    position.first_exit_taken = True
+    position.partial_exit_on = None
+    position.one_bar_mode = position.partial_is_fifth_wave
+    if position.one_bar_mode and position.partial_hook_bar_low is not None:
+        candidate = stop_below(position.partial_hook_bar_low)
+        if candidate > position.stop_price:
+            position.stop_price = candidate
+            position.stop_reason = ExitReason.ONE_BAR_TRAIL
+    return proceeds
+
+
+def _observe_burns_management(
+    position: Position,
+    prepared: pd.DataFrame,
+    timestamp: pd.Timestamp,
+    next_timestamp: pd.Timestamp | None,
+) -> dict[str, object] | None:
+    if not position.first_exit_taken and position.partial_exit_on is None:
+        previous_wave_high = position.entry_context.get("previous_cycle_high_price")
+        high_turn = long_cycle_high_turn(
+            prepared,
+            timestamp,
+            previous_wave_high=(
+                float(previous_wave_high) if isinstance(previous_wave_high, (int, float)) else None
+            ),
+        )
+        if high_turn is not None and next_timestamp is not None:
+            position.partial_exit_on = next_timestamp.date()
+            position.partial_signal_date = high_turn.signal_date
+            position.partial_hook_bar_low = high_turn.hook_bar_low
+            position.partial_cycle_high = high_turn.extreme_price
+            position.partial_is_fifth_wave = bool(
+                int(position.entry_context.get("retrace_number", 1)) >= 2
+                and high_turn.wave_breakout
+            )
+            return {
+                "position_id": position.position_id,
+                "symbol": position.symbol,
+                "date": timestamp.date().isoformat(),
+                "event": "cycle_high_partial_scheduled",
+                "effective_on": next_timestamp.date().isoformat(),
+                "cycle_high": high_turn.extreme_price,
+                "fifth_wave": position.partial_is_fifth_wave,
+            }
+        return None
+
+    if position.one_bar_mode:
+        candidate = stop_below(float(prepared.loc[timestamp, "low"]))
+        if candidate > position.stop_price:
+            old_stop = position.stop_price
+            position.stop_price = candidate
+            position.stop_reason = ExitReason.ONE_BAR_TRAIL
+            return {
+                "position_id": position.position_id,
+                "symbol": position.symbol,
+                "date": timestamp.date().isoformat(),
+                "event": "one_bar_stop_raised",
+                "old_stop": old_stop,
+                "new_stop": candidate,
+            }
+        return None
+
+    low_turn = long_cycle_low_turn(prepared, timestamp)
+    if low_turn is None:
+        return None
+    position.runner_cycle_low_seen = True
+    candidate = stop_below(low_turn.extreme_price)
+    if candidate <= position.stop_price:
+        return {
+            "position_id": position.position_id,
+            "symbol": position.symbol,
+            "date": timestamp.date().isoformat(),
+            "event": "cycle_low_stop_not_raised",
+            "cycle_low": low_turn.extreme_price,
+            "current_stop": position.stop_price,
+        }
+    old_stop = position.stop_price
+    position.stop_price = candidate
+    position.stop_reason = ExitReason.CYCLE_LOW_TRAIL
+    return {
+        "position_id": position.position_id,
+        "symbol": position.symbol,
+        "date": timestamp.date().isoformat(),
+        "event": "cycle_low_stop_raised",
+        "cycle_low": low_turn.extreme_price,
+        "old_stop": old_stop,
+        "new_stop": candidate,
+    }
+
+
 def run_backtest(
     frames: dict[str, pd.DataFrame],
     config: AppConfig,
@@ -337,7 +575,9 @@ def run_backtest(
     end: date,
     *,
     benchmark_symbol: str = "SPY",
+    exit_policy: ExitPolicy = ExitPolicy.STATIC_2R,
 ) -> BacktestResult:
+    exit_policy = ExitPolicy(exit_policy)
     if start > end:
         raise ValueError("start date must not be after end date")
     missing = sorted(set(config.symbols) - set(frames))
@@ -371,6 +611,8 @@ def run_backtest(
     equity_rows: list[dict[str, object]] = []
     signal_rows: list[dict[str, object]] = []
     order_rows: list[dict[str, object]] = []
+    exit_rows: list[dict[str, object]] = []
+    management_rows: list[dict[str, object]] = []
     slip = _slippage_fraction(config)
     commission = config.execution.commission_per_share
 
@@ -381,15 +623,73 @@ def run_backtest(
         for symbol in sorted(tuple(positions)):
             if timestamp not in normalized[symbol].index:
                 continue
-            outcome = _existing_exit(positions[symbol], normalized[symbol].loc[timestamp], slip)
+            position = positions[symbol]
+            bar = normalized[symbol].loc[timestamp]
+            partial_due = bool(
+                exit_policy is ExitPolicy.BURNS_CYCLE_V1
+                and position.partial_exit_on == current_date
+                and not position.first_exit_taken
+            )
+            if partial_due and float(bar["open"]) > position.stop_price:
+                # A market-at-open partial is knowably earlier than an intraday
+                # stop when the session opens above the existing stop. Recheck
+                # the runner afterward because today's low can still stop it.
+                partial_proceeds = _process_scheduled_partial(
+                    position,
+                    bar,
+                    current_date,
+                    slip,
+                    commission,
+                )
+                if partial_proceeds is None:  # pragma: no cover - guarded above
+                    raise RuntimeError("scheduled partial was not processed")
+                cash += partial_proceeds
+                exit_rows.append(_exit_row(position.exit_fills[-1]))
+                if position.quantity == 0:
+                    positions.pop(symbol)
+                    trades.append(_finalize_trade(position))
+                    continue
+                runner_outcome = _existing_exit(position, bar, slip, exit_policy)
+                if runner_outcome is not None:
+                    exit_price, reason = runner_outcome
+                    positions.pop(symbol)
+                    proceeds = _record_exit(
+                        position,
+                        current_date,
+                        exit_price,
+                        reason,
+                        commission,
+                    )
+                    cash += proceeds
+                    exit_rows.append(_exit_row(position.exit_fills[-1]))
+                    trades.append(_finalize_trade(position))
+                continue
+
+            outcome = _existing_exit(position, bar, slip, exit_policy)
             if outcome is None:
+                if exit_policy is not ExitPolicy.BURNS_CYCLE_V1:
+                    continue
+                partial_proceeds = _process_scheduled_partial(
+                    position,
+                    bar,
+                    current_date,
+                    slip,
+                    commission,
+                )
+                if partial_proceeds is None:
+                    continue
+                cash += partial_proceeds
+                exit_rows.append(_exit_row(position.exit_fills[-1]))
+                if position.quantity == 0:
+                    positions.pop(symbol)
+                    trades.append(_finalize_trade(position))
                 continue
             exit_price, reason = outcome
-            trade, proceeds = _close_position(
-                positions.pop(symbol), current_date, exit_price, reason, commission
-            )
+            position = positions.pop(symbol)
+            proceeds = _record_exit(position, current_date, exit_price, reason, commission)
             cash += proceeds
-            trades.append(trade)
+            exit_rows.append(_exit_row(position.exit_fills[-1]))
+            trades.append(_finalize_trade(position))
 
         # 2) Process only orders created from a prior close and valid this session.
         for symbol in sorted(tuple(pending)):
@@ -437,15 +737,21 @@ def run_backtest(
             entry_fee = quantity * commission
             cash -= quantity * fill_price + entry_fee
             position = Position(
+                position_id=(
+                    f"{symbol}-{order.signal.signal_date.strftime('%Y%m%d')}-{current_date:%Y%m%d}"
+                ),
                 symbol=symbol,
+                initial_quantity=quantity,
                 quantity=quantity,
                 signal_date=order.signal.signal_date,
                 entry_date=current_date,
                 entry_price=fill_price,
+                initial_stop_price=order.signal.stop_price,
                 stop_price=order.signal.stop_price,
                 target_price=order.signal.target_price,
                 initial_risk_per_share=order.signal.risk_per_share,
                 entry_commission=entry_fee,
+                entry_context=dict(order.signal.context),
             )
             positions[symbol] = position
             order_rows.append(
@@ -466,16 +772,32 @@ def run_backtest(
                 normalized[symbol].loc[timestamp],
                 filled_at_open,
                 slip,
+                exit_policy,
             )
             if same_bar_exit is not None:
                 exit_price, reason = same_bar_exit
-                trade, proceeds = _close_position(
-                    positions.pop(symbol), current_date, exit_price, reason, commission
-                )
+                position = positions.pop(symbol)
+                proceeds = _record_exit(position, current_date, exit_price, reason, commission)
                 cash += proceeds
-                trades.append(trade)
+                exit_rows.append(_exit_row(position.exit_fills[-1]))
+                trades.append(_finalize_trade(position))
 
-        # 3) Evaluate this completed close. No fill-time or next-bar data enters here.
+        # 3) Update Burns's manager from this completed close. New stops and
+        # partial exits become active next session, never retroactively today.
+        if exit_policy is ExitPolicy.BURNS_CYCLE_V1:
+            for symbol in sorted(positions):
+                if timestamp not in prepared[symbol].index:
+                    continue
+                event = _observe_burns_management(
+                    positions[symbol],
+                    prepared[symbol],
+                    timestamp,
+                    next_date[symbol].get(timestamp),
+                )
+                if event is not None:
+                    management_rows.append(event)
+
+        # 4) Evaluate this completed close. No fill-time or next-bar data enters here.
         candidates: list[Signal] = []
         for symbol in config.symbols:
             if timestamp not in prepared[symbol].index:
@@ -540,15 +862,17 @@ def run_backtest(
         mark = _mark_price(normalized[symbol], final_timestamp)
         final_bar = normalized[symbol].loc[:final_timestamp].iloc[-1]
         exit_price = max(float(final_bar["low"]), mark * (1.0 - slip))
-        trade, proceeds = _close_position(
-            positions.pop(symbol),
+        position = positions.pop(symbol)
+        proceeds = _record_exit(
+            position,
             final_timestamp.date(),
             exit_price,
             ExitReason.END_OF_DATA,
             commission,
         )
         cash += proceeds
-        trades.append(trade)
+        exit_rows.append(_exit_row(position.exit_fills[-1]))
+        trades.append(_finalize_trade(position))
     pending.clear()
     equity_rows[-1].update({"equity": cash, "cash": cash, "positions": 0, "pending_orders": 0})
 
@@ -560,15 +884,19 @@ def run_backtest(
         end,
         benchmark_symbol,
         config,
+        exit_policy,
     )
     summary["strategy_diagnostics"] = strategy_diagnostics.as_dict()
     summary["execution_diagnostics"] = _execution_diagnostics(signal_rows, order_rows)
+    summary["exit_diagnostics"] = _exit_diagnostics(trades, exit_rows, management_rows)
     return BacktestResult(
         summary=summary,
         trades=trades,
         equity_rows=equity_rows,
         signal_rows=signal_rows,
         order_rows=order_rows,
+        exit_rows=exit_rows,
+        management_rows=management_rows,
     )
 
 
@@ -580,6 +908,7 @@ def _summarize(
     end: date,
     benchmark_symbol: str,
     config: AppConfig,
+    exit_policy: ExitPolicy,
 ) -> dict[str, object]:
     equity = pd.Series(
         [float(row["equity"]) for row in equity_rows],
@@ -612,10 +941,15 @@ def _summarize(
     expectancy_r = float(np.mean([trade.r_multiple for trade in trades])) if trades else None
 
     benchmark_return = None
+    benchmark_cagr = None
     if benchmark_symbol in frames:
         benchmark = frames[benchmark_symbol].loc[pd.Timestamp(start) : pd.Timestamp(end), "close"]
         if len(benchmark) >= 2:
             benchmark_return = float(benchmark.iloc[-1] / benchmark.iloc[0] - 1.0)
+            benchmark_cagr = (1.0 + benchmark_return) ** (1.0 / elapsed_years) - 1.0
+
+    invested_sessions = sum(int(row.get("positions", 0)) > 0 for row in equity_rows)
+    average_positions = float(np.mean([int(row.get("positions", 0)) for row in equity_rows]))
 
     return {
         "start": start.isoformat(),
@@ -641,8 +975,17 @@ def _summarize(
         "fees": float(sum(trade.fees for trade in trades)),
         "benchmark_symbol": benchmark_symbol,
         "benchmark_return": benchmark_return,
+        "benchmark_cagr": benchmark_cagr,
+        "invested_sessions": invested_sessions,
+        "invested_session_fraction": invested_sessions / len(equity_rows),
+        "average_positions": average_positions,
+        "max_concurrent_positions": max(int(row.get("positions", 0)) for row in equity_rows),
+        "meets_15_percent_cagr_hurdle": bool(cagr >= 0.15),
+        "meets_20_percent_cagr_hurdle": bool(cagr >= 0.20),
         "strategy_version": STRATEGY_VERSION,
         "strategy_fingerprint": strategy_fingerprint(),
+        "exit_policy": exit_policy.value,
+        "exit_policy_fingerprint": exit_policy_fingerprint(exit_policy),
         "config_fingerprint": config_fingerprint(config),
     }
 
@@ -673,6 +1016,10 @@ def write_report(
         output / "signals.csv", index=False, lineterminator="\n"
     )
     pd.DataFrame(result.order_rows).to_csv(output / "orders.csv", index=False, lineterminator="\n")
+    pd.DataFrame(result.exit_rows).to_csv(output / "exits.csv", index=False, lineterminator="\n")
+    pd.DataFrame(result.management_rows).to_csv(
+        output / "management.csv", index=False, lineterminator="\n"
+    )
     pd.DataFrame(_yearly_rows(result)).to_csv(
         output / "yearly.csv", index=False, lineterminator="\n"
     )

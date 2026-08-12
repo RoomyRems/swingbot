@@ -14,6 +14,7 @@ import pandas as pd
 from .backtest import run_backtest, write_report
 from .config import load_config
 from .data import AlpacaDataSource, SnapshotStore, fetch_snapshot
+from .exits import ExitPolicy
 from .paper import AlpacaPaperBroker, build_paper_plan, write_paper_plan
 from .research import execute_research_request
 from .strategy import (
@@ -55,7 +56,14 @@ def _backtest(args: argparse.Namespace) -> int:
     if manifest.get("feed") != config.data.feed:
         raise ValueError("configured feed does not match the snapshot manifest")
 
-    result = run_backtest(frames, config, args.start, args.end, benchmark_symbol=args.benchmark)
+    result = run_backtest(
+        frames,
+        config,
+        args.start,
+        args.end,
+        benchmark_symbol=args.benchmark,
+        exit_policy=args.exit_policy,
+    )
     provenance = {
         "snapshot_fingerprint": manifest.get("snapshot_fingerprint"),
         "data_fingerprint": manifest.get("data_fingerprint"),
@@ -221,6 +229,12 @@ def build_parser() -> argparse.ArgumentParser:
     backtest_parser.add_argument("--end", type=_date, required=True)
     backtest_parser.add_argument("--output", type=Path, required=True)
     backtest_parser.add_argument("--benchmark", default="SPY")
+    backtest_parser.add_argument(
+        "--exit-policy",
+        type=ExitPolicy,
+        choices=list(ExitPolicy),
+        default=ExitPolicy.STATIC_2R,
+    )
     backtest_parser.set_defaults(handler=_backtest)
 
     research_parser = subparsers.add_parser(

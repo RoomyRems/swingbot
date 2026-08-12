@@ -3,9 +3,13 @@
 # out-of-sample performance claim.
 # The burns-book-v2 rerun holds the universe, dates, configuration, provider,
 # and costs fixed; only the Cycle classification changes from burns-book-v1.
+# This next run holds those inputs fixed again. It compares the research-only
+# burns-cycle-v1 manager with static-2r from one fetched snapshot. The 15% and
+# 20% CAGR hurdles were declared before seeing this exit result.
 schema_version = 1
 name = "pilot-etf-2018-2025"
 config = "swingbot.toml"
 start = "2018-01-01"
 end = "2025-12-31"
 benchmark = "SPY"
+exit_policy = "burns-cycle-v1"

@@ -36,6 +36,9 @@ authoritative than it is.
 | Risk per trade | Examples use conservative fractional-equity risk and warn against exceeding 2% | Risk-management chapters | Default is 0.5%; the strict config permits a maximum of 2% |
 | Liquidity lookback | Judge liquidity over roughly 90 sessions | PDF 255 | Implemented as trailing 90-session average daily volume |
 | Market-impact cap | Position size should be no more than 0.1% of average daily volume | PDF 255 | Implemented as a hard sizing cap |
+| First profit exit | Exit part of a long at the next cycle high before trailing | PDF 321-323 | `burns-cycle-v1` sells a frozen 50% on the session after a closed cycle-high hook; the exact peak is never used as a fill |
+| Cycle-low trailing stop | After the first exit, move the runner stop below each new higher cycle low | PDF 324-325 | Implemented from completed 5-2-3 intervals; a stop may rise but never fall |
+| Fifth-wave tightening | Near the fifth impulse, trail below the previous closed bar | PDF 324-327 | Second-retrace plus an objective break of the prior cycle high activates one-bar mode after the partial exit |
 | Audit discipline | Record the reason for entry/exit and evaluate average wins, average losses, fees, and mistakes | Journaling and evaluation chapters | Signals include all energy values/rules/context; reports include win/loss, payoff, fees, and expectancy fields |
 | Avoid curve fitting | Freeze rules before out-of-sample evaluation | Testing and system-development discussion | Strategy version and rule fingerprint are written into every summary |
 
@@ -53,6 +56,9 @@ made by the book.
 | Entry lifetime | Next regular session only | Forces a stale setup to be re-evaluated after another close |
 | Same-bar ambiguity | Take the adverse feasible path | Daily OHLC cannot reveal intrabar order |
 | Candidate priority | Five-energy setups rank above four-energy setups; first retraces rank above second retraces; mini-divergence ranks above a plain hook within those groups | Deterministic portfolio selection when capital or slots are scarce, while preserving the book's probability distinction |
+| Partial fraction | Sell 50% of original quantity | Burns says “part”; 50% is frozen from the 400/200-share example on PDF 322-323 |
+| Cycle-high execution | Confirm the %K turn at close and sell next session with adverse slippage | Daily OHLC cannot provide Burns's visual cycle-high decision and a simultaneous historical peak fill without look-ahead |
+| Fifth impulse | A second-retrace entry followed by a cycle high whose interval has both open and close at/above the prior cycle high | Combines Burns's objective wave definition with the already frozen retrace count |
 
 Trend and Cycle are operationally mandatory in addition to Scale. A long entry
 without an uptrend or without the hook that defines its trigger is not a coherent
@@ -83,7 +89,6 @@ can add them without confusing them with the current evidence.
 
 | Book material | Why it is not silently added now | Safe next implementation |
 |---|---|---|
-| Partial exit at the next cycle high, then trail the runner below successive cycle lows; tighten near wave five | Requires partial-fill accounting, cancel/replace safety, broker reconciliation, and restart recovery. A static bracket cannot express it faithfully | Build an event-driven position manager and test crash recovery before enabling paper submission |
 | “First retrace after the cross” before the 50-SMA has turned | The book labels this an aggressive four-of-five setup (PDF 217), while the present baseline deliberately requires a confirmed rising 50-SMA | Add a separately versioned precursor-trend state that requires a causal price/50-SMA cross and exactly one subsequent retrace |
 | Elliott-style five-wave context | The book treats wave interpretation as useful but less objective than the core energy rules | Add only after a deterministic, separately versioned wave-state definition is written |
 | Fibonacci support | Anchor selection is not machine-unique and would create many tuning choices | Require a frozen causal anchor algorithm and evaluate it as a separate hypothesis |
@@ -98,14 +103,16 @@ can add them without confusing them with the current evidence.
 | Overnight option hedges | Options introduce contract selection, expiry, liquidity, assignment, and multi-leg recovery risks outside this ETF baseline | Treat gap stress first; design hedging as a separately approved portfolio system |
 | Short trades | Borrow availability, locate costs, upward-gap risk, and order parity differ from longs | Create and validate a distinct short strategy version |
 | Other chart pairs and instruments | The book applies the framework broadly, but mixing timeframes/markets creates different hypotheses | Validate each pair and market as its own frozen experiment |
+| Volume-spike support/resistance zones | The phrase “volume spikes” occurs only in a scanner-feature list (PDF 279); the book does not define a lookback, spike threshold, price zone, or expiry rule | Record continuous relative-volume diagnostics first; any zone algorithm must be a separately sourced and preregistered hypothesis |
 
 ## Exit boundary in the current release
 
-The present full-position 2R take-profit is **not** Burns's exit. It is retained
-as a conspicuous engineering control: every paper entry can be sent with a
-broker-held protective stop and deterministic profit target even if SwingBot is
-offline. Backtest output labels the exact strategy version so results cannot be
-mistaken for a test of the book's complete trade-management process.
+The full-position 2R take-profit is **not** Burns's exit. It is retained as the
+paper-trading engineering control: every paper entry has a broker-held protective
+stop and deterministic target even if SwingBot is offline. The separately
+fingerprinted `burns-cycle-v1` policy is now implemented for research with
+partial-fill accounting and conservative daily-bar ordering. It cannot be used
+for paper submission until broker reconciliation and restart recovery exist.
 
 ## Validation consequences
 

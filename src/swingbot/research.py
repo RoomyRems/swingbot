@@ -12,9 +12,18 @@ from typing import Any
 from .backtest import run_backtest, write_report
 from .config import AppConfig, config_fingerprint, load_config
 from .data import SnapshotStore, fetch_snapshot
+from .exits import ExitPolicy
 from .strategy import STRATEGY_VERSION, strategy_fingerprint
 
-_REQUEST_KEYS = {"schema_version", "name", "config", "start", "end", "benchmark"}
+_REQUEST_KEYS = {
+    "schema_version",
+    "name",
+    "config",
+    "start",
+    "end",
+    "benchmark",
+    "exit_policy",
+}
 _RUN_NAME = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 _MAX_CALENDAR_DAYS = 10 * 366
 _MAX_SYMBOLS = 25
@@ -28,6 +37,7 @@ class ResearchRequest:
     start: date
     end: date
     benchmark: str
+    exit_policy: ExitPolicy
 
 
 def _request_date(value: Any, name: str) -> date:
@@ -113,6 +123,7 @@ def load_research_request(
         start=start,
         end=end,
         benchmark=benchmark.strip().upper(),
+        exit_policy=ExitPolicy(str(raw["exit_policy"])),
     )
 
 
@@ -123,6 +134,7 @@ def research_request_fingerprint(request: ResearchRequest, config: AppConfig) ->
         "start": request.start.isoformat(),
         "end": request.end.isoformat(),
         "benchmark": request.benchmark,
+        "exit_policy": request.exit_policy.value,
         "config_fingerprint": config_fingerprint(config),
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
@@ -180,6 +192,7 @@ def execute_research_request(
         request.start,
         request.end,
         benchmark_symbol=request.benchmark,
+        exit_policy=request.exit_policy,
     )
     provenance = {
         "research_request": request.name,
@@ -192,12 +205,58 @@ def execute_research_request(
     }
     write_report(result, report_path, provenance=provenance)
 
+    baseline_report: str | None = None
+    if request.exit_policy is not ExitPolicy.STATIC_2R:
+        baseline_result = run_backtest(
+            frames,
+            config,
+            request.start,
+            request.end,
+            benchmark_symbol=request.benchmark,
+            exit_policy=ExitPolicy.STATIC_2R,
+        )
+        baseline_path = output / "baseline-report"
+        baseline_provenance = {**provenance, "comparison_role": "static-2r baseline"}
+        write_report(baseline_result, baseline_path, provenance=baseline_provenance)
+        baseline_report = "baseline-report"
+
+        comparison_keys = (
+            "total_return",
+            "cagr",
+            "benchmark_cagr",
+            "max_drawdown",
+            "daily_sharpe",
+            "trades",
+            "win_rate",
+            "profit_factor",
+            "expectancy_r",
+            "invested_session_fraction",
+            "meets_15_percent_cagr_hurdle",
+            "meets_20_percent_cagr_hurdle",
+        )
+        comparison = {
+            "candidate_exit_policy": request.exit_policy.value,
+            "baseline_exit_policy": ExitPolicy.STATIC_2R.value,
+            "data_fingerprint": manifest.get("data_fingerprint"),
+            "candidate": {key: result.summary[key] for key in comparison_keys},
+            "baseline": {key: baseline_result.summary[key] for key in comparison_keys},
+            "same_strategy_fingerprint": (
+                result.summary["strategy_fingerprint"]
+                == baseline_result.summary["strategy_fingerprint"]
+            ),
+        }
+        (output / "comparison.json").write_text(
+            json.dumps(comparison, indent=2, sort_keys=True, allow_nan=False) + "\n",
+            encoding="utf-8",
+        )
+
     run_manifest = {
         "schema_version": 1,
         "name": request.name,
         "start": request.start.isoformat(),
         "end": request.end.isoformat(),
         "benchmark": request.benchmark,
+        "exit_policy": request.exit_policy.value,
         "symbols": list(config.symbols),
         "strategy_version": STRATEGY_VERSION,
         "strategy_fingerprint": strategy_fingerprint(),
@@ -207,6 +266,7 @@ def execute_research_request(
         "data_fingerprint": manifest.get("data_fingerprint"),
         "snapshot_manifest": "snapshot/manifest.json",
         "report": "report",
+        "baseline_report": baseline_report,
     }
     (output / "run.json").write_text(
         json.dumps(run_manifest, indent=2, sort_keys=True, allow_nan=False) + "\n",

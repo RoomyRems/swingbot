@@ -54,9 +54,12 @@ the one missing energy:
 Entry is a next-session DAY buy stop-limit one tick above the closed hook bar;
 the initial hard stop is one tick below the active cycle low. Position size is
 capped by risk, capital, portfolio capacity, and 0.1% of 90-session average
-volume. The fixed full-position 2R target is a transparent engineering baseline,
-not Burns's exit method. His partial-at-cycle-high and cycle-low trailing process
-is documented but deferred until order replacement and recovery are fail-closed.
+volume. Research can compare the static full-position 2R baseline with the
+separately fingerprinted `burns-cycle-v1` manager: sell half on the session after
+the next closed cycle-high hook, then trail the runner under higher cycle lows
+and tighten after a causal fifth-wave classification. The dynamic manager is
+backtest-only; paper orders retain the broker-held 2R bracket until partial-fill,
+cancel/replace, and restart recovery are fail-closed.
 
 The earlier `burns-book-v1` research result is preserved as a falsified
 translation. It incorrectly required every Cycle turn to include a strict
@@ -112,13 +115,20 @@ swingbot backtest \
   --snapshot data/snapshots/etf-2018-2025 \
   --start 2018-01-01 \
   --end 2025-12-31 \
-  --output reports/etf-2018-2025-v2
+  --output reports/etf-2018-2025-v2 \
+  --exit-policy burns-cycle-v1
 ```
 
-The report contains `summary.json`, `trades.csv`, `equity.csv`, `signals.csv`,
-`orders.csv`, `yearly.csv`, and `by_symbol.csv`. The summary records strategy,
+The report contains `summary.json`, `trades.csv`, `exits.csv`, `management.csv`,
+`equity.csv`, `signals.csv`, `orders.csv`, `yearly.csv`, and `by_symbol.csv`.
+The summary records strategy,
 configuration, and snapshot fingerprints and compares the result with
 buy-and-hold SPY.
+
+The authenticated request also writes a same-snapshot `static-2r` baseline and
+`comparison.json` whenever the selected exit policy is dynamic. Reports include
+CAGR, benchmark CAGR, exposure, exit-leg attribution, and explicit 15% and 20%
+CAGR hurdle flags. A hurdle pass is a continuation screen, not proof of an edge.
 
 ### Authenticated GitHub research runs
 

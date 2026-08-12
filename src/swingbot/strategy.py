@@ -274,14 +274,19 @@ def _support_evidence(
 
     active_row = prepared.iloc[active_low_location]
     active_low = float(cycle_context["cycle_low_price"])
+    prior_cycle_levels = _prior_cycle_levels(prepared, cycle_start, rules.cycle_midline)
+    context: dict[str, object] = {
+        f"{prior_label.replace(' ', '_')}_price": prior_level
+        for prior_label, prior_level in prior_cycle_levels
+    }
     atr_value = float(active_row["atr14"])
     if not np.isfinite(atr_value) or atr_value <= 0:
-        return _evidence(False, None, "ATR support zone is unavailable"), {}
+        return _evidence(False, None, "ATR support zone is unavailable"), context
 
     candidates = [
         ("15-EMA", float(active_row["ema15"])),
         ("50-SMA", float(active_row["sma50"])),
-        *_prior_cycle_levels(prepared, cycle_start, rules.cycle_midline),
+        *prior_cycle_levels,
     ]
     current_close = float(prepared["close"].iloc[location])
     distances = [
@@ -290,21 +295,24 @@ def _support_evidence(
         if np.isfinite(level) and current_close >= level
     ]
     if not distances:
-        return _evidence(False, None, "no causal support level is available"), {}
+        return _evidence(False, None, "no causal support level is available"), context
 
     label, level, distance = min(distances, key=lambda item: item[2])
     passed = distance <= rules.support_atr_tolerance
+    context.update(
+        {
+            "support_source": label,
+            "support_level": level,
+            "support_distance_atr": distance,
+        }
+    )
     return (
         _evidence(
             passed,
             distance,
             f"active cycle low tests {label} support within 0.25 ATR",
         ),
-        {
-            "support_source": label,
-            "support_level": level,
-            "support_distance_atr": distance,
-        },
+        context,
     )
 
 
@@ -341,7 +349,17 @@ def _evaluate_setup(
         scale_value,
         "last completed weekly MACD line is angling up",
     )
-    context = {**trend_context, **cycle_context, **support_context}
+    volume_context: dict[str, object] = {}
+    for label, volume_location in (
+        ("cycle_low", active_low_location),
+        ("signal", location),
+    ):
+        history = prepared["volume"].iloc[max(0, volume_location - 90) : volume_location]
+        average = float(history.mean()) if not history.empty else float("nan")
+        current_volume = float(prepared["volume"].iloc[volume_location])
+        if np.isfinite(average) and average > 0:
+            volume_context[f"{label}_relative_volume_90"] = current_volume / average
+    context = {**trend_context, **cycle_context, **support_context, **volume_context}
     return _Evaluation(
         energies={
             "trend": trend,

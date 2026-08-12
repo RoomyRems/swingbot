@@ -30,6 +30,8 @@ class ReportingTests(unittest.TestCase):
                 "equity.csv",
                 "signals.csv",
                 "orders.csv",
+                "exits.csv",
+                "management.csv",
                 "yearly.csv",
                 "by_symbol.csv",
             },
