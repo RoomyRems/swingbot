@@ -29,15 +29,23 @@ find the prettiest equity curve.
 
 ## Evaluation sequence
 
-1. Freeze `burns-book-v1`, its strategy fingerprint, and the data snapshot.
-2. Use an early development interval only to find coding errors and understand trade frequency.
-3. Do not optimize configuration or frozen strategy constants against return.
-4. Evaluate later calendar periods separately and keep the last interval untouched until the rules are frozen.
-5. Compare against SPY buy-and-hold and a simple trend baseline.
-6. Break results down by symbol, year, volatility regime, and entry gap.
-7. Inspect every extreme winner/loss and a random trade sample against the raw bars.
-8. Repeat with higher slippage and, when available, a second data vendor.
-9. Paper trade long enough to compare planned, submitted, filled, rejected, and canceled orders.
+1. Preserve the `burns-book-v1` result as the record of the strict-divergence
+   interpretation; do not rewrite or discard it.
+2. Run `burns-book-v2` on the identical snapshot and costs. Attribute the change
+   with its reconstructed v1 strict count and Cycle funnel before considering
+   returns.
+3. Use the early development interval only to find coding errors and understand
+   trade frequency.
+4. Do not optimize configuration or frozen strategy constants against return.
+5. Evaluate later calendar periods separately and keep the last interval
+   untouched until the rules are frozen.
+6. Compare against SPY buy-and-hold and a simple trend baseline.
+7. Break results down by symbol, year, volatility regime, and entry gap.
+8. Inspect every extreme winner/loss and a random trade sample against the raw
+   bars.
+9. Repeat with higher slippage and, when available, a second data vendor.
+10. Paper trade long enough to compare planned, submitted, filled, rejected,
+    and canceled orders.
 
 ## Evidence expected before considering further automation
 

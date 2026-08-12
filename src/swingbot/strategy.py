@@ -12,7 +12,7 @@ import pandas as pd
 from .indicators import add_indicators
 from .models import EnergyEvidence, Signal
 
-STRATEGY_VERSION = "burns-book-v1"
+STRATEGY_VERSION = "burns-book-v2"
 
 
 @dataclass(frozen=True)
@@ -22,10 +22,10 @@ class StrategyRules:
     minimum_bars: int = 220
     trend_slope_bars: int = 5
     cycle_midline: float = 50.0
+    cycle_extreme_level: float = 20.0
     early_retrace_level: float = 55.0
     maximum_retrace_number: int = 2
     support_atr_tolerance: float = 0.25
-    require_mini_divergence: bool = True
 
 
 DEFAULT_RULES = StrategyRules()
@@ -33,6 +33,15 @@ DEFAULT_RULES = StrategyRules()
 
 @dataclass(frozen=True)
 class _Evaluation:
+    energies: dict[str, EnergyEvidence]
+    context: dict[str, object]
+
+
+@dataclass(frozen=True)
+class SetupAssessment:
+    """One strategy evaluation shared by explain, research, and signal creation."""
+
+    signal: Signal | None
     energies: dict[str, EnergyEvidence]
     context: dict[str, object]
 
@@ -124,11 +133,11 @@ def _cycle_evidence(
     ):
         return _evidence(False, None, "5-2-3 stochastic cycle is unavailable"), {}
 
-    hook = bool(
-        d.iloc[location] < rules.cycle_midline
-        and k.iloc[location - 1] <= k.iloc[location - 2]
-        and k.iloc[location] > k.iloc[location - 1]
+    cycle_active = bool(d.iloc[location] < rules.cycle_midline)
+    k_turn_up = bool(
+        k.iloc[location - 1] <= k.iloc[location - 2] and k.iloc[location] > k.iloc[location - 1]
     )
+    hook = cycle_active and k_turn_up
     cycle_start = location
     while (
         cycle_start > 0
@@ -137,6 +146,9 @@ def _cycle_evidence(
     ):
         cycle_start -= 1
 
+    active_k = k.iloc[cycle_start : location + 1].dropna()
+    active_k_min = float(active_k.min()) if not active_k.empty else float("nan")
+    reached_extreme = bool(active_k_min < rules.cycle_extreme_level)
     active_lows = prepared["low"].iloc[cycle_start : location + 1]
     active_low_date = active_lows.idxmin()
     active_low_location = int(prepared.index.get_loc(active_low_date))
@@ -165,23 +177,41 @@ def _cycle_evidence(
         divergence = second_price_low < first_price_low and second_k_low > first_k_low
         divergence_size = second_k_low - first_k_low
 
-    passed = hook and (divergence or not rules.require_mini_divergence)
+    if not hook:
+        divergence_reason = "no closed %K hook in the cycle-low interval"
+    elif first_trough is None:
+        divergence_reason = "no earlier %K trough in the active cycle-low interval"
+    elif divergence:
+        divergence_reason = "price made a lower low while %K made a higher low"
+    else:
+        divergence_reason = "the paired price and %K troughs did not diverge"
+
+    k_delta = float(k.iloc[location] - k.iloc[location - 1])
     context: dict[str, object] = {
         "cycle_start_date": prepared.index[cycle_start].date().isoformat(),
         "cycle_low_date": active_low_date.date().isoformat(),
         "cycle_low_price": active_low,
+        "cycle_active": cycle_active,
+        "cycle_reached_extreme": reached_extreme,
+        "cycle_extreme_level": rules.cycle_extreme_level,
+        "cycle_active_k_min": active_k_min,
+        "cycle_k_turn_up": k_turn_up,
         "cycle_hook": hook,
+        "cycle_k_delta": k_delta,
         "mini_divergence": divergence,
+        "mini_divergence_reason": divergence_reason,
         "_active_cycle_low_location": active_low_location,
         "_cycle_start_location": cycle_start,
     }
     if first_trough is not None:
         context["first_stochastic_trough_date"] = prepared.index[first_trough].date().isoformat()
+    if divergence_size is not None:
+        context["mini_divergence_k_delta"] = divergence_size
     return (
         _evidence(
-            passed,
-            divergence_size,
-            "5-2-3 %K hooks up below the %D midline with price/%K mini-divergence",
+            hook,
+            k_delta,
+            "5-2-3 %K hooks up during a %D-defined cycle-low interval",
         ),
         context,
     )
@@ -391,9 +421,18 @@ def _signal_from_evaluation(
         rules.maximum_retrace_number,
     )
     retrace_quality = (rules.maximum_retrace_number + 1 - int(retrace_number)) * 10_000
-    trend_quality = max(0.0, energies["trend"].value or 0.0) * 10_000
-    scale_quality = max(0.0, energies["scale"].value or 0.0) / reference * 10_000
-    quality = score * 1_000_000 + retrace_quality + trend_quality + scale_quality
+    divergence_quality = int(bool(evaluation.context.get("mini_divergence"))) * 1_000
+    # Keep the ordering lexicographic: score, early retrace, mini-divergence,
+    # then bounded trend/scale tie-breakers. Burns describes divergence as a
+    # higher-probability Cycle pattern, not as a prerequisite for Cycle itself.
+    trend_quality = min(max(0.0, energies["trend"].value or 0.0) * 10_000, 499.0)
+    scale_quality = min(
+        max(0.0, energies["scale"].value or 0.0) / reference * 10_000,
+        499.0,
+    )
+    quality = (
+        score * 1_000_000 + retrace_quality + divergence_quality + trend_quality + scale_quality
+    )
     public_context = {
         key: value for key, value in evaluation.context.items() if not key.startswith("_")
     }
@@ -414,7 +453,7 @@ def _signal_from_evaluation(
     )
 
 
-def assess_signal(
+def assess_setup(
     symbol: str,
     prepared: pd.DataFrame,
     as_of: date | str | pd.Timestamp,
@@ -422,8 +461,8 @@ def assess_signal(
     max_entry_gap_r: float,
     reward_r: float,
     rules: StrategyRules = DEFAULT_RULES,
-) -> tuple[Signal | None, dict[str, EnergyEvidence]]:
-    """Evaluate the energy gates once and return both the signal and evidence."""
+) -> SetupAssessment:
+    """Evaluate once and expose causal evidence even when no signal qualifies."""
     timestamp = pd.Timestamp(as_of).normalize()
     if timestamp not in prepared.index:
         raise ValueError(f"no bar exists on {timestamp.date()}")
@@ -437,7 +476,35 @@ def assess_signal(
         reward_r=reward_r,
         rules=rules,
     )
-    return signal, evaluation.energies
+    public_context = {
+        key: value for key, value in evaluation.context.items() if not key.startswith("_")
+    }
+    return SetupAssessment(
+        signal=signal,
+        energies=evaluation.energies,
+        context=public_context,
+    )
+
+
+def assess_signal(
+    symbol: str,
+    prepared: pd.DataFrame,
+    as_of: date | str | pd.Timestamp,
+    *,
+    max_entry_gap_r: float,
+    reward_r: float,
+    rules: StrategyRules = DEFAULT_RULES,
+) -> tuple[Signal | None, dict[str, EnergyEvidence]]:
+    """Backward-compatible pair of signal and evidence from one assessment."""
+    assessment = assess_setup(
+        symbol,
+        prepared,
+        as_of,
+        max_entry_gap_r=max_entry_gap_r,
+        reward_r=reward_r,
+        rules=rules,
+    )
+    return assessment.signal, assessment.energies
 
 
 def generate_signal(
@@ -450,7 +517,7 @@ def generate_signal(
     rules: StrategyRules = DEFAULT_RULES,
 ) -> Signal | None:
     """Generate the one causal signal used by backtesting and paper trading."""
-    signal, _ = assess_signal(
+    assessment = assess_setup(
         symbol,
         prepared,
         as_of,
@@ -458,4 +525,4 @@ def generate_signal(
         reward_r=reward_r,
         rules=rules,
     )
-    return signal
+    return assessment.signal

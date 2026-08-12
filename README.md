@@ -32,7 +32,7 @@ flowchart TD
 
 ## Current book-derived hypothesis
 
-`burns-book-v1` is an objective daily/weekly, long-only translation of Barry
+`burns-book-v2` is an objective daily/weekly, long-only translation of Barry
 Burns's *Trend Trading For Dummies*. The exact rules and their page-level basis
 are in [the strategy specification](docs/STRATEGY_SPEC.md); the broader audit,
 including intentionally deferred material, is in
@@ -45,8 +45,9 @@ the one missing energy:
 
 1. Trend: close above a rising 50-SMA on the first or second retrace.
 2. Momentum: daily MACD line above zero at the active cycle low.
-3. Cycle: 5-2-3 stochastic %K hooks up below the midpoint with price/%K
-   mini-divergence.
+3. Cycle: 5-2-3 stochastic %K hooks up during the `%D < 50` cycle-low
+   interval. A price/%K mini-divergence raises candidate priority but is not a
+   veto; Burns explicitly presents valid Cycle turns without it.
 4. Support: the cycle low tests a causal 15-EMA, 50-SMA, or prior cycle level.
 5. Scale: the last completed weekly MACD **line** is angled upward.
 
@@ -56,6 +57,13 @@ capped by risk, capital, portfolio capacity, and 0.1% of 90-session average
 volume. The fixed full-position 2R target is a transparent engineering baseline,
 not Burns's exit method. His partial-at-cycle-high and cycle-low trailing process
 is documented but deferred until order replacement and recovery are fail-closed.
+
+The earlier `burns-book-v1` research result is preserved as a falsified
+translation. It incorrectly required every Cycle turn to include a strict
+two-trough mini-divergence, even though the book calls divergence an additional
+higher-probability pattern and labels ordinary stochastic turns as valid Cycle
+energy. Version 2 corrects that classification without changing data, costs, or
+the other four energies.
 
 ## Install
 
@@ -104,7 +112,7 @@ swingbot backtest \
   --snapshot data/snapshots/etf-2018-2025 \
   --start 2018-01-01 \
   --end 2025-12-31 \
-  --output reports/etf-2018-2025-v1
+  --output reports/etf-2018-2025-v2
 ```
 
 The report contains `summary.json`, `trades.csv`, `equity.csv`, `signals.csv`,
@@ -130,7 +138,9 @@ to the default branch, the repository owner can select a committed request with
 
 Each summary also aggregates every energy gate over every in-range symbol-session,
 the score distribution, mandatory Trend/Cycle/Scale concurrence, eligible setups,
-and the signal-to-fill funnel. These are diagnostics, not tunable parameters.
+the Cycle funnel (active interval, `%K` turn, hook, extreme, and divergence), a
+reconstructed v1 strict count, and the signal-to-fill funnel. These are
+diagnostics, not tunable parameters.
 
 Explain one decision without running a new backtest:
 
@@ -191,7 +201,8 @@ python -m compileall -q src tests
 ```
 
 The suite specifically checks indicator and signal prefix invariance, book-rule
-vetoes, retrace counting, next-bar trigger/limit behavior, conservative same-bar
+vetoes, Cycle/divergence classification, retrace counting, next-bar trigger/limit
+behavior, conservative same-bar
 execution, configuration duplication, snapshot tampering, liquidity/risk caps,
 and the hard-coded paper client.
 

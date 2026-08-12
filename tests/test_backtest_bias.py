@@ -9,6 +9,7 @@ import pandas as pd
 import swingbot.backtest as backtest_module
 from swingbot.backtest import run_backtest
 from swingbot.models import ExitReason
+from swingbot.strategy import SetupAssessment
 from tests.helpers import app_config, complete_signal
 
 
@@ -35,11 +36,11 @@ class BacktestBiasTests(unittest.TestCase):
     def _fake_assess(self, symbol, prepared, as_of, **kwargs):
         signal = complete_signal("TEST", date(2024, 1, 2))
         candidate = signal if pd.Timestamp(as_of).date() == signal.signal_date else None
-        return candidate, signal.energies
+        return SetupAssessment(candidate, dict(signal.energies), dict(signal.context))
 
     def test_next_bar_close_cannot_revalidate_or_change_entry(self):
         config = app_config("TEST")
-        with patch.object(backtest_module, "assess_signal", side_effect=self._fake_assess):
+        with patch.object(backtest_module, "assess_setup", side_effect=self._fake_assess):
             low_close = run_backtest(
                 {"TEST": _three_day_frame(96.0)},
                 config,
@@ -62,12 +63,12 @@ class BacktestBiasTests(unittest.TestCase):
         self.assertEqual(high_close.trades[0].entry_price, 100.0)
         self.assertEqual(low_close.trades[0].reason, ExitReason.STOP)
         self.assertEqual(high_close.trades[0].reason, ExitReason.STOP)
-        self.assertEqual(low_close.summary["strategy_version"], "burns-book-v1")
+        self.assertEqual(low_close.summary["strategy_version"], "burns-book-v2")
         self.assertEqual(len(low_close.summary["strategy_fingerprint"]), 64)
 
     def test_ambiguous_same_day_stop_and_target_uses_stop(self):
         frame = _three_day_frame(100.0, second_high=130.0, second_low=89.0)
-        with patch.object(backtest_module, "assess_signal", side_effect=self._fake_assess):
+        with patch.object(backtest_module, "assess_setup", side_effect=self._fake_assess):
             result = run_backtest(
                 {"TEST": frame},
                 app_config("TEST"),
@@ -86,7 +87,7 @@ class BacktestBiasTests(unittest.TestCase):
             second_high=112.0,
             second_low=102.0,
         )
-        with patch.object(backtest_module, "assess_signal", side_effect=self._fake_assess):
+        with patch.object(backtest_module, "assess_setup", side_effect=self._fake_assess):
             result = run_backtest(
                 {"TEST": frame},
                 app_config("TEST"),
@@ -104,7 +105,7 @@ class BacktestBiasTests(unittest.TestCase):
             second_high=99.0,
             second_low=95.0,
         )
-        with patch.object(backtest_module, "assess_signal", side_effect=self._fake_assess):
+        with patch.object(backtest_module, "assess_setup", side_effect=self._fake_assess):
             result = run_backtest(
                 {"TEST": frame},
                 app_config("TEST"),
@@ -122,7 +123,7 @@ class BacktestBiasTests(unittest.TestCase):
             second_high=112.0,
             second_low=100.5,
         )
-        with patch.object(backtest_module, "assess_signal", side_effect=self._fake_assess):
+        with patch.object(backtest_module, "assess_setup", side_effect=self._fake_assess):
             result = run_backtest(
                 {"TEST": frame},
                 app_config("TEST"),

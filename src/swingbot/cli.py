@@ -18,8 +18,7 @@ from .paper import AlpacaPaperBroker, build_paper_plan, write_paper_plan
 from .research import execute_research_request
 from .strategy import (
     STRATEGY_VERSION,
-    evaluate_energies,
-    generate_signal,
+    assess_setup,
     prepare_indicators,
     strategy_fingerprint,
 )
@@ -168,14 +167,15 @@ def _explain(args: argparse.Namespace) -> int:
     if manifest.get("adjustment") != config.data.adjustment:
         raise ValueError("configured adjustment does not match the snapshot manifest")
     prepared = prepare_indicators(frames[symbol])
-    energies = evaluate_energies(prepared, args.as_of)
-    signal = generate_signal(
+    assessment = assess_setup(
         symbol,
         prepared,
         args.as_of,
         max_entry_gap_r=config.execution.max_entry_gap_r,
         reward_r=config.risk.reward_r,
     )
+    energies = assessment.energies
+    signal = assessment.signal
     payload = {
         "symbol": symbol,
         "as_of": args.as_of.isoformat(),
@@ -183,6 +183,7 @@ def _explain(args: argparse.Namespace) -> int:
         "strategy_fingerprint": strategy_fingerprint(),
         "score": sum(item.passed for item in energies.values()),
         "energies": {name: asdict(item) for name, item in energies.items()},
+        "context": assessment.context,
         "signal": None
         if signal is None
         else {

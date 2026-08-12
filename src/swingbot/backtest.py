@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import math
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import asdict, dataclass, field
 from datetime import date
 from pathlib import Path
@@ -24,13 +24,22 @@ from .models import (
 from .portfolio import Capacity, size_order
 from .strategy import (
     STRATEGY_VERSION,
-    assess_signal,
+    assess_setup,
     prepare_indicators,
     strategy_fingerprint,
 )
 
 _ENERGY_NAMES = ("trend", "momentum", "cycle", "support", "scale")
 _REQUIRED_ENERGIES = ("trend", "cycle", "scale")
+_CYCLE_FUNNEL_NAMES = (
+    "active_cycle_low_interval",
+    "reached_cycle_extreme",
+    "k_turn_up_anywhere",
+    "closed_cycle_hook",
+    "hook_after_cycle_extreme",
+    "hook_with_mini_divergence",
+    "hook_without_mini_divergence",
+)
 
 
 @dataclass
@@ -47,6 +56,12 @@ class _StrategyDiagnostics:
     score_at_least_four: int = 0
     required_energies_pass: int = 0
     eligible_setups: int = 0
+    eligible_with_mini_divergence: int = 0
+    eligible_without_mini_divergence: int = 0
+    burns_book_v1_strict_eligible_setups: int = 0
+    cycle_funnel_counts: dict[str, int] = field(
+        default_factory=lambda: {name: 0 for name in _CYCLE_FUNNEL_NAMES}
+    )
     eligible_by_symbol: dict[str, int] = field(init=False)
     eligible_by_year: dict[int, int] = field(default_factory=dict)
 
@@ -58,8 +73,16 @@ class _StrategyDiagnostics:
         symbol: str,
         timestamp: pd.Timestamp,
         energies: dict[str, EnergyEvidence],
+        context: Mapping[str, object] | None = None,
     ) -> None:
         passed = {name: bool(energies[name].passed) for name in _ENERGY_NAMES}
+        context = context or {}
+        cycle_active = bool(context.get("cycle_active"))
+        reached_cycle_extreme = bool(context.get("cycle_reached_extreme"))
+        k_turn_up = bool(context.get("cycle_k_turn_up"))
+        cycle_hook = bool(context.get("cycle_hook"))
+        mini_divergence = bool(context.get("mini_divergence"))
+
         score = sum(passed.values())
         self.evaluated_symbol_sessions += 1
         self.score_counts[score] += 1
@@ -68,21 +91,45 @@ class _StrategyDiagnostics:
 
         pattern = ",".join(name for name in _ENERGY_NAMES if passed[name]) or "none"
         self.pattern_counts[pattern] = self.pattern_counts.get(pattern, 0) + 1
+        self.cycle_funnel_counts["active_cycle_low_interval"] += int(cycle_active)
+        self.cycle_funnel_counts["reached_cycle_extreme"] += int(reached_cycle_extreme)
+        self.cycle_funnel_counts["k_turn_up_anywhere"] += int(k_turn_up)
+        self.cycle_funnel_counts["closed_cycle_hook"] += int(cycle_hook)
+        self.cycle_funnel_counts["hook_after_cycle_extreme"] += int(
+            cycle_hook and reached_cycle_extreme
+        )
+        self.cycle_funnel_counts["hook_with_mini_divergence"] += int(cycle_hook and mini_divergence)
+        self.cycle_funnel_counts["hook_without_mini_divergence"] += int(
+            cycle_hook and not mini_divergence
+        )
+
         has_score = score >= 4
         has_required = all(passed[name] for name in _REQUIRED_ENERGIES)
         self.score_at_least_four += int(has_score)
         self.required_energies_pass += int(has_required)
         if has_score and has_required:
             self.eligible_setups += 1
+            self.eligible_with_mini_divergence += int(mini_divergence)
+            self.eligible_without_mini_divergence += int(not mini_divergence)
             self.eligible_by_symbol[symbol] += 1
             year = int(timestamp.year)
             self.eligible_by_year[year] = self.eligible_by_year.get(year, 0) + 1
+
+        # Reconstruct the v1 Cycle veto from the same evaluation. This isolates
+        # the effect of the corrected classification without rerunning indicators.
+        v1_score = score - int(passed["cycle"]) + int(mini_divergence)
+        v1_has_required = passed["trend"] and mini_divergence and passed["scale"]
+        self.burns_book_v1_strict_eligible_setups += int(v1_score >= 4 and v1_has_required)
 
     def as_dict(self) -> dict[str, object]:
         evaluated = self.evaluated_symbol_sessions
         pass_rates = {
             name: count / evaluated if evaluated else 0.0
             for name, count in self.energy_pass_counts.items()
+        }
+        cycle_funnel_rates = {
+            name: count / evaluated if evaluated else 0.0
+            for name, count in self.cycle_funnel_counts.items()
         }
         return {
             "evaluated_symbol_sessions": evaluated,
@@ -92,6 +139,11 @@ class _StrategyDiagnostics:
             "score_at_least_four": self.score_at_least_four,
             "required_trend_cycle_scale": self.required_energies_pass,
             "eligible_setups": self.eligible_setups,
+            "eligible_with_mini_divergence": self.eligible_with_mini_divergence,
+            "eligible_without_mini_divergence": self.eligible_without_mini_divergence,
+            "burns_book_v1_strict_eligible_setups": (self.burns_book_v1_strict_eligible_setups),
+            "cycle_funnel_counts": self.cycle_funnel_counts,
+            "cycle_funnel_rates": cycle_funnel_rates,
             "eligible_by_symbol": self.eligible_by_symbol,
             "eligible_by_year": {
                 str(year): count for year, count in sorted(self.eligible_by_year.items())
@@ -428,18 +480,23 @@ def run_backtest(
         for symbol in config.symbols:
             if timestamp not in prepared[symbol].index:
                 continue
-            signal, energies = assess_signal(
+            assessment = assess_setup(
                 symbol,
                 prepared[symbol],
                 timestamp,
                 max_entry_gap_r=config.execution.max_entry_gap_r,
                 reward_r=config.risk.reward_r,
             )
-            strategy_diagnostics.observe(symbol, timestamp, energies)
+            strategy_diagnostics.observe(
+                symbol,
+                timestamp,
+                assessment.energies,
+                assessment.context,
+            )
             if symbol in positions or symbol in pending:
                 continue
-            if signal is not None:
-                candidates.append(signal)
+            if assessment.signal is not None:
+                candidates.append(assessment.signal)
 
         current_equity = _equity(cash, positions, normalized, timestamp)
         capacity = Capacity(

@@ -10,7 +10,7 @@ visual or discretionary instruction needed a numeric definition, that choice is
 labeled as a translation. Unlabeled optimization would make a backtest look more
 authoritative than it is.
 
-## Implemented in `burns-book-v1`
+## Implemented in `burns-book-v2`
 
 | Book concept | Operational rule | Location | Status |
 |---|---|---|---|
@@ -20,8 +20,9 @@ authoritative than it is.
 | Trend direction | For a long, price is above an upward-sloping 50-period SMA | PDF 94-96, 196-197 | Implemented; slope is measured over five daily bars |
 | Early trend entry | Prefer the first two pullbacks after the 50-SMA turns up; the first pullback is recognized when stochastic %D first moves below 55 | PDF 196-197 | Implemented with a causal retrace counter |
 | Cycle settings | Use stochastic 5-2-3; the second line is a three-period EMA of smoothed %K | PDF 81-83, 141-144 | Implemented exactly for indicator construction |
-| Cycle region | A long cycle-low interval occurs while %D is below the 50 midpoint | PDF 81-83 | Implemented without requiring the conventional oversold-20 threshold |
-| Mini-divergence | On the early retrace, price makes a lower low while %K makes a higher low, then %K hooks upward | PDF 141-144, 198-200 | Implemented causally within the active below-50 interval |
+| Cycle region | A long cycle-low interval occurs while %D is below the 50 midpoint | PDF 81-83 | Implemented as the interval boundary; a prior %K move below 20 is reported separately because PDF 284 presents it as a scan example |
+| Cycle hook | On a completed bar, %K changes from falling to rising while %D remains in the below-50 cycle-low interval | PDF 81-83, 205-226, 284 | Implemented as the Cycle energy and next-session entry reference |
+| Mini-divergence | On the early retrace, price makes a lower low while %K makes a higher low, then %K hooks upward | PDF 141-144, 198-200 | Recorded as higher-probability evidence and used to rank otherwise eligible candidates; not a Cycle veto |
 | Objective cycle low | The cycle low is the lowest price while %D remains below 50 | PDF 81-83 | Implemented and recorded with date and price |
 | Momentum | At the cycle low, the daily MACD line should remain above zero for a long | PDF 170-176, 197-198 | Implemented at the bar containing the active cycle's price low |
 | Support as a zone | Treat support as an area rather than a single exact print | PDF 146-163, 205-225 | Implemented as a fixed ATR-normalized zone |
@@ -51,12 +52,29 @@ made by the book.
 | Direction/timeframe scope | Long-only US ETFs on daily bars with weekly Scale | Gives one testable baseline and avoids silently mixing structurally different markets |
 | Entry lifetime | Next regular session only | Forces a stale setup to be re-evaluated after another close |
 | Same-bar ambiguity | Take the adverse feasible path | Daily OHLC cannot reveal intrabar order |
-| Candidate priority | Five-energy setups rank above four-energy setups; first retraces rank above second retraces | Deterministic portfolio selection when capital or slots are scarce |
+| Candidate priority | Five-energy setups rank above four-energy setups; first retraces rank above second retraces; mini-divergence ranks above a plain hook within those groups | Deterministic portfolio selection when capital or slots are scarce, while preserving the book's probability distinction |
 
 Trend and Cycle are operationally mandatory in addition to Scale. A long entry
 without an uptrend or without the hook that defines its trigger is not a coherent
 instance of this translation. Consequently, Momentum or Support may be the one
 missing energy, but not both.
+
+## Corrected v1 interpretation
+
+The first translation made mini-divergence mandatory for Cycle. The supplied
+book does not support that equivalence:
+
+- PDF 143-144 says cycle lows and highs do not always contain divergence and
+  treats the pattern as higher-probability evidence.
+- The worked five-energy examples on PDF 206, 209, 212-213, 218, and 222-223
+  award Cycle when the stochastic turns; they do not require two troughs.
+- PDF 220 explicitly mentions divergence as an additional property when it is
+  present, confirming the distinction.
+
+`burns-book-v2` therefore uses the closed stochastic hook for Cycle and retains
+mini-divergence in the signal record and candidate ordering. Aggregate reports
+also reconstruct how many setups would have survived the old strict veto and
+separately count hooks that followed a %K move below 20.
 
 ## Useful material deliberately deferred
 
@@ -66,6 +84,7 @@ can add them without confusing them with the current evidence.
 | Book material | Why it is not silently added now | Safe next implementation |
 |---|---|---|
 | Partial exit at the next cycle high, then trail the runner below successive cycle lows; tighten near wave five | Requires partial-fill accounting, cancel/replace safety, broker reconciliation, and restart recovery. A static bracket cannot express it faithfully | Build an event-driven position manager and test crash recovery before enabling paper submission |
+| “First retrace after the cross” before the 50-SMA has turned | The book labels this an aggressive four-of-five setup (PDF 217), while the present baseline deliberately requires a confirmed rising 50-SMA | Add a separately versioned precursor-trend state that requires a causal price/50-SMA cross and exactly one subsequent retrace |
 | Elliott-style five-wave context | The book treats wave interpretation as useful but less objective than the core energy rules | Add only after a deterministic, separately versioned wave-state definition is written |
 | Fibonacci support | Anchor selection is not machine-unique and would create many tuning choices | Require a frozen causal anchor algorithm and evaluate it as a separate hypothesis |
 | Visually major highs and lows | “Major” is intentionally judgment-based | Define an objective pivot algorithm before testing |

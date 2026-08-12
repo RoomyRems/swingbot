@@ -1,6 +1,6 @@
 # Strategy specification: Burns book baseline
 
-Version: `burns-book-v1`
+Version: `burns-book-v2`
 
 This document is the machine authority for the current strategy. The primary
 human source is Barry Burns, *Trend Trading For Dummies* (Wiley, 2014). Page
@@ -32,18 +32,33 @@ states. Trend and Cycle are also operationally required in this long-only
 translation because they establish direction and the entry trigger. Therefore,
 Momentum or Support may be the one missing energy, but not both.
 
-| Energy | `burns-book-v1` rule | Book basis | Translation |
+| Energy | `burns-book-v2` rule | Book basis | Translation |
 |---|---|---|---|
 | Trend | Close is above the 50-SMA; its five-bar fractional slope is positive; the active stochastic retrace is the first or second since that rising-SMA epoch began | Ch. 6, PDF 94-96; Ch. 14, PDF 196-197 | Five bars quantify an otherwise visual angle |
 | Momentum | Daily MACD(12,26,9) line is above zero at the active cycle low | Ch. 12, PDF 170-176; Ch. 14, PDF 197-198 | Direct implementation |
-| Cycle | Burns 5-2-3 stochastic: smoothed %K hooks upward while %D is below 50, and price makes a lower low while %K makes a higher low | Ch. 5, PDF 81-83; Ch. 10, PDF 141-144; Ch. 14, PDF 198-200 | Direct, causal mini-divergence implementation |
+| Cycle | Burns 5-2-3 stochastic: smoothed %K turns from falling to rising on a closed bar while %D is below 50 | Ch. 5, PDF 81-83; Ch. 15, PDF 205-226; Ch. 20, PDF 284 | Direct, causal hook implementation |
 | Support | The active cycle low is within 0.25 ATR of the 15-EMA, 50-SMA, previous confirmed cycle low, or previous confirmed cycle high, and the signal close is above that level | Ch. 6, PDF 94-95; Ch. 11, PDF 146-163; Ch. 15, PDF 205-225 | ATR converts Burns's price “zone” into a frozen rule |
 | Scale | The MACD line on the last completed weekly bar is higher than on the preceding completed week | Ch. 13, PDF 177-185; Ch. 14, PDF 201-202 | Daily/weekly is the book's common swing pairing; positive delta quantifies angle |
 
 Stochastic uses a 5-bar range, a two-period simple smoothing for %K, and a
 three-period exponential average for %D. A cycle-low interval begins when %D
 moves below 50 and ends when it returns above 50. The active cycle low is the
-lowest price seen in that interval through *t*.
+lowest price seen in that interval through *t*. The Cycle energy passes only on
+the closed bar where %K changes from non-rising to rising inside that interval.
+
+A mini-divergence is recorded when price makes a lower second low while %K makes
+a higher second low. It receives a deterministic candidate-ranking bonus but is
+not required for Cycle. Burns calls divergence a higher-probability pattern and
+explicitly notes that not every cycle low has one (PDF 143-144). His worked
+five-energy examples repeatedly score Cycle from the stochastic turn itself and
+call out divergence separately when it is present (PDF 206, 209, 212-213,
+220-223).
+
+The report also records whether %K reached below 20 before the hook. PDF 284
+uses that threshold in a scanning example, while the general cycle definition
+and several five-energy explanations use the `%D < 50` interval and angle of %K.
+Version 2 therefore exposes the threshold as a diagnostic instead of silently
+turning an example scan into a universal veto.
 
 The first retrace begins the first time %D falls below 55 after the 50-SMA
 starts its current rising epoch. Each later move from at/above 55 to below 55
@@ -67,6 +82,17 @@ After a qualifying bar closes:
 Burns describes buying one tick above the hook bar (PDF 284), entering with a
 stop-limit order, using hard stop-market protection (PDF 317-320), and placing
 the initial stop one tick below the cycle low (PDF 317).
+
+## Why this is version 2
+
+`burns-book-v1` required a strict two-trough mini-divergence for every Cycle
+pass. That interpretation produced only 11 eligible setups in the first frozen
+12-ETF pilot. It also contradicted the book's distinction between an ordinary
+Cycle turn and the additional high-probability divergence pattern. Version 2
+changes only that classification: the closed stochastic hook is Cycle, while
+mini-divergence is evidence used for ranking and attribution. Reports reconstruct
+the v1 strict eligible count from the same one-pass evaluation so the effect is
+measurable without changing the bars or the other four energies.
 
 ## Causal daily-bar execution
 
@@ -96,6 +122,10 @@ implemented fail-closed.
 
 ## Intentionally excluded from the signal
 
+- The aggressive “first retrace after the cross” setup on PDF 217: this baseline
+  requires the 50-SMA itself to be rising. A future version may add a causal
+  price/50-SMA precursor state, but it must remain attributable separately from
+  confirmed-trend entries.
 - Fibonacci support: the book does not provide a machine-unique anchor pair.
 - Visually “major” highs/lows: explicitly described as subjective.
 - Floor-trader pivots: objective, but chiefly defined from the prior session for

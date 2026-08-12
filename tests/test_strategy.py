@@ -8,6 +8,7 @@ import pandas as pd
 
 from swingbot.strategy import (
     DEFAULT_RULES,
+    assess_setup,
     assess_signal,
     evaluate_energies,
     generate_signal,
@@ -151,16 +152,98 @@ class StrategyTests(unittest.TestCase):
         evidence = evaluate_energies(prepared, timestamp)
         self.assertFalse(evidence["scale"].passed)
 
-    def test_cycle_requires_price_k_mini_divergence(self):
+    def test_cycle_hook_is_valid_without_mini_divergence(self):
         prepared = prepare_indicators(make_bars())
         timestamp = _force_complete_setup(prepared)
         location = int(prepared.index.get_loc(timestamp))
         prepared.iloc[location - 1, prepared.columns.get_loc("stoch_k")] = 10.0
-        evidence = evaluate_energies(prepared, timestamp)
-        self.assertFalse(evidence["cycle"].passed)
-        self.assertIsNone(
-            generate_signal("SPY", prepared, timestamp, max_entry_gap_r=0.25, reward_r=2.0)
+        assessment = assess_setup(
+            "SPY",
+            prepared,
+            timestamp,
+            max_entry_gap_r=0.25,
+            reward_r=2.0,
         )
+        self.assertTrue(assessment.energies["cycle"].passed)
+        self.assertFalse(assessment.context["mini_divergence"])
+        self.assertIsNotNone(assessment.signal)
+
+    def test_cycle_requires_a_closed_k_hook(self):
+        prepared = prepare_indicators(make_bars())
+        timestamp = _force_complete_setup(prepared)
+        location = int(prepared.index.get_loc(timestamp))
+        prepared.iloc[location, prepared.columns.get_loc("stoch_k")] = 19.0
+        assessment = assess_setup(
+            "SPY",
+            prepared,
+            timestamp,
+            max_entry_gap_r=0.25,
+            reward_r=2.0,
+        )
+        self.assertFalse(assessment.energies["cycle"].passed)
+        self.assertFalse(assessment.context["cycle_hook"])
+        self.assertIsNone(assessment.signal)
+
+    def test_cycle_hook_must_be_in_the_d_defined_cycle_low_interval(self):
+        prepared = prepare_indicators(make_bars())
+        timestamp = _force_complete_setup(prepared)
+        prepared.loc[timestamp, "stoch_d"] = 60.0
+        assessment = assess_setup(
+            "SPY",
+            prepared,
+            timestamp,
+            max_entry_gap_r=0.25,
+            reward_r=2.0,
+        )
+        self.assertTrue(assessment.context["cycle_k_turn_up"])
+        self.assertFalse(assessment.context["cycle_active"])
+        self.assertFalse(assessment.energies["cycle"].passed)
+
+    def test_k_below_20_is_reported_but_is_not_a_cycle_veto(self):
+        prepared = prepare_indicators(make_bars())
+        timestamp = _force_complete_setup(prepared)
+        location = int(prepared.index.get_loc(timestamp))
+        cycle_positions = list(range(location - 7, location + 1))
+        prepared.iloc[cycle_positions, prepared.columns.get_loc("stoch_k")] = [
+            55.0,
+            25.0,
+            45.0,
+            40.0,
+            38.0,
+            36.0,
+            30.0,
+            35.0,
+        ]
+        assessment = assess_setup(
+            "SPY",
+            prepared,
+            timestamp,
+            max_entry_gap_r=0.25,
+            reward_r=2.0,
+        )
+        self.assertFalse(assessment.context["cycle_reached_extreme"])
+        self.assertTrue(assessment.energies["cycle"].passed)
+        self.assertIsNotNone(assessment.signal)
+
+    def test_mini_divergence_is_a_quality_priority_not_a_veto(self):
+        divergent = prepare_indicators(make_bars())
+        plain_hook = prepare_indicators(make_bars())
+        timestamp = _force_complete_setup(divergent)
+        _force_complete_setup(plain_hook)
+        location = int(plain_hook.index.get_loc(timestamp))
+        plain_hook.iloc[location - 1, plain_hook.columns.get_loc("stoch_k")] = 10.0
+
+        divergent_signal = generate_signal(
+            "SPY", divergent, timestamp, max_entry_gap_r=0.25, reward_r=2.0
+        )
+        plain_signal = generate_signal(
+            "SPY", plain_hook, timestamp, max_entry_gap_r=0.25, reward_r=2.0
+        )
+        assert divergent_signal is not None
+        assert plain_signal is not None
+        self.assertTrue(divergent_signal.context["mini_divergence"])
+        self.assertFalse(plain_signal.context["mini_divergence"])
+        self.assertGreater(divergent_signal.quality, plain_signal.quality)
 
     def test_third_retrace_is_not_an_early_trend_entry(self):
         prepared = prepare_indicators(make_bars())

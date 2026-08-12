@@ -43,7 +43,14 @@ class ReportingTests(unittest.TestCase):
                     name: EnergyEvidence(all_pass or name == "trend", 1.0, "test")
                     for name in ("trend", "momentum", "cycle", "support", "scale")
                 }
-                accumulator.observe(symbol, pd.Timestamp(day), energies)
+                context = {
+                    "cycle_active": all_pass,
+                    "cycle_reached_extreme": all_pass and symbol == "SPY",
+                    "cycle_k_turn_up": all_pass,
+                    "cycle_hook": all_pass,
+                    "mini_divergence": all_pass and symbol == "SPY",
+                }
+                accumulator.observe(symbol, pd.Timestamp(day), energies, context)
         diagnostics = accumulator.as_dict()
 
         self.assertEqual(diagnostics["evaluated_symbol_sessions"], 4)
@@ -53,6 +60,21 @@ class ReportingTests(unittest.TestCase):
             diagnostics["score_counts"], {"0": 0, "1": 2, "2": 0, "3": 0, "4": 0, "5": 2}
         )
         self.assertEqual(diagnostics["eligible_setups"], 2)
+        self.assertEqual(diagnostics["eligible_with_mini_divergence"], 1)
+        self.assertEqual(diagnostics["eligible_without_mini_divergence"], 1)
+        self.assertEqual(diagnostics["burns_book_v1_strict_eligible_setups"], 1)
+        self.assertEqual(
+            diagnostics["cycle_funnel_counts"],
+            {
+                "active_cycle_low_interval": 2,
+                "reached_cycle_extreme": 1,
+                "k_turn_up_anywhere": 2,
+                "closed_cycle_hook": 2,
+                "hook_after_cycle_extreme": 1,
+                "hook_with_mini_divergence": 1,
+                "hook_without_mini_divergence": 1,
+            },
+        )
         self.assertEqual(diagnostics["eligible_by_symbol"], {"SPY": 1, "QQQ": 1})
 
 
