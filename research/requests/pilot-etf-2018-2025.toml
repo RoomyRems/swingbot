@@ -1,5 +1,6 @@
 # The first real-data run validates the authenticated pipeline and establishes
-# unoptimized trade frequency. It is not an out-of-sample performance claim.
+# unoptimized trade frequency and per-energy gate rates. It is not an
+# out-of-sample performance claim.
 schema_version = 1
 name = "pilot-etf-2018-2025"
 config = "swingbot.toml"

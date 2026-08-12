@@ -8,6 +8,7 @@ import pandas as pd
 
 from swingbot.strategy import (
     DEFAULT_RULES,
+    assess_signal,
     evaluate_energies,
     generate_signal,
     prepare_indicators,
@@ -57,6 +58,27 @@ def _force_complete_setup(
 
 
 class StrategyTests(unittest.TestCase):
+    def test_assessment_reuses_the_signal_energy_evidence(self):
+        prepared = prepare_indicators(make_bars())
+        timestamp = _force_complete_setup(prepared)
+        assessed, energies = assess_signal(
+            "SPY",
+            prepared,
+            timestamp,
+            max_entry_gap_r=0.25,
+            reward_r=2.0,
+        )
+        generated = generate_signal(
+            "SPY",
+            prepared,
+            timestamp,
+            max_entry_gap_r=0.25,
+            reward_r=2.0,
+        )
+        self.assertEqual(assessed, generated)
+        assert assessed is not None
+        self.assertIs(assessed.energies, energies)
+
     def test_all_five_energies_create_one_transparent_signal(self):
         prepared = prepare_indicators(make_bars())
         timestamp = _force_complete_setup(prepared)

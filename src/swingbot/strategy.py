@@ -347,20 +347,16 @@ def _round_up(price: float, tick: float) -> float:
     return round(math.ceil((price - 1e-12) / tick) * tick, 4)
 
 
-def generate_signal(
+def _signal_from_evaluation(
     symbol: str,
     prepared: pd.DataFrame,
-    as_of: date | str | pd.Timestamp,
+    timestamp: pd.Timestamp,
+    evaluation: _Evaluation,
     *,
     max_entry_gap_r: float,
     reward_r: float,
     rules: StrategyRules = DEFAULT_RULES,
 ) -> Signal | None:
-    """Generate the one causal signal used by backtesting and paper trading."""
-    timestamp = pd.Timestamp(as_of).normalize()
-    if timestamp not in prepared.index:
-        raise ValueError(f"no bar exists on {timestamp.date()}")
-    evaluation = _evaluate_setup(prepared, timestamp, rules)
     energies = evaluation.energies
     score = sum(evidence.passed for evidence in energies.values())
 
@@ -416,3 +412,50 @@ def generate_signal(
         energies=energies,
         context=public_context,
     )
+
+
+def assess_signal(
+    symbol: str,
+    prepared: pd.DataFrame,
+    as_of: date | str | pd.Timestamp,
+    *,
+    max_entry_gap_r: float,
+    reward_r: float,
+    rules: StrategyRules = DEFAULT_RULES,
+) -> tuple[Signal | None, dict[str, EnergyEvidence]]:
+    """Evaluate the energy gates once and return both the signal and evidence."""
+    timestamp = pd.Timestamp(as_of).normalize()
+    if timestamp not in prepared.index:
+        raise ValueError(f"no bar exists on {timestamp.date()}")
+    evaluation = _evaluate_setup(prepared, timestamp, rules)
+    signal = _signal_from_evaluation(
+        symbol,
+        prepared,
+        timestamp,
+        evaluation,
+        max_entry_gap_r=max_entry_gap_r,
+        reward_r=reward_r,
+        rules=rules,
+    )
+    return signal, evaluation.energies
+
+
+def generate_signal(
+    symbol: str,
+    prepared: pd.DataFrame,
+    as_of: date | str | pd.Timestamp,
+    *,
+    max_entry_gap_r: float,
+    reward_r: float,
+    rules: StrategyRules = DEFAULT_RULES,
+) -> Signal | None:
+    """Generate the one causal signal used by backtesting and paper trading."""
+    signal, _ = assess_signal(
+        symbol,
+        prepared,
+        as_of,
+        max_entry_gap_r=max_entry_gap_r,
+        reward_r=reward_r,
+        rules=rules,
+    )
+    return signal

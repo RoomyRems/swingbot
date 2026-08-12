@@ -80,7 +80,7 @@ class Trade:
 
 @dataclass
 class BacktestResult:
-    summary: dict[str, float | int | str | None]
+    summary: dict[str, object]
     trades: list[Trade] = field(default_factory=list)
     equity_rows: list[dict[str, object]] = field(default_factory=list)
     signal_rows: list[dict[str, object]] = field(default_factory=list)

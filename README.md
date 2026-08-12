@@ -128,6 +128,10 @@ itself exists only on the ephemeral GitHub runner. After this workflow is merged
 to the default branch, the repository owner can select a committed request with
 **Run workflow**.
 
+Each summary also aggregates every energy gate over every in-range symbol-session,
+the score distribution, mandatory Trend/Cycle/Scale concurrence, eligible setups,
+and the signal-to-fill funnel. These are diagnostics, not tunable parameters.
+
 Explain one decision without running a new backtest:
 
 ```bash

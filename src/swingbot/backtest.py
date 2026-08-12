@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import math
 from collections.abc import Iterable
-from dataclasses import asdict
+from dataclasses import asdict, dataclass, field
 from datetime import date
 from pathlib import Path
 
@@ -14,6 +14,7 @@ from .config import AppConfig, config_fingerprint
 from .indicators import normalize_bars
 from .models import (
     BacktestResult,
+    EnergyEvidence,
     ExitReason,
     PlannedOrder,
     Position,
@@ -23,10 +24,82 @@ from .models import (
 from .portfolio import Capacity, size_order
 from .strategy import (
     STRATEGY_VERSION,
-    generate_signal,
+    assess_signal,
     prepare_indicators,
     strategy_fingerprint,
 )
+
+_ENERGY_NAMES = ("trend", "momentum", "cycle", "support", "scale")
+_REQUIRED_ENERGIES = ("trend", "cycle", "scale")
+
+
+@dataclass
+class _StrategyDiagnostics:
+    symbols: tuple[str, ...]
+    evaluated_symbol_sessions: int = 0
+    energy_pass_counts: dict[str, int] = field(
+        default_factory=lambda: {name: 0 for name in _ENERGY_NAMES}
+    )
+    score_counts: dict[int, int] = field(
+        default_factory=lambda: {score: 0 for score in range(len(_ENERGY_NAMES) + 1)}
+    )
+    pattern_counts: dict[str, int] = field(default_factory=dict)
+    score_at_least_four: int = 0
+    required_energies_pass: int = 0
+    eligible_setups: int = 0
+    eligible_by_symbol: dict[str, int] = field(init=False)
+    eligible_by_year: dict[int, int] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.eligible_by_symbol = {symbol: 0 for symbol in self.symbols}
+
+    def observe(
+        self,
+        symbol: str,
+        timestamp: pd.Timestamp,
+        energies: dict[str, EnergyEvidence],
+    ) -> None:
+        passed = {name: bool(energies[name].passed) for name in _ENERGY_NAMES}
+        score = sum(passed.values())
+        self.evaluated_symbol_sessions += 1
+        self.score_counts[score] += 1
+        for name, value in passed.items():
+            self.energy_pass_counts[name] += int(value)
+
+        pattern = ",".join(name for name in _ENERGY_NAMES if passed[name]) or "none"
+        self.pattern_counts[pattern] = self.pattern_counts.get(pattern, 0) + 1
+        has_score = score >= 4
+        has_required = all(passed[name] for name in _REQUIRED_ENERGIES)
+        self.score_at_least_four += int(has_score)
+        self.required_energies_pass += int(has_required)
+        if has_score and has_required:
+            self.eligible_setups += 1
+            self.eligible_by_symbol[symbol] += 1
+            year = int(timestamp.year)
+            self.eligible_by_year[year] = self.eligible_by_year.get(year, 0) + 1
+
+    def as_dict(self) -> dict[str, object]:
+        evaluated = self.evaluated_symbol_sessions
+        pass_rates = {
+            name: count / evaluated if evaluated else 0.0
+            for name, count in self.energy_pass_counts.items()
+        }
+        return {
+            "evaluated_symbol_sessions": evaluated,
+            "energy_pass_counts": self.energy_pass_counts,
+            "energy_pass_rates": pass_rates,
+            "score_counts": {str(score): count for score, count in self.score_counts.items()},
+            "score_at_least_four": self.score_at_least_four,
+            "required_trend_cycle_scale": self.required_energies_pass,
+            "eligible_setups": self.eligible_setups,
+            "eligible_by_symbol": self.eligible_by_symbol,
+            "eligible_by_year": {
+                str(year): count for year, count in sorted(self.eligible_by_year.items())
+            },
+            "pass_patterns": dict(
+                sorted(self.pattern_counts.items(), key=lambda item: (-item[1], item[0]))
+            ),
+        }
 
 
 def _slippage_fraction(config: AppConfig) -> float:
@@ -179,6 +252,32 @@ def _signal_row(signal: Signal, status: str, reason: str = "") -> dict[str, obje
     return row
 
 
+def _execution_diagnostics(
+    signal_rows: list[dict[str, object]],
+    order_rows: list[dict[str, object]],
+) -> dict[str, object]:
+    signal_status_counts: dict[str, int] = {}
+    for row in signal_rows:
+        status = str(row.get("status", "unknown"))
+        signal_status_counts[status] = signal_status_counts.get(status, 0) + 1
+    order_status_counts: dict[str, int] = {}
+    for row in order_rows:
+        status = str(row.get("status", "unknown"))
+        order_status_counts[status] = order_status_counts.get(status, 0) + 1
+    planned_orders = sum(row.get("status") == "planned" for row in signal_rows)
+    filled_orders = sum(row.get("status") == "filled" for row in order_rows)
+    unfilled_orders = sum(row.get("status") == "not_filled" for row in order_rows)
+    return {
+        "generated_signals": len(signal_rows),
+        "signal_status_counts": signal_status_counts,
+        "order_status_counts": order_status_counts,
+        "planned_orders": planned_orders,
+        "filled_orders": filled_orders,
+        "unfilled_orders": unfilled_orders,
+        "fill_rate": filled_orders / planned_orders if planned_orders else None,
+    }
+
+
 def run_backtest(
     frames: dict[str, pd.DataFrame],
     config: AppConfig,
@@ -206,6 +305,7 @@ def run_backtest(
     )
     if not dates:
         raise ValueError("no bars exist in the requested backtest range")
+    strategy_diagnostics = _StrategyDiagnostics(tuple(config.symbols))
 
     next_date: dict[str, dict[pd.Timestamp, pd.Timestamp]] = {}
     for symbol, frame in normalized.items():
@@ -326,15 +426,18 @@ def run_backtest(
         # 3) Evaluate this completed close. No fill-time or next-bar data enters here.
         candidates: list[Signal] = []
         for symbol in config.symbols:
-            if symbol in positions or symbol in pending or timestamp not in prepared[symbol].index:
+            if timestamp not in prepared[symbol].index:
                 continue
-            signal = generate_signal(
+            signal, energies = assess_signal(
                 symbol,
                 prepared[symbol],
                 timestamp,
                 max_entry_gap_r=config.execution.max_entry_gap_r,
                 reward_r=config.risk.reward_r,
             )
+            strategy_diagnostics.observe(symbol, timestamp, energies)
+            if symbol in positions or symbol in pending:
+                continue
             if signal is not None:
                 candidates.append(signal)
 
@@ -401,6 +504,8 @@ def run_backtest(
         benchmark_symbol,
         config,
     )
+    summary["strategy_diagnostics"] = strategy_diagnostics.as_dict()
+    summary["execution_diagnostics"] = _execution_diagnostics(signal_rows, order_rows)
     return BacktestResult(
         summary=summary,
         trades=trades,
@@ -418,7 +523,7 @@ def _summarize(
     end: date,
     benchmark_symbol: str,
     config: AppConfig,
-) -> dict[str, float | int | str | None]:
+) -> dict[str, object]:
     equity = pd.Series(
         [float(row["equity"]) for row in equity_rows],
         index=pd.to_datetime([row["date"] for row in equity_rows]),
