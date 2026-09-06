@@ -1,214 +1,241 @@
-# swingbot
+# swingbot research v2
 
-Quant swing trading framework implementing a 5-core energy methodology (inspired by Dr. Barry Burns) plus optional higher timeframe and pattern filters.
+This branch is a clean replacement for the original experiment. It provides a
+reproducible long-only ETF backtester and an explicitly gated Alpaca **paper**
+trading path. It does not contain a live-trading mode, and it does not claim that
+the strategy has an edge.
 
-## Core Energies (scored)
-1. Trend (EMA20 vs EMA50 + price vs EMA50)
-2. Momentum (MACD vs Signal + optional RSI filter + zero line + optional expansion)
-3. Cycle (Stochastic %K/%D with optional hysteresis requirements)
-4. Support/Resistance (pivot proximity; optional yesterday touch; EMA50 fallback if allowed)
-5. Scale (weekly timeframe momentum alignment via MACD)
+The rewrite has one rule engine for both research and paper orders:
 
-Volume (RVOL / Chaikin A/D slope / OBV) is now a confirmation layer and does NOT add to the core score; it’s logged for diagnostics.
-
-Weekly (MTF) alignment can optionally add a bonus +1 to the raw core score if enabled and aligned.
-
-## New / Updated Config Parameters
-See `config.yaml` for defaults. Highlights:
-
-### Cycle
-```
-cycle:
-  rise_bars: 0          # %K must rise/fall N prior bars for validity (0 = off)
-  require_d_slope: false  # Require SlowD slope confirmation
+```mermaid
+flowchart TD
+    A["Immutable daily-bar snapshot"] --> B["Causal indicators"]
+    B --> C["One five-energy signal"]
+    C --> D["One risk-sizing function"]
+    D --> E["Backtest execution"]
+    D --> F["Alpaca paper orders"]
 ```
 
-### Scale (5th core energy)
-Weekly momentum alignment using MACD on W-FRI bars. In pure Burns mode, Scale is counted inside the core evaluator.
+## What v2 deliberately changes
 
-### Support / Resistance
-```
-signals:
-  sr_pivots:
-    ema50_fallback_pct: 0.025
-    allow_fallback_as_core: false
-```
-`allow_fallback_as_core=false` means EMA50 proximity alone can't satisfy S/R; a pivot structure is required unless you flip this to true.
+| Concern | v2 behavior |
+|---|---|
+| Configuration | One strict TOML file with 11 numeric/risk/data settings; unknown or duplicate settings fail |
+| Data | Explicit start/end dates, `adjustment="all"`, recorded feed, immutable CSV files, SHA-256 verification |
+| Universe | Fixed liquid US ETFs by default; no present-day constituent lookup |
+| Signal timing | Signal uses bar *t* at its close; an order may fill only in the next session |
+| Stop-limit fills | Requires the next session to trigger above the hook bar; its close cannot approve or reject the fill |
+| Ambiguous daily bars | If stop and target are both touched, the stop wins |
+| Strategy parity | Backtest and paper planning call the same `generate_signal` and `size_order` functions |
+| Risk | Per-trade, total open-risk, position-count, notional, cash/buying-power, and duplicate-symbol caps |
+| Credentials | `.env` remains local and ignored; paper mode is hard-coded in the Alpaca client |
 
-### Volume Confirmation
-```
-volume:
-  min_components: 2   # of {RVOL, AD, OBV}
-```
-Stricter default now requires 2 agreeing components.
+## Current book-derived hypothesis
 
-### Scoring & Thresholds
-```
-trading:
-  min_core_energies: 4  # strict Burns rule: must have 4 of 5 BEFORE bonus
-  min_score: 4          # effective threshold after adding MTF bonus (if any)
-  energy_weights:
-    trend: 1.0
-    momentum: 1.0
-    cycle: 1.0
-    sr: 1.0
-  scale: 1.0
-```
-`score` = raw count of core passes. `score_weighted` = sum of weights for passed energies (informational).
+`burns-book-v2` is an objective daily/weekly, long-only translation of Barry
+Burns's *Trend Trading For Dummies*. The exact rules and their page-level basis
+are in [the strategy specification](docs/STRATEGY_SPEC.md); the broader audit,
+including intentionally deferred material, is in
+[the book implementation map](docs/BOOK_IMPLEMENTATION_MAP.md).
 
-### Pattern Trigger Layer
-```
-trading:
-  patterns:
-    enabled: false
-    modes: ["engulf", "inside_break", "nr4_break"]
-```
-If enabled, at least one selected pattern must be present on the signal bar. Patterns are evaluated AFTER energies pass.
+The setup scores five energies and needs at least four. Scale is always required;
+Trend and Cycle are also required in this translation because they establish the
+long direction and entry trigger. Therefore, either Momentum or Support may be
+the one missing energy:
 
-### Weekly (MTF) Confirmation
-Unchanged conceptually; if `counts_as_energy: true` and alignment passes, +1 bonus is added to `eff_score`. Mismatch can veto if `reject_on_mismatch: true`.
+1. Trend: close above a rising 50-SMA on the first or second retrace.
+2. Momentum: daily MACD line above zero at the active cycle low.
+3. Cycle: 5-2-3 stochastic %K hooks up during the `%D < 50` cycle-low
+   interval. A price/%K mini-divergence raises candidate priority but is not a
+   veto; Burns explicitly presents valid Cycle turns without it.
+4. Support: the cycle low tests a causal 15-EMA, 50-SMA, or prior cycle level.
+5. Scale: the last completed weekly MACD **line** is angled upward.
 
-## Trade Notes Field
-`TradeSignal.notes` now includes: Trend, Mom, Cycle, S/R, Scale, VolC, core count, weighted score, and MTF status.
+Entry is a next-session DAY buy stop-limit one tick above the closed hook bar;
+the initial hard stop is one tick below the active cycle low. Position size is
+capped by risk, capital, portfolio capacity, and 0.1% of 90-session average
+volume. Research can compare the static full-position 2R baseline with the
+separately fingerprinted `burns-cycle-v1` manager: sell half on the session after
+the next closed cycle-high hook, then trail the runner under higher cycle lows
+and tighten after a causal fifth-wave classification. The dynamic manager is
+backtest-only; paper orders retain the broker-held 2R bracket until partial-fill,
+cancel/replace, and restart recovery are fail-closed.
 
-## Upgrading From Previous Version
-1. Add new sections (`cycle`, `trading.patterns`, `trading.energy_weights`, and `min_core_energies`).
-2. Decide whether EMA fallback should count toward S/R (`allow_fallback_as_core`).
-3. Adjust `volume.min_components` if you prefer more lenient volume confirmation.
-4. (Optional) Begin tuning `energy_weights`—weights do NOT affect pass/fail thresholds unless you incorporate them externally; they are informational for ranking.
+The earlier `burns-book-v1` research result is preserved as a falsified
+translation. It incorrectly required every Cycle turn to include a strict
+two-trough mini-divergence, even though the book calls divergence an additional
+higher-probability pattern and labels ordinary stochastic turns as valid Cycle
+energy. Version 2 corrects that classification without changing data, costs, or
+the other four energies.
 
-## Backtest Impact
-Expect fewer signals due to stricter S/R and core minimum enforcement (volume no longer inflates score). Re-run historical backtests to recalibrate position/risk parameters.
+## Install
 
-## Quick Start
-1. Populate `watchlist.txt` with tickers.
-2. Configure `config.yaml` (ensure API keys via env vars for Alpaca).
-3. Run daily scan:
-```
-python main.py
-```
-4. Backtest (example period configured in `config.yaml`):
-```
-python scripts/run_backtest.py
-```
+Python 3.11 or newer is required.
 
-### Generating / Updating the Watchlist
+```bash
+python -m venv .venv
 
-The legacy `generate_watchlist_sp1500.py` script has been replaced by a unified generator supporting multiple index families (S&P and Russell).
+# Linux/macOS
+. .venv/bin/activate
 
-Config section (excerpt):
-```yaml
-watchlist:
-  universes: ["sp1500"]   # options: sp500, sp1000, sp1500, russell3000, all
-  # NOTE: russell3000 is ALWAYS sourced from current IWV ETF holdings (snapshot). No web scrape.
-  #       This introduces survivorship bias relative to historical Russell 3000 membership.
-  #       For point-in-time research, obtain licensed historical index data.
-  alpaca_filter: false      # apply active & tradable filter (requires credentials)
-  include_iwv: false        # if true AND russell3000 not in universes, merge IWV holdings (broad market proxy)
-  iwv_ttl_days: 2           # cache TTL for IWV holdings csv
-  iwv_force_refresh: false  # force re-download ignoring cache
+# PowerShell
+# .venv\Scripts\Activate.ps1
+
+python -m pip install -e '.[dev,paper]'
 ```
 
-Universes:
-* `sp500` – S&P 500
-* `sp1000` – S&P 400 Mid + S&P 600 Small
-* `sp1500` – S&P 500 + 400 + 600 (default)
-* `russell3000` – Approximation via current IWV ETF holdings (no scrape; snapshot; survivorship bias)
-* `all` – Expands to every supported list above (includes russell3000 => IWV holdings)
+Copy `.env.example` to `.env` and insert **paper-account** keys locally. The same
+two variable names used by the old project still work:
 
-Command line overrides config (always writes to canonical `watchlist.txt` in project root; previous file is overwritten):
-```
-python scripts/generate_watchlist.py                    # uses config.yaml universes
-python scripts/generate_watchlist.py --universes sp500  # only S&P 500
-python scripts/generate_watchlist.py --universes sp1000 russell3000 --alpaca-filter
-python scripts/generate_watchlist.py --universes all --include-iwv   # include_iwv adds nothing extra if russell3000 present
+```dotenv
+ALPACA_API_KEY=...
+ALPACA_API_SECRET=...
 ```
 
-The script now intentionally ignores any custom output path and always overwrites `watchlist.txt` to avoid proliferation of stale watchlist files. Duplicates across indices are removed and (optionally) filtered via Alpaca for active + tradable symbols.
+Never paste keys into an issue, commit, or pull request.
 
-If you enable `include_iwv` AND you did NOT request `russell3000`, the current IWV ETF holdings are merged (cache-aware) to broaden universe. If `russell3000` is included, IWV is already used and won't be double-merged. Survivorship bias applies because holdings reflect the present composition only.
+## Reproducible backtest
 
-### Specifying an Explicit Backtest Date Range
+First download a date-bounded snapshot. A 500-calendar-day warm-up is fetched
+automatically, while the requested test dates remain explicit.
 
-You can now supply a fixed start/end date instead of relying on `start_days_ago`.
-
-Precedence (highest first):
-1. CLI `--start-date` / `--end-date`
-2. `backtest.start_date` / `backtest.end_date` in `config.yaml`
-3. `backtest.start_days_ago` fallback (end = today)
-
-Accepted formats: `YYYY-MM-DD` or `M/D/YYYY` (e.g. `2024-01-01` or `1/1/2024`).
-
-Rules:
-* If only start provided → end = today
-* If only end provided → start = end - `start_days_ago`
-* If start > end → error
-* A warning prints if the inferred window < 30 days (unless both dates explicitly set)
-
-Examples:
-```
-python scripts/run_backtest.py --start-date 2024-01-01 --end-date 2024-12-21
-python scripts/run_backtest.py --start-date 1/1/2024 --end-date 12/21/2024
-python scripts/run_backtest.py --end-date 2024-06-30   # start inferred from start_days_ago
+```bash
+swingbot fetch \
+  --config swingbot.toml \
+  --start 2018-01-01 \
+  --end 2025-12-31 \
+  --snapshot data/snapshots/etf-2018-2025
 ```
 
-In `config.yaml`:
-```yaml
-backtest:
-  start_days_ago: 600
-  start_date: 2024-01-01   # overrides start_days_ago when set
-  end_date: 2024-12-21
+Then run exclusively from that verified snapshot:
+
+```bash
+swingbot backtest \
+  --config swingbot.toml \
+  --snapshot data/snapshots/etf-2018-2025 \
+  --start 2018-01-01 \
+  --end 2025-12-31 \
+  --output reports/etf-2018-2025-v2 \
+  --exit-policy burns-cycle-v1
 ```
 
-Runtime output will echo the resolved range:
-```
-[Backtest] Date range: 2024-01-01 -> 2024-12-21 (355 days)
+The report contains `summary.json`, `trades.csv`, `exits.csv`, `management.csv`,
+`equity.csv`, `signals.csv`, `orders.csv`, `yearly.csv`, and `by_symbol.csv`.
+The summary records strategy,
+configuration, and snapshot fingerprints and compares the result with
+buy-and-hold SPY.
+
+The authenticated request also writes a same-snapshot `static-2r` baseline and
+`comparison.json` whenever the selected exit policy is dynamic. Reports include
+CAGR, benchmark CAGR, exposure, exit-leg attribution, and explicit 15% and 20%
+CAGR hurdle flags. A hurdle pass is a continuation screen, not proof of an edge.
+
+### Authenticated GitHub research runs
+
+The protected workflow in `.github/workflows/research-backtest.yml` executes a
+strict, committed file under `research/requests/`. It exposes
+`ALPACA_API_KEY` and `ALPACA_API_SECRET` only to the fetch/backtest step, uses
+read-only repository permissions, pins every action to a full commit SHA, and
+accepts at most 25 symbols over ten calendar years. Missing secrets, an unsafe
+path, a current-day end date, or any snapshot/config mismatch stops the run.
+
+Because this repository is public, the workflow does **not** publish licensed
+raw bars. Its 30-day artifact contains the raw-file hash manifest, a stable data
+fingerprint, run/config/strategy fingerprints, and derived reports. The snapshot
+itself exists only on the ephemeral GitHub runner. After this workflow is merged
+to the default branch, the repository owner can select a committed request with
+**Run workflow**.
+
+Each summary also aggregates every energy gate over every in-range symbol-session,
+the score distribution, mandatory Trend/Cycle/Scale concurrence, eligible setups,
+the Cycle funnel (active interval, `%K` turn, hook, extreme, and divergence), a
+reconstructed v1 strict count, and the signal-to-fill funnel. These are
+diagnostics, not tunable parameters.
+
+Explain one decision without running a new backtest:
+
+```bash
+swingbot explain \
+  --config swingbot.toml \
+  --snapshot data/snapshots/etf-2018-2025 \
+  --symbol SPY \
+  --as-of 2024-06-28
 ```
 
-## Environment & Credentials
-The project reads API credentials from environment variables (loaded automatically via `python-dotenv` if a `.env` file is present in the project root).
+Alpaca documents that `sip` is consolidated across US exchanges whereas `iex`
+contains Investors Exchange data, and that `all` applies split, dividend, and
+spin-off adjustments. SIP may require a data subscription. If you must switch to
+IEX, change the config *before fetching*; the feed is permanently recorded in the
+snapshot. See [Alpaca historical bars](https://docs.alpaca.markets/us/reference/stockbars).
 
-Required / Optional keys:
+## Paper plan and submission
 
-| Purpose | Variable | Required | Notes |
-|---------|----------|----------|-------|
-| Alpaca API Key | `ALPACA_API_KEY` | Yes (for live/data) | Needed for fresh daily bars & any live/account operations |
-| Alpaca API Secret | `ALPACA_API_SECRET` | Yes (for live/data) | Without these, broker features are disabled (tests use a stub) |
-| Alpaca Paper Endpoint | `ALPACA_PAPER_ENDPOINT` | No | Defaults to `https://paper-api.alpaca.markets` |
-| Financial Modeling Prep | `FMP_API_KEY` | Optional | Enables earnings blackout + fundamentals filters |
-| Marketaux News | `MARKETAUX_API_KEY` | Optional | Enables news/sentiment veto if turned on in config |
+Evaluate a completed session after the close:
 
-### Creating a `.env` file
-```
-ALPACA_API_KEY=YOUR_KEY
-ALPACA_API_SECRET=YOUR_SECRET
-ALPACA_PAPER_ENDPOINT=https://paper-api.alpaca.markets
-FMP_API_KEY=YOUR_FMP_KEY
-MARKETAUX_API_KEY=YOUR_NEWS_KEY
-```
-`.env` is **git-ignored** (see `.gitignore`). Do not commit secrets.
-
-### Loading env vars in PowerShell
-Either restart VS Code (auto-load via `dotenv`) or dot-source the helper script:
-```
-. ./scripts/load_env.ps1
-```
-You should see:
-```
-[load_env] Loaded N variable(s) from <path>
+```bash
+swingbot paper \
+  --config swingbot.toml \
+  --as-of 2026-08-07 \
+  --plan-out reports/paper-2026-08-07.json
 ```
 
-### Verifying
+That command is a dry run. To submit DAY stop-limit bracket orders to the Alpaca
+paper account, both flags are required:
+
+```bash
+swingbot paper \
+  --config swingbot.toml \
+  --as-of 2026-08-07 \
+  --submit \
+  --confirm PAPER
 ```
-python -c "import os; print(os.getenv('ALPACA_API_KEY') is not None, os.getenv('FMP_API_KEY') is not None)"
+
+The adapter reconciles account equity, buying power, positions, open orders, and
+visible protective stops first. If reconciliation fails, it submits nothing.
+Submission also rejects future, stale, or incomplete as-of dates, refuses the
+9:30 AM-4:15 PM New York safety window on weekdays, and verifies through Alpaca's
+market clock that the market is closed.
+Alpaca's SDK uses `paper=True` for its paper environment, and bracket orders link
+the entry, profit target, and protective stop; see the official
+[paper-client documentation](https://alpaca.markets/sdks/python/trading.html) and
+[order documentation](https://docs.alpaca.markets/us/docs/orders-at-alpaca). The
+SDK's [market clock](https://alpaca.markets/sdks/python/api_reference/trading/clock.html)
+reports whether the market is currently open.
+
+## Validate locally
+
+```bash
+PYTHONPATH=src python -m unittest discover -s tests -v
+python -m ruff check src tests
+python -m compileall -q src tests
 ```
 
-If running tests without keys, the Alpaca module now provides a dummy stub so the suite passes. For live usage, ensure real credentials are present.
+The suite specifically checks indicator and signal prefix invariance, book-rule
+vetoes, Cycle/divergence classification, retrace counting, next-bar trigger/limit
+behavior, conservative same-bar
+execution, configuration duplication, snapshot tampering, liquidity/risk caps,
+and the hard-coded paper client.
 
-## Future Ideas
--- Add alternative scale/HTF momentum filters.
-- Incorporate volatility contraction pattern detection.
-- Persist volume component breakdown into trade logs.
+Read [the research protocol](docs/RESEARCH_PROTOCOL.md) before interpreting any
+result. Paper fills are simulations and do not establish live performance. This is
+research software, not investment advice.
 
----
-Feel free to open issues or extend the framework for additional edges.
+## Audit repair study
+
+The [frozen repair protocol](docs/REPAIR_STUDY.md) compares original source with
+corrected entry-session target handling, actual-fill risk reporting, continuous
+wave management and separately versioned wave-retrace entries. The finite matrix
+uses one snapshot and includes higher costs and a fixed SPY trend control.
+It does not represent an untouched holdout or established profitability.
+
+```bash
+git worktree add --detach ../swingbot-original 5cd61af3f1b44e236bd153fcc7c306df4e98f5b0
+python -m swingbot.repair_study \
+  --request research/requests/audit-repair-2018-2025.toml \
+  --baseline-source ../swingbot-original \
+  --output repair-study-output
+```
+
+Paper stop-quantity reconciliation and next-session validation are stricter,
+but persistent bracket lifecycle and restart recovery remain unverified. The
+new wave entries and exit policies are research-only.
