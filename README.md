@@ -219,3 +219,23 @@ and the hard-coded paper client.
 Read [the research protocol](docs/RESEARCH_PROTOCOL.md) before interpreting any
 result. Paper fills are simulations and do not establish live performance. This is
 research software, not investment advice.
+
+## Audit repair study
+
+The [frozen repair protocol](docs/REPAIR_STUDY.md) compares original source with
+corrected entry-session target handling, actual-fill risk reporting, continuous
+wave management and separately versioned wave-retrace entries. The finite matrix
+uses one snapshot and includes higher costs and a fixed SPY trend control.
+It does not represent an untouched holdout or established profitability.
+
+```bash
+git worktree add --detach ../swingbot-original 5cd61af3f1b44e236bd153fcc7c306df4e98f5b0
+python -m swingbot.repair_study \
+  --request research/requests/audit-repair-2018-2025.toml \
+  --baseline-source ../swingbot-original \
+  --output repair-study-output
+```
+
+Paper stop-quantity reconciliation and next-session validation are stricter,
+but persistent bracket lifecycle and restart recovery remain unverified. The
+new wave entries and exit policies are research-only.

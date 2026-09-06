@@ -26,6 +26,7 @@ class StrategyRules:
     early_retrace_level: float = 55.0
     maximum_retrace_number: int = 2
     support_atr_tolerance: float = 0.25
+    objective_wave_retraces: bool = False
 
 
 DEFAULT_RULES = StrategyRules()
@@ -50,9 +51,16 @@ def prepare_indicators(frame: pd.DataFrame) -> pd.DataFrame:
     return add_indicators(frame)
 
 
+def strategy_version(rules: StrategyRules = DEFAULT_RULES) -> str:
+    return "burns-book-v3" if rules.objective_wave_retraces else STRATEGY_VERSION
+
+
 def strategy_fingerprint(rules: StrategyRules = DEFAULT_RULES) -> str:
+    settings = asdict(rules)
+    if not rules.objective_wave_retraces:
+        settings.pop("objective_wave_retraces")  # preserve the frozen v2 fingerprint
     payload = json.dumps(
-        {"version": STRATEGY_VERSION, "rules": asdict(rules)},
+        {"version": strategy_version(rules), "rules": settings},
         sort_keys=True,
         separators=(",", ":"),
     )
@@ -97,6 +105,9 @@ def _trend_evidence(
         fill_value=False,
     )
     retrace_number = int(retrace_starts.sum())
+    legacy_retrace_number = retrace_number
+    if rules.objective_wave_retraces:
+        retrace_number = int(row["wave_retrace_number"])
     early_retrace = (
         bool(below_retrace_level.iloc[-1]) and 1 <= retrace_number <= rules.maximum_retrace_number
     )
@@ -105,6 +116,9 @@ def _trend_evidence(
         "trend_start_date": prepared.index[trend_start].date().isoformat(),
         "retrace_number": retrace_number,
     }
+    if rules.objective_wave_retraces:
+        context["legacy_retrace_number"] = legacy_retrace_number
+        context["wave_confirmed_impulse"] = int(row["wave_confirmed_impulse"])
     return (
         _evidence(
             passed,

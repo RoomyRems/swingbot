@@ -4,7 +4,7 @@ import argparse
 import json
 import sys
 from collections.abc import Sequence
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -18,6 +18,7 @@ from .exits import ExitPolicy
 from .paper import AlpacaPaperBroker, build_paper_plan, write_paper_plan
 from .research import execute_research_request
 from .strategy import (
+    DEFAULT_RULES,
     STRATEGY_VERSION,
     assess_setup,
     prepare_indicators,
@@ -63,6 +64,10 @@ def _backtest(args: argparse.Namespace) -> int:
         args.end,
         benchmark_symbol=args.benchmark,
         exit_policy=args.exit_policy,
+        strategy_rules=replace(
+            DEFAULT_RULES,
+            objective_wave_retraces=args.objective_wave_retraces,
+        ),
     )
     provenance = {
         "snapshot_fingerprint": manifest.get("snapshot_fingerprint"),
@@ -236,6 +241,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=ExitPolicy.STATIC_2R,
     )
     backtest_parser.set_defaults(handler=_backtest)
+    backtest_parser.add_argument(
+        "--objective-wave-retraces",
+        action="store_true",
+        help="research-only v3 wave-retrace entries; default keeps v2 entries",
+    )
 
     research_parser = subparsers.add_parser(
         "research", help="fetch a frozen snapshot and run one strict research request"

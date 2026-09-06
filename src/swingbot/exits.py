@@ -15,7 +15,17 @@ class ExitPolicy(StrEnum):
     """Backtest-only exit policies; paper submission remains a static bracket."""
 
     STATIC_2R = "static-2r"
+    STATIC_FILL_2R = "static-fill-2r"
     BURNS_CYCLE_V1 = "burns-cycle-v1"
+    BURNS_CYCLE_V2 = "burns-cycle-v2"
+
+    @property
+    def is_static(self) -> bool:
+        return self in {self.STATIC_2R, self.STATIC_FILL_2R}
+
+    @property
+    def is_burns(self) -> bool:
+        return not self.is_static
 
 
 @dataclass(frozen=True)
@@ -44,8 +54,10 @@ def exit_policy_fingerprint(
     rules: BurnsExitRules = DEFAULT_BURNS_EXIT_RULES,
 ) -> str:
     payload: dict[str, object] = {"policy": policy.value}
-    if policy is ExitPolicy.BURNS_CYCLE_V1:
+    if policy.is_burns:
         payload["rules"] = asdict(rules)
+    if policy is ExitPolicy.BURNS_CYCLE_V2:
+        payload["wave_model"] = "closed-body-completed-cycle-v1"
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
@@ -57,6 +69,12 @@ def tick_size(price: float) -> float:
 def stop_below(price: float) -> float:
     tick = tick_size(price)
     return round(math.floor((price - tick + 1e-12) / tick) * tick, 4)
+
+
+def fill_risk_target(entry: float, stop: float, reward_r: float) -> float:
+    target = entry + reward_r * (entry - stop)
+    tick = tick_size(target)
+    return round(math.ceil((target - 1e-12) / tick) * tick, 4)
 
 
 def _finite_turn_values(prepared: pd.DataFrame, location: int) -> bool:

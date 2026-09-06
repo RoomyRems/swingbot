@@ -64,6 +64,7 @@ class Position:
     stop_price: float
     target_price: float
     initial_risk_per_share: float
+    reserved_risk_per_share: float | None = None
     entry_commission: float = 0.0
     entry_context: Mapping[str, object] = field(default_factory=dict)
     exit_fills: list[ExitFill] = field(default_factory=list)
@@ -109,6 +110,9 @@ class Trade:
     first_exit_date: date | None = None
     initial_stop_price: float | None = None
     final_stop_price: float | None = None
+    reserved_r_multiple: float | None = None
+    actual_risk_per_share: float | None = None
+    reserved_risk_per_share: float | None = None
 
 
 @dataclass

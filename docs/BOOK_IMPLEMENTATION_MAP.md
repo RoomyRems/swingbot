@@ -38,7 +38,7 @@ authoritative than it is.
 | Market-impact cap | Position size should be no more than 0.1% of average daily volume | PDF 255 | Implemented as a hard sizing cap |
 | First profit exit | Exit part of a long at the next cycle high before trailing | PDF 321-323 | `burns-cycle-v1` sells a frozen 50% on the session after a closed cycle-high hook; the exact peak is never used as a fill |
 | Cycle-low trailing stop | After the first exit, move the runner stop below each new higher cycle low | PDF 324-325 | Implemented from completed 5-2-3 intervals; a stop may rise but never fall |
-| Fifth-wave tightening | Near the fifth impulse, trail below the previous closed bar | PDF 324-327 | Second-retrace plus an objective break of the prior cycle high activates one-bar mode after the partial exit |
+| Fifth-wave tightening | Near the fifth impulse, trail below the previous closed bar | PDF 324-327 | V1 retains the original shortcut; research V2 tracks confirmed wave highs continuously and can activate one-bar mode later in the runner (see REPAIR_STUDY.md) |
 | Audit discipline | Record the reason for entry/exit and evaluate average wins, average losses, fees, and mistakes | Journaling and evaluation chapters | Signals include all energy values/rules/context; reports include win/loss, payoff, fees, and expectancy fields |
 | Avoid curve fitting | Freeze rules before out-of-sample evaluation | Testing and system-development discussion | Strategy version and rule fingerprint are written into every summary |
 

@@ -1,6 +1,7 @@
 # Strategy specification: Burns book baseline
 
-Version: `burns-book-v2`
+Default/paper entry version: `burns-book-v2`. Research entry alternative:
+`burns-book-v3`. Execution engine: `daily-execution-v3`.
 
 This document is the machine authority for the current strategy. The primary
 human source is Barry Burns, *Trend Trading For Dummies* (Wiley, 2014). Page
@@ -103,6 +104,11 @@ measurable without changing the bars or the other four energies.
 - A gap above the limit does not fill unless price later trades down to the
   limit after the stop has triggered.
 - No next-bar close is used to approve a fill.
+- The corrected engine permits a same-bar target after a breakout from below
+  the trigger, under the daily model's continuous-crossing assumption. For a
+  gap above the limit followed by a retrace, the high alone cannot prove a
+  post-entry target: a close at/above target is required. The close affects exit
+  ordering evidence, never entry eligibility or fill price.
 - If a daily bar cannot reveal whether entry, stop, or target occurred first,
   the backtest takes the adverse path.
 
@@ -111,9 +117,14 @@ measurable without changing the bars or the other four energies.
 Exit behavior has its own version and fingerprint so it can change without
 pretending the entry rules changed.
 
-`static-2r` closes the full position at 2R or the initial hard stop. The target
-is deliberately **not** attributed to Burns. It remains the paper-trading policy
-so every position has broker-held protection even when SwingBot is offline.
+`static-2r` retains the legacy target: entry limit plus two times the distance
+from that limit to the initial stop. It can exceed 2R measured from the actual
+fill. `static-fill-2r` is a separate research policy that uses the actual fill
+and initial stop, rounded up to a tradable tick. Neither target is attributed
+to Burns. Sizing and reserved portfolio risk still use the worst allowed fill.
+Trade `r_multiple` and `expectancy_r` now use actual initial risk, with fees
+deducted from P&L. `reserved_r_multiple` and `expectancy_reserved_r` retain the
+old denominator explicitly; compare those with historical reports.
 
 `burns-cycle-v1` is research-only and implements Chapter 23 (PDF 321-327):
 
@@ -143,6 +154,21 @@ the signal record. That distinction must be considered when interpreting results
 The dynamic manager does not replace the paper bracket until partial-fill
 reconciliation, cancel/replace, restart recovery, and persistent stop state are
 implemented fail-closed.
+
+`burns-cycle-v2` replaces the v1 fifth-wave shortcut with continuously updated
+wave state, including later transitions for first-retrace runners. Research
+entries `burns-book-v3` also replace stochastic excursion counting with wave
+retraces. The complete operational definition, comparison matrix and limits of
+book fidelity are frozen in [the repair protocol](REPAIR_STUDY.md). V2 entries
+and the original manager remain selectable controls.
+
+Paper reconciliation now checks remaining active stop quantity and deduplicates
+order IDs; submission requires the broker's next-session date. Offline planning
+still approximates the next weekday, so a holiday mismatch is refused at
+submission. This does not establish multi-day DAY-bracket protection or restart
+recovery. Those lifecycle issues remain unresolved; this study submits no orders.
+Broker semantics: [orders](https://docs.alpaca.markets/us/docs/orders-at-alpaca)
+and [clock model](https://alpaca.markets/sdks/python/api_reference/trading/models.html#clock).
 
 ## Volume boundary
 

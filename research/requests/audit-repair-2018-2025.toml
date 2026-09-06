@@ -1,0 +1,9 @@
+# Finite matrix and acceptance criteria: docs/REPAIR_STUDY.md.
+# Requires the repair_study driver and the pinned original source checkout.
+schema_version = 1
+name = "audit-repair-2018-2025"
+config = "swingbot.toml"
+start = "2018-01-01"
+end = "2025-12-31"
+benchmark = "SPY"
+exit_policy = "burns-cycle-v2"

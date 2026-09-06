@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Iterable
 from dataclasses import asdict, dataclass
 from datetime import date, timedelta
@@ -42,6 +43,38 @@ def _next_weekday(value: date) -> date:
     while candidate.weekday() >= 5:
         candidate += timedelta(days=1)
     return candidate
+
+
+def _covered_position_risk(symbol: str, quantity: float, market: float, orders: list[Any]) -> float:
+    """Require active remaining stop quantity covering the complete holding."""
+    if not all(math.isfinite(value) and value > 0 for value in (quantity, market)):
+        raise RuntimeError(f"paper position {symbol} has invalid quantity or market price")
+    stops: dict[str, tuple[float, float]] = {}
+    for order in orders:
+        if (
+            str(getattr(order, "symbol", "")).upper() != symbol
+            or _enum_text(getattr(order, "side", "")) != "sell"
+            or _enum_text(getattr(order, "type", "")) not in {"stop", "stop_limit"}
+            or _enum_text(getattr(order, "status", ""))
+            not in {"new", "accepted", "partially_filled"}
+        ):
+            continue
+        identifier = str(getattr(order, "id", ""))
+        try:
+            price = float(order.stop_price)
+            remaining = float(order.qty) - float(getattr(order, "filled_qty", 0) or 0)
+        except (AttributeError, ValueError, TypeError):
+            continue
+        if identifier and math.isfinite(remaining) and remaining > 0 and 0 < price < market:
+            stops[identifier] = (price, remaining)
+    if not stops or sum(qty for _, qty in stops.values()) + 1e-8 < quantity:
+        raise RuntimeError(
+            f"paper position {symbol} has no visible protective stop covering its full quantity; "
+            "refusing new orders"
+        )
+    # Reserve conservatively at the lowest covering stop, never the highest
+    # price of an order that might cover only a fraction of the holding.
+    return quantity * (market - min(price for price, _ in stops.values()))
 
 
 class AlpacaPaperBroker:
@@ -98,15 +131,6 @@ class AlpacaPaperBroker:
         )
         blocked_symbols.discard("")
 
-        stops_by_symbol: dict[str, list[float]] = {}
-        for order in all_orders:
-            symbol = str(getattr(order, "symbol", "")).upper()
-            side = _enum_text(getattr(order, "side", ""))
-            order_type = _enum_text(getattr(order, "type", ""))
-            stop_price = getattr(order, "stop_price", None)
-            if symbol and side == "sell" and order_type in {"stop", "stop_limit"} and stop_price:
-                stops_by_symbol.setdefault(symbol, []).append(float(stop_price))
-
         committed_risk = 0.0
         position_symbols: set[str] = set()
         for position in positions:
@@ -114,20 +138,12 @@ class AlpacaPaperBroker:
             position_symbols.add(symbol)
             if _enum_text(getattr(position, "side", "long")) not in {"long", "buy"}:
                 raise RuntimeError(f"unsupported non-long paper position exists: {symbol}")
-            stops = stops_by_symbol.get(symbol, [])
-            if not stops:
-                raise RuntimeError(
-                    f"paper position {symbol} has no visible protective stop; refusing new orders"
-                )
-            current_price = float(position.current_price)
-            valid_stops = [price for price in stops if price < current_price]
-            if not valid_stops:
-                raise RuntimeError(
-                    f"paper position {symbol} has no protective stop below market; "
-                    "refusing new orders"
-                )
-            protective_stop = max(valid_stops)
-            committed_risk += float(position.qty) * max(0.0, current_price - protective_stop)
+            committed_risk += _covered_position_risk(
+                symbol,
+                float(position.qty),
+                float(position.current_price),
+                all_orders,
+            )
 
         # Reserve risk for unfilled entry parents as well as filled positions.
         for parent in parents:
@@ -185,6 +201,15 @@ class AlpacaPaperBroker:
         )
 
         plans_list = list(plans)
+        next_open = getattr(clock, "next_open", None)
+        if plans_list and (
+            next_open is None
+            or any(
+                plan.valid_on != pd.Timestamp(next_open).tz_convert("America/New_York").date()
+                for plan in plans_list
+            )
+        ):
+            raise RuntimeError("paper plan date must match the broker's next market session")
         symbols = [plan.signal.symbol for plan in plans_list]
         if len(symbols) != len(set(symbols)):
             raise RuntimeError("paper plan contains duplicate symbols")

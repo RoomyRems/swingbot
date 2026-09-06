@@ -15,6 +15,7 @@ from .exits import (
     DEFAULT_BURNS_EXIT_RULES,
     ExitPolicy,
     exit_policy_fingerprint,
+    fill_risk_target,
     long_cycle_high_turn,
     long_cycle_low_turn,
     stop_below,
@@ -32,11 +33,16 @@ from .models import (
 )
 from .portfolio import Capacity, size_order
 from .strategy import (
-    STRATEGY_VERSION,
+    DEFAULT_RULES,
+    StrategyRules,
     assess_setup,
     prepare_indicators,
     strategy_fingerprint,
+    strategy_version,
 )
+from .waves import add_wave_context
+
+ENGINE_VERSION = "daily-execution-v3"
 
 _ENERGY_NAMES = ("trend", "momentum", "cycle", "support", "scale")
 _REQUIRED_ENERGIES = ("trend", "cycle", "scale")
@@ -191,7 +197,8 @@ def _committed_risk(
     pending: Iterable[PlannedOrder],
 ) -> float:
     open_risk = sum(
-        position.quantity * position.initial_risk_per_share + 2.0 * position.entry_commission
+        position.quantity * (position.reserved_risk_per_share or position.initial_risk_per_share)
+        + 2.0 * position.entry_commission
         for position in positions
     )
     return open_risk + sum(order.reserved_risk for order in pending)
@@ -208,13 +215,11 @@ def _existing_exit(
             max(float(bar["low"]), float(bar["open"]) * (1.0 - slip)),
             position.stop_reason,
         )
-    if exit_policy is ExitPolicy.STATIC_2R and float(bar["open"]) >= position.target_price:
+    if exit_policy.is_static and float(bar["open"]) >= position.target_price:
         return position.target_price, ExitReason.TARGET
 
     stop_touched = float(bar["low"]) <= position.stop_price
-    target_touched = (
-        exit_policy is ExitPolicy.STATIC_2R and float(bar["high"]) >= position.target_price
-    )
+    target_touched = exit_policy.is_static and float(bar["high"]) >= position.target_price
     if stop_touched:
         # Daily OHLC cannot reveal whether a same-day stop or target came first.
         # The conservative convention always assigns the stop.
@@ -256,6 +261,8 @@ def _new_position_exit(
     filled_at_open: bool,
     slip: float,
     exit_policy: ExitPolicy,
+    *,
+    entry_path: str = "gap_retrace",
 ) -> tuple[float, ExitReason] | None:
     if filled_at_open and float(bar["open"]) <= position.stop_price:
         return max(float(bar["low"]), float(bar["open"]) * (1.0 - slip)), position.stop_reason
@@ -265,13 +272,17 @@ def _new_position_exit(
             position.stop_reason,
         )
     if (
-        exit_policy is ExitPolicy.STATIC_2R
-        and filled_at_open
+        exit_policy.is_static
+        and (
+            filled_at_open
+            or entry_path == "breakout"
+            or float(bar["close"]) >= position.target_price
+        )
         and float(bar["high"]) >= position.target_price
     ):
         return position.target_price, ExitReason.TARGET
-    # If a limit filled intraday, the day's high may have occurred before entry.
-    # We therefore never award a same-bar target to an intraday fill.
+    # A gap-retrace high can precede the fill. A close at/above target,
+    # unlike the high alone, establishes a post-fill target touch.
     return None
 
 
@@ -357,6 +368,15 @@ def _finalize_trade(position: Position) -> Trade:
         first_exit_date=min(partial_dates) if partial_dates else None,
         initial_stop_price=position.initial_stop_price,
         final_stop_price=position.stop_price,
+        reserved_r_multiple=pnl
+        / (
+            position.initial_quantity
+            * (position.reserved_risk_per_share or position.initial_risk_per_share)
+        ),
+        actual_risk_per_share=position.initial_risk_per_share,
+        reserved_risk_per_share=(
+            position.reserved_risk_per_share or position.initial_risk_per_share
+        ),
     )
 
 
@@ -419,6 +439,9 @@ def _execution_diagnostics(
         "filled_orders": filled_orders,
         "unfilled_orders": unfilled_orders,
         "fill_rate": filled_orders / planned_orders if planned_orders else None,
+        "entry_stop_sequence_ambiguous": sum(
+            bool(row.get("entry_stop_sequence_ambiguous")) for row in order_rows
+        ),
     }
 
 
@@ -494,6 +517,7 @@ def _observe_burns_management(
     prepared: pd.DataFrame,
     timestamp: pd.Timestamp,
     next_timestamp: pd.Timestamp | None,
+    exit_policy: ExitPolicy = ExitPolicy.BURNS_CYCLE_V1,
 ) -> dict[str, object] | None:
     if not position.first_exit_taken and position.partial_exit_on is None:
         previous_wave_high = position.entry_context.get("previous_cycle_high_price")
@@ -513,6 +537,8 @@ def _observe_burns_management(
                 int(position.entry_context.get("retrace_number", 1)) >= 2
                 and high_turn.wave_breakout
             )
+            if exit_policy is ExitPolicy.BURNS_CYCLE_V2:
+                position.partial_is_fifth_wave = prepared.loc[timestamp, "wave_active_impulse"] >= 5
             return {
                 "position_id": position.position_id,
                 "symbol": position.symbol,
@@ -523,6 +549,25 @@ def _observe_burns_management(
                 "fifth_wave": position.partial_is_fifth_wave,
             }
         return None
+
+    if (
+        exit_policy is ExitPolicy.BURNS_CYCLE_V2
+        and not position.one_bar_mode
+        and prepared.loc[timestamp, "wave_active_impulse"] >= 5
+    ):
+        position.one_bar_mode = True
+        old_stop = position.stop_price
+        position.stop_price = max(old_stop, stop_below(float(prepared.loc[timestamp, "low"])))
+        if position.stop_price > old_stop:
+            position.stop_reason = ExitReason.ONE_BAR_TRAIL
+        return {
+            "position_id": position.position_id,
+            "symbol": position.symbol,
+            "date": timestamp.date().isoformat(),
+            "event": "later_fifth_wave_activated",
+            "old_stop": old_stop,
+            "new_stop": position.stop_price,
+        }
 
     if position.one_bar_mode:
         candidate = stop_below(float(prepared.loc[timestamp, "low"]))
@@ -576,6 +621,7 @@ def run_backtest(
     *,
     benchmark_symbol: str = "SPY",
     exit_policy: ExitPolicy = ExitPolicy.STATIC_2R,
+    strategy_rules: StrategyRules = DEFAULT_RULES,
 ) -> BacktestResult:
     exit_policy = ExitPolicy(exit_policy)
     if start > end:
@@ -586,6 +632,11 @@ def run_backtest(
 
     normalized = {symbol: normalize_bars(frames[symbol]) for symbol in config.symbols}
     prepared = {symbol: prepare_indicators(frame) for symbol, frame in normalized.items()}
+    if exit_policy is ExitPolicy.BURNS_CYCLE_V2 or strategy_rules.objective_wave_retraces:
+        prepared = {
+            symbol: add_wave_context(frame, strategy_rules.trend_slope_bars)
+            for symbol, frame in prepared.items()
+        }
     start_ts = pd.Timestamp(start)
     end_ts = pd.Timestamp(end)
     dates = sorted(
@@ -626,7 +677,7 @@ def run_backtest(
             position = positions[symbol]
             bar = normalized[symbol].loc[timestamp]
             partial_due = bool(
-                exit_policy is ExitPolicy.BURNS_CYCLE_V1
+                exit_policy.is_burns
                 and position.partial_exit_on == current_date
                 and not position.first_exit_taken
             )
@@ -667,7 +718,7 @@ def run_backtest(
 
             outcome = _existing_exit(position, bar, slip, exit_policy)
             if outcome is None:
-                if exit_policy is not ExitPolicy.BURNS_CYCLE_V1:
+                if not exit_policy.is_burns:
                     continue
                 partial_proceeds = _process_scheduled_partial(
                     position,
@@ -748,12 +799,25 @@ def run_backtest(
                 entry_price=fill_price,
                 initial_stop_price=order.signal.stop_price,
                 stop_price=order.signal.stop_price,
-                target_price=order.signal.target_price,
-                initial_risk_per_share=order.signal.risk_per_share,
+                target_price=(
+                    fill_risk_target(fill_price, order.signal.stop_price, config.risk.reward_r)
+                    if exit_policy is ExitPolicy.STATIC_FILL_2R
+                    else order.signal.target_price
+                ),
+                initial_risk_per_share=fill_price - order.signal.stop_price,
+                reserved_risk_per_share=order.signal.risk_per_share,
                 entry_commission=entry_fee,
                 entry_context=dict(order.signal.context),
             )
             positions[symbol] = position
+            entry_bar = normalized[symbol].loc[timestamp]
+            entry_path = (
+                "open"
+                if filled_at_open
+                else "breakout"
+                if float(entry_bar["open"]) < order.signal.entry_stop
+                else "gap_retrace"
+            )
             order_rows.append(
                 {
                     "symbol": symbol,
@@ -764,6 +828,16 @@ def run_backtest(
                     "fill_price": fill_price,
                     "entry_stop": order.signal.entry_stop,
                     "entry_limit": order.signal.entry_limit,
+                    "entry_path": entry_path,
+                    "actual_risk_per_share": position.initial_risk_per_share,
+                    "reserved_risk_per_share": position.reserved_risk_per_share,
+                    "effective_target": position.target_price,
+                    "entry_stop_sequence_ambiguous": bool(
+                        not filled_at_open
+                        and entry_path == "breakout"
+                        and float(entry_bar["low"]) <= position.stop_price
+                        and float(entry_bar["close"]) > position.stop_price
+                    ),
                 }
             )
 
@@ -773,6 +847,7 @@ def run_backtest(
                 filled_at_open,
                 slip,
                 exit_policy,
+                entry_path=entry_path,
             )
             if same_bar_exit is not None:
                 exit_price, reason = same_bar_exit
@@ -784,7 +859,7 @@ def run_backtest(
 
         # 3) Update Burns's manager from this completed close. New stops and
         # partial exits become active next session, never retroactively today.
-        if exit_policy is ExitPolicy.BURNS_CYCLE_V1:
+        if exit_policy.is_burns:
             for symbol in sorted(positions):
                 if timestamp not in prepared[symbol].index:
                     continue
@@ -793,6 +868,7 @@ def run_backtest(
                     prepared[symbol],
                     timestamp,
                     next_date[symbol].get(timestamp),
+                    exit_policy,
                 )
                 if event is not None:
                     management_rows.append(event)
@@ -808,6 +884,7 @@ def run_backtest(
                 timestamp,
                 max_entry_gap_r=config.execution.max_entry_gap_r,
                 reward_r=config.risk.reward_r,
+                rules=strategy_rules,
             )
             strategy_diagnostics.observe(
                 symbol,
@@ -886,6 +963,8 @@ def run_backtest(
         config,
         exit_policy,
     )
+    summary["strategy_version"] = strategy_version(strategy_rules)
+    summary["strategy_fingerprint"] = strategy_fingerprint(strategy_rules)
     summary["strategy_diagnostics"] = strategy_diagnostics.as_dict()
     summary["execution_diagnostics"] = _execution_diagnostics(signal_rows, order_rows)
     summary["exit_diagnostics"] = _exit_diagnostics(trades, exit_rows, management_rows)
@@ -982,7 +1061,12 @@ def _summarize(
         "max_concurrent_positions": max(int(row.get("positions", 0)) for row in equity_rows),
         "meets_15_percent_cagr_hurdle": bool(cagr >= 0.15),
         "meets_20_percent_cagr_hurdle": bool(cagr >= 0.20),
-        "strategy_version": STRATEGY_VERSION,
+        "engine_version": ENGINE_VERSION,
+        "r_basis": "actual entry fill minus initial stop; net of fees",
+        "expectancy_reserved_r": (
+            float(np.mean([t.reserved_r_multiple for t in trades])) if trades else None
+        ),
+        "strategy_version": strategy_version(),
         "strategy_fingerprint": strategy_fingerprint(),
         "exit_policy": exit_policy.value,
         "exit_policy_fingerprint": exit_policy_fingerprint(exit_policy),

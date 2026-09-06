@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 import types
 import unittest
+from dataclasses import replace
 from datetime import date
 from unittest.mock import patch
 
@@ -142,7 +143,7 @@ class PaperSafetyTests(unittest.TestCase):
 
         class FakeClient:
             def get_clock(self):
-                return types.SimpleNamespace(is_open=False)
+                return types.SimpleNamespace(is_open=False, next_open="2026-08-10T13:30:00Z")
 
             def submit_order(self, order_data):
                 captured.update(order_data.values)
@@ -175,6 +176,11 @@ class PaperSafetyTests(unittest.TestCase):
                 state,
                 confirmation="PAPER",
             )
+
+            with self.assertRaisesRegex(RuntimeError, "next market session"):
+                broker.submit(
+                    [replace(plan, valid_on=date(2026, 8, 7))], config, state, confirmation="PAPER"
+                )
 
         self.assertEqual(submitted[0]["order_id"], "paper-order-id")
         self.assertEqual(captured["order_class"], "bracket")
